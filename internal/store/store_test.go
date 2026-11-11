@@ -198,7 +198,8 @@ func TestDescribeRedactsPassword(t *testing.T) {
 }
 
 func TestEnsureDirSkipsSpecialDSN(t *testing.T) {
-	for _, dsn := range []string{"", ":memory:", "file::memory:?cache=shared"} {
+	// 远端 authority 的 URI 不在这里建目录：那由 SQLite 当 URI 处理。
+	for _, dsn := range []string{"", ":memory:", "file::memory:?cache=shared", "file://remote-host/tmp/x.db"} {
 		if err := EnsureDir(dsn); err != nil {
 			t.Errorf("EnsureDir(%q) = %v", dsn, err)
 		}
@@ -457,4 +458,61 @@ func TestNilStoreIsMemoryOnly(t *testing.T) {
 	}
 	// 纯内存模式下的导入应当无声跳过（dir 里没有旧文件）。
 	ImportLegacy(nil, t.TempDir())
+}
+
+// TestEnsureDirCreatesDirForFileURI 守住 file: 前缀 DSN 的建目录行为。
+//
+// 来由：config.example.json 里给了一条「自己指定 pragma」的样例
+// file:./data/wb2api.db?_pragma=…。EnsureDir 原先见到 file: 就 return nil，
+// 于是 data/ 不存在时启动直接失败，报的还是 "unable to open database file:
+// out of memory (14)"——一个把路径问题伪装成内存问题的错误。
+func TestEnsureDirCreatesDirForFileURI(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct{ dsn, sub string }{
+		{"file:" + filepath.ToSlash(filepath.Join(dir, "a", "x.db")), "a"},
+		{"file:" + filepath.ToSlash(filepath.Join(dir, "b", "x.db")) + "?_pragma=journal_mode(WAL)", "b"},
+	}
+	for _, c := range cases {
+		if err := EnsureDir(c.dsn); err != nil {
+			t.Fatalf("EnsureDir(%q) = %v", c.dsn, err)
+		}
+		want := filepath.Join(dir, c.sub)
+		if st, err := os.Stat(want); err != nil || !st.IsDir() {
+			t.Errorf("EnsureDir(%q) 没建出 %s: %v", c.dsn, want, err)
+		}
+	}
+	// 相对路径形态：file:./data/wb2api.db。样例里就是这一条，它必须落在工作目录下。
+	t.Chdir(dir)
+	if err := EnsureDir("file:" + filepath.ToSlash(filepath.Join(".", "d", "x.db"))); err != nil {
+		t.Fatalf("相对 file: DSN: %v", err)
+	}
+	if st, err := os.Stat(filepath.Join(dir, "d")); err != nil || !st.IsDir() {
+		t.Errorf("相对 file: DSN 没建出 %s/d: %v", dir, err)
+	}
+}
+
+// TestLocalDBPath 直接标定「哪些 DSN 该建目录」这条判断。
+func TestLocalDBPath(t *testing.T) {
+	yes := map[string]string{
+		"wb2api.db":                         "wb2api.db",
+		"./data/wb2api.db":                  "./data/wb2api.db",
+		"D:/wb/data/x.db":                   "D:/wb/data/x.db",
+		"file:./data/x.db":                  "./data/x.db",
+		"file:x.db?_pragma=foreign_keys(1)": "x.db",
+	}
+	for in, want := range yes {
+		got, ok := localDBPath(in)
+		if !ok || got != want {
+			t.Errorf("localDBPath(%q) = (%q,%v)，想要 (%q,true)", in, got, ok, want)
+		}
+	}
+	// file:// 形态一律不动：authority 与 Windows 盘符前导斜杠的取舍不可靠，
+	// 判错会在 Windows 上拼出 "\\C:\…" 这种路径。宁可不建目录。
+	no := []string{"", "  ", ":memory:", "file::memory:", "file::memory:?cache=shared",
+		"file://remote/x.db", "file:///var/lib/wb2api/x.db", "file://localhost/var/x.db"}
+	for _, in := range no {
+		if got, ok := localDBPath(in); ok {
+			t.Errorf("localDBPath(%q) = (%q,true)，应该不动", in, got)
+		}
+	}
 }

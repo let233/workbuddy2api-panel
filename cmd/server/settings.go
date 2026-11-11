@@ -5,13 +5,11 @@
 //     这三样改了要重开库/重开监听，属于引导参数。
 //   - 其余全部配置（上游参数、池策略、排程、提示词、告警、预算……）存数据库
 //     （app_kv 的 config:settings 单键），面板保存即落库并热应用，重启不再是生效条件。
-//   - api_key 不再写进配置文件：首次部署自动生成 sk- 前缀随机 key 入库，
-//     避免「配置文件里躺着一个明文弱 key」这种最糟糕的组合。
+//   - 管理员凭据不写进配置文件：面板走账号密码登录（internal/panelauth），
+//     首次部署播种 admin/123456 的哈希，配置里没有任何明文密钥。
 package main
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -20,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
 	"github.com/misakano7545/workbuddy2api-panel/internal/store"
@@ -87,7 +84,8 @@ func (h *settingsHub) Load(base *Config, legacyFile bool) (migrated bool, err er
 			return false, fmt.Errorf("parse settings from db: %w", err)
 		}
 		// 派生字段（都是 json:"-" 的 *Dur / PromptText 之类）不落库，必须按库里的
-		// 原始值重算，否则重启后「配置里显示 120s、实际生效 0s」。
+		// 原始值重算，否则重启后「配置里显示 120s、实际生效 0s」——提示词同理：
+		// 库里存 prompt.text 原文，PromptText 由 normalizePrompt 重新解析。
 		// 环境变量优先级高于库值，故 applyEnv 放在归一化之前。
 		applyEnv(base)
 		if err := base.normalize(); err != nil {
@@ -146,8 +144,8 @@ func settingsPayload(c *Config) ([]byte, error) {
 	for _, k := range bootstrapKeys {
 		delete(doc, k)
 	}
-	// PromptText 是 json:"-"/omitempty 的派生字段（normalize 时按 prompt 文件读出来），
-	// 即使没入库也不会丢：重启后按 prompt.mode/file 重新读。
+	// PromptText 是 json:"-" 的派生字段（normalize 时从后台设置的 prompt.text 解析出来），
+	// 即使没入库也不会丢：重启后按 prompt.mode/text 重新解析（空 text 回落内置默认）。
 	return json.Marshal(doc)
 }
 
@@ -192,26 +190,5 @@ func hasLegacySettings(raw []byte) bool {
 	return false
 }
 
-// EnsureAPIKey 保证进程有一个可用的 api_key。
-//
-// 首次部署自动生成 sk- 前缀随机 key（crypto/rand 18 字节 → 24 字符 base64url），
-// 与旧版 WriteDefault 生成的形态一致：随机 key 是安全默认，比示例占位符强得多，
-// 而且现在它躺在库里（不是配置文件），面板里能看到、能改。
-// 返回 true 表示本次是新生成的（调用方负责入库并打印到启动日志）。
-func EnsureAPIKey(c *Config) bool {
-	if strings.TrimSpace(c.APIKey) != "" {
-		return false
-	}
-	c.APIKey = newAPIKey()
-	return true
-}
-
-func newAPIKey() string {
-	raw := make([]byte, 18)
-	if _, err := rand.Read(raw); err != nil {
-		// crypto/rand 在当前平台不可用极罕见；退回纳秒时间戳也强过空 key
-		// （空 key = 网关完全不鉴权，而 listen 可能已经不是回环）。
-		return "sk-" + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-	}
-	return "sk-" + base64.RawURLEncoding.EncodeToString(raw)
-}
+// 全局 api_key 已移除：面板用账号密码登录（internal/panelauth），网关只用客户端 Key
+// （internal/gatewaykeys）。这里不再生成/落库任何管理员密钥。

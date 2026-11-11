@@ -21,35 +21,10 @@ func openTestDB(t *testing.T) *store.Store {
 	return db
 }
 
-// 首次部署：没有 api_key 时必须自动生成 sk- 前缀的随机 key（入库），两次生成不能相同。
-func TestEnsureAPIKeyGeneratesRandomSK(t *testing.T) {
-	c := Default()
-	c.APIKey = "  "
-	if !EnsureAPIKey(c) {
-		t.Fatal("空 api_key 应触发生成")
-	}
-	if !strings.HasPrefix(c.APIKey, "sk-") {
-		t.Fatalf("key=%q 缺少 sk- 前缀", c.APIKey)
-	}
-	// 18 字节 → base64url 无填充 24 字符
-	if len(c.APIKey) != len("sk-")+24 {
-		t.Fatalf("key=%q 长度 %d，期望 %d", c.APIKey, len(c.APIKey), len("sk-")+24)
-	}
-	if EnsureAPIKey(c) {
-		t.Fatal("已有 key 时不该重新生成（面板改过的 key 不能被抹掉）")
-	}
-	other := Default()
-	EnsureAPIKey(other)
-	if other.APIKey == c.APIKey {
-		t.Fatal("两次生成的 key 相同，随机源有问题")
-	}
-}
-
 // 入库 payload 里不允许出现引导参数：那三样留在文件里，重复存一份只会让「文件改端口、
 // 库里改端口」互相打架。
 func TestSettingsPayloadDropsBootstrapKeys(t *testing.T) {
 	c := Default()
-	c.APIKey = "k"
 	if err := c.normalize(); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +41,7 @@ func TestSettingsPayloadDropsBootstrapKeys(t *testing.T) {
 			t.Errorf("入库 payload 里出现了引导参数 %q", k)
 		}
 	}
-	for _, k := range []string{"api_key", "upstream", "pool", "server"} {
+	for _, k := range []string{"upstream", "pool", "server"} {
 		if _, ok := doc[k]; !ok {
 			t.Errorf("入库 payload 缺少运行期配置 %q", k)
 		}
@@ -116,7 +91,6 @@ func TestSettingsMigrateLegacyFile(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 
 	legacy := Default()
-	legacy.APIKey = "sk-legacykey1234"
 	legacy.Upstream.UserAgent = "legacy-agent"
 	legacy.Server.ReadTimeout = "42s"
 	if err := legacy.normalize(); err != nil {
@@ -148,9 +122,6 @@ func TestSettingsMigrateLegacyFile(t *testing.T) {
 	}
 	if got := hub.Current().Upstream.UserAgent; got != "legacy-agent" {
 		t.Fatalf("迁移后 UA = %q", got)
-	}
-	if got := hub.Current().APIKey; got != "sk-legacykey1234" {
-		t.Fatalf("迁移后 api_key = %q（升级丢 key 是致命的）", got)
 	}
 
 	rewritten, err := os.ReadFile(path)

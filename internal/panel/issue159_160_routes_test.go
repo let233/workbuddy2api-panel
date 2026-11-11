@@ -20,7 +20,7 @@ import (
 func TestAccountGroupEndpoint(t *testing.T) {
 	pl := pool.New(nil)
 	pl.Add(&auth.Auth{UID: "u1"})
-	p := New(Config{Version: "test", APIKey: "k", Pool: pl})
+	p := New(Config{Version: "test", Pool: pl})
 
 	call := func(path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", path, strings.NewReader(body))
@@ -49,7 +49,7 @@ func TestAccountGroupEndpoint(t *testing.T) {
 func TestRequestLogsClearEndpoint(t *testing.T) {
 	rl := reqlog.New(reqlog.Config{DB: storetest.Open(t), Enabled: true, RetentionDays: 7})
 	rl.Record(reqlog.Event{Time: time.Now().Add(-time.Minute), RequestID: "a", Status: 200, OK: true})
-	p := New(Config{Version: "test", APIKey: "k", RequestLog: rl})
+	p := New(Config{Version: "test", RequestLog: rl})
 
 	req := httptest.NewRequest("POST", "/panel/api/request_logs/clear", nil)
 	req.Header.Set("Authorization", "Bearer k")

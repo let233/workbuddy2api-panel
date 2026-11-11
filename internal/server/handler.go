@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
-	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
@@ -33,8 +33,7 @@ import (
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -125,6 +124,11 @@ type Config struct {
 	// MaxPayloadBytes 入站请求体安全上限（字节，server.max_payload_bytes，默认 64MiB）。
 	// 只挡「大到能把进程读死」的上传，不做大请求预拦截（见 bodylimit.go）。启动时读取。
 	MaxPayloadBytes int64
+	// Keys 客户端多 Key 管理器（网关唯一鉴权来源）。nil = 本进程不鉴权，
+	// 只有测例/纯内存装配会这样传；cmd/server 永远给非 nil 的 Manager。
+	// 每个 Key 自带到期时间、可用模型、积分额度与系统提示词覆盖，见 gatewaykeys 包。
+	Keys *gatewaykeys.Manager
+
 	// RestrictionHold 11140 风控连坐的全池暂停时长（upstream.restriction_hold_seconds，
 	// 默认 1800s；0 = 只保留「命中即停手」）。见 restrict.go。启动时读取。
 	RestrictionHold time.Duration
@@ -138,7 +142,6 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	// 白名单静态回退（issue #68）：裸用/单测路径不依赖 Live，与 Hidden 对称。
 	allowed, enabled := livecfg.NormalizeAllowedModels(h.cfg.ModelsAllowed)
 	return livecfg.Snapshot{
-		APIKey:                h.cfg.APIKey,
 		SoftCooldown:          h.cfg.SoftCooldown,
 		EmbeddingsEnabled:     h.cfg.EmbeddingsEnabled,
 		WatermarkStripEnabled: h.cfg.WatermarkStripEnabled,
@@ -375,11 +378,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		k, status, code, msg := h.authenticate(r)
+		if status != 0 {
+			writeAuthFailure(w, r, status, code, msg, false)
 			return
 		}
-		next(w, r)
+		next(w, withGatewayKey(r, k))
 	}
 }
 
@@ -462,10 +466,6 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) capacity(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if strings.TrimSpace(h.loadLive().APIKey) == "" {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "API key is required")
-		return
-	}
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
@@ -484,6 +484,10 @@ func (h *Handler) capacity(w http.ResponseWriter, r *http.Request) {
 	// 不在白名单，这里也必须报零容量。信息面不成为绕过口：客户端按 /v1/capacity
 	// 选模型时，调不通的模型不该显示「有号可用」。
 	if !h.allowedModel(realm, bareModel) {
+		modelAvailable = 0
+	}
+	// 客户端 Key 的模型白名单：与拒绝调用同一口径（未授权 = 零容量）。
+	if !gatewayKeyAllowsModel(r, realm, bareModel) {
 		modelAvailable = 0
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -523,9 +527,12 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	// 客户端 Key 的模型白名单在这里也生效：列表与「点名调用」必须对称，
+	// 否则客户端会从 /v1/models 选到一个必被 400 的模型。
+	list := filterModelListForKey(h.modelList(), requestGatewayKey(r))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
 	})
 }
 
@@ -950,6 +957,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
+	// 本次请求命中的客户端 Key（鉴权中间件挂在上下文里；全局 key/未鉴权为 nil）。
+	gk := requestGatewayKey(r)
 	// 请求体安全上限（server.max_payload_bytes）：超限回 413，其余读错误 400。
 	// 不做「大请求预拦截」——紧上限曾因多图长会话被移除，见 bodylimit.go 文件头。
 	body, berr := h.readBody(w, r)
@@ -1096,6 +1105,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.requestID = tr.id
 	}
 	defer st.done()
+
+	// 客户端 Key 的模型白名单：与全局限定同一位置、同一错误形状。别名映射后
+	// 的真实目标同样受检（Key 不能靠别名绕过自己的白名单）。文案不区分
+	// 「模型不存在」与「该 Key 未授权」，避免枚举探测。
+	if !gatewayKeyAllowsModel(r, realm, bareModel) {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+			"model is not allowed for this API key, try another model", "")
+		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
 
 	// models.allowed 白名单（issue #68）：别名映射之后、黑名单检查之前——
 	// 别名解析出的真实目标同样受检，不能绕过白名单（与 hidden 同一条不变量）。
@@ -1294,6 +1314,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasCache:         delta.HasCacheTokens,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
+
+		// 客户端 Key 的积分配额：只统计上游给出可信额度的尝试（hasCredit），
+		// 与 usage 记录同一口径；计数异步回写，不在请求路径上写库。
+		if gk != nil && h.cfg.Keys != nil {
+			tokens := int64(0)
+			if delta.HasTotalTokens {
+				tokens = delta.TotalTokens
+			}
+			h.cfg.Keys.Charge(gk.ID, credit, hasCredit, tokens)
+		}
 	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
@@ -1312,6 +1342,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 提示词策略/文本按请求取一次快照：面板刚保存配置时可能出现「本请求用新 mode、
 	// 后继重试阶梯读到旧 text」的撕裂，一次取两个值把口径钉在同一时刻。
 	hPromptMode, hPromptText := h.prompt()
+	// 客户端 Key 的提示词覆盖：模式为空 = 跟随全局（需求默认值）；
+	// 显式指定模式时文本一并取该 Key 的（可能为空 → 等价于不注入）。
+	if gk := requestGatewayKey(r); gk != nil && gk.PromptMode != "" {
+		hPromptMode, hPromptText = gk.PromptMode, gk.PromptText
+	}
 	if hPromptMode == "custom" && hPromptText != "" {
 		body = prompt.Rewrite(body, hPromptText)
 	} else if hPromptMode == "append" && hPromptText != "" && !h.degrade.Active() {

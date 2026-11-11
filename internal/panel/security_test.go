@@ -7,14 +7,47 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/panelauth"
 )
 
+// newTestPanel 造一个开了登录闸门的面板（内存账号库 + 默认管理员）：没有会话
+// Cookie 的 /panel/api/* 一律 401，不会走进依赖 Pool/Upstream 的 handler。
 func newTestPanel() *Panel {
-	// 启用鉴权：未带 key 的请求一律 401，不进入依赖 Pool/Upstream 的 handler。
-	return New(Config{Version: "test", APIKey: "test-key"})
+	return New(Config{Version: "test", Users: authUsers()})
 }
 
-// 默认拒绝：页面静态资源之外一律要密钥，包括尚未注册的路径。
+// authUsers 内存账号库 + 播种默认管理员：Config.Users 非 nil 即打开登录闸门。
+func authUsers() *panelauth.Manager {
+	m := panelauth.NewManager(nil)
+	if _, _, err := m.EnsureDefaultAdmin(); err != nil {
+		panic(err) // 内存库播种不可能失败；失败说明 panelauth 被改坏了
+	}
+	return m
+}
+
+// authSession 直接向账号库签发一个会话，返回可挂到请求上的 Cookie。
+// 走 Manager 而不是 HTTP 登录，是为了让「已经登录」这件事与登录限速/JSON 解析解耦。
+func authSession(t *testing.T, pn *Panel) *http.Cookie {
+	t.Helper()
+	u, ok := pn.cfg.Users.Authenticate(panelauth.DefaultAdminUsername, panelauth.DefaultAdminPassword)
+	if !ok {
+		t.Fatal("默认管理员无法登录 —— 账号库播种坏了")
+	}
+	token, err := pn.cfg.Users.IssueSession(u.ID, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	panelauth.SetSessionCookie(rec, token, false)
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("SetSessionCookie 没有写出 Cookie")
+	}
+	return cookies[0]
+}
+
+// 默认拒绝：页面静态资源与登录/登出端点之外一律要会话，包括尚未注册的路径。
 // 将来新增路由即便忘了包鉴权，也不会静默公开。
 func TestPanelDefaultDeny(t *testing.T) {
 	p := newTestPanel()
@@ -41,7 +74,7 @@ func TestSecurityHeadersOnAllPanelResponses(t *testing.T) {
 		{"GET", "/panel/"},
 		{"GET", "/panel/theme.js"},
 		{"GET", "/panel/app.js"},
-		{"GET", "/panel/api/overview"}, // 401（未提供 key）
+		{"GET", "/panel/api/overview"}, // 401（未登录）
 		{"POST", "/panel/api/config"},  // 401
 		{"GET", "/panel/api/nonexistent"},
 	}
@@ -225,20 +258,20 @@ func TestValidUID(t *testing.T) {
 	}
 }
 
-// 未带密钥的 API 请求必须 401；携带正确密钥则通过鉴权层（不再是 401）。
+// 无会话的 API 请求必须 401；持有有效会话则通过鉴权层（不再是 401）。
 func TestAuthLayerBehavior(t *testing.T) {
 	p := newTestPanel()
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/api/overview", nil))
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("no key: code=%d want 401", rec.Code)
+		t.Fatalf("no session: code=%d want 401", rec.Code)
 	}
-	// 用不存在的路由验证"带正确 key 已过鉴权"（避免触碰依赖 nil 的 handler）。
+	// 用不存在的路由验证"已登录即过鉴权"（避免触碰依赖 nil 的 handler）。
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest("GET", "/panel/api/nonexistent", nil)
-	req2.Header.Set("Authorization", "Bearer test-key")
+	req2.AddCookie(authSession(t, p))
 	p.ServeHTTP(rec2, req2)
 	if rec2.Code == http.StatusUnauthorized {
-		t.Error("valid key must pass the auth layer")
+		t.Error("valid session must pass the auth layer")
 	}
 }

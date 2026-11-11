@@ -16,7 +16,7 @@ func creditPanel(t *testing.T, ledger *credithist.Ledger) *Panel {
 	t.Helper()
 	p := pool.New(nil)
 	p.Add(&auth.Auth{UID: "u1", Nickname: "小明"})
-	return New(Config{Version: "test", APIKey: "test-key", Pool: p, CreditHistory: ledger})
+	return New(Config{Version: "test", Pool: p, CreditHistory: ledger})
 }
 
 func creditGet(t *testing.T, p *Panel, query string) (int, string) {
@@ -147,7 +147,7 @@ func TestCreditHistoryEmptyReturnsArray(t *testing.T) {
 // 账本未装配 = 501（与 RequestLog 同语义），不是 500 也不是空列表——
 // "功能不可用"与"没有记录"必须在协议层可区分。
 func TestCreditHistoryNotConfigured(t *testing.T) {
-	p := New(Config{Version: "test", APIKey: "test-key", Pool: pool.New(nil)})
+	p := New(Config{Version: "test", Pool: pool.New(nil)})
 	code, body := creditGet(t, p, "")
 	if code != 501 {
 		t.Fatalf("未装配账本应回 501，得到 %d %s", code, body)
@@ -157,13 +157,13 @@ func TestCreditHistoryNotConfigured(t *testing.T) {
 	}
 }
 
-// 接口与其他 /panel/api/* 同口径鉴权：不带 key 必须 401。
+// 接口与其他 /panel/api/* 同口径鉴权：没有会话必须 401。
 func TestCreditHistoryRequiresAuth(t *testing.T) {
-	p := creditPanel(t, credithist.New(nil, 100))
+	p := New(Config{Version: "test", Users: authUsers(), Pool: pool.New(nil), CreditHistory: credithist.New(nil, 100)})
 	req := httptest.NewRequest("GET", "/panel/api/credit_history", nil)
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, req)
 	if rr.Code != 401 {
-		t.Fatalf("无 key 应回 401，得到 %d", rr.Code)
+		t.Fatalf("无会话应回 401，得到 %d", rr.Code)
 	}
 }

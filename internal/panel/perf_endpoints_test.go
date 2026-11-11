@@ -21,7 +21,7 @@ import (
 // 这正是前端用「已见到的最大 ts + 同一批兜底」策略的原因（见 app.js 的 logSinceTs）。
 // 本测试用「分批写入 + 显式 sleep」构造可区分的时间戳。
 func TestLogsHandlerSinceIncremental(t *testing.T) {
-	p := New(Config{Version: "test", APIKey: "test-key"})
+	p := New(Config{Version: "test"})
 
 	// 第一批：2 行。
 	p.logs.Write([]byte("2026/10/24 12:00:00 line-0\n2026/10/24 12:00:01 line-1\n"))
@@ -122,7 +122,7 @@ func TestParseSinceParamPlusDecodedAsSpace(t *testing.T) {
 // recent 数组（只回指标与归档状态）。面板在归档开启时用归档数据当请求记录表，
 // recent 那 100 条（~35KB）用不上——每 5 秒白拉一次、白解析、白 GC。
 func TestRequestMetricsRecentOptOut(t *testing.T) {
-	p := New(Config{Version: "test", APIKey: "test-key"})
+	p := New(Config{Version: "test"})
 
 	// RequestLog 为 nil 时端点返回 501——本测试验证各参数组合都不会 500，
 	// 且参数解析不因取值不同而改变响应码。真正的「有没有 recent」由 reqlog 层的
@@ -146,7 +146,7 @@ func TestRequestMetricsRecentOptOut(t *testing.T) {
 // 「晚于最后一条的 ts」永远为空或永远为真——要么漏、要么重复刷最后一条
 // （用户看到的现象）。seq 单调递增，不受时钟精度影响。
 func TestLogsSinceSeqAdvancesWithinSameTick(t *testing.T) {
-	p := New(Config{Version: "test", APIKey: "test-key"})
+	p := New(Config{Version: "test"})
 	// 一次 Write 多行：这些行必然共享同一个 TS（同一次 time.Now()）。
 	p.logs.Write([]byte("a\nb\nc\n"))
 
@@ -193,7 +193,7 @@ func TestLogsSinceSeqAdvancesWithinSameTick(t *testing.T) {
 // 同一刻度的多条无法增量区分，按 ts 推进会漏掉同刻度的后几行。保留 since 只为
 // 兼容旧前端/手工 curl；新代码一律用 since_seq。
 func TestLogsSinceTSStillDropsTailWithinSameTick(t *testing.T) {
-	p := New(Config{Version: "test", APIKey: "test-key"})
+	p := New(Config{Version: "test"})
 	p.logs.Write([]byte("a\nb\nc\n"))
 
 	all := p.logs.Snapshot()

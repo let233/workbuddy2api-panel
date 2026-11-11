@@ -41,7 +41,6 @@ func newSaveRig(t *testing.T) *saveRig {
 	t.Cleanup(func() { _ = db.Close() })
 
 	cfg := Default()
-	cfg.APIKey = "initial-key"
 	if err := cfg.normalize(); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +85,7 @@ func TestSaveConfigPreservesAndUpdatesModelFallback(t *testing.T) {
 		t.Fatalf("restart fields=%v", fields)
 	}
 	for _, tc := range []struct{ body, want string }{
-		{`{"api_key":"changed"}`, "model-b"},
+		{`{"upstream":{"user_agent":"changed"}}`, "model-b"},
 		{`{"pool":{"model_fallback":{"model-a":"model-c"}}}`, "model-c"},
 		{`{"pool":{"model_fallback":null}}`, ""},
 	} {
@@ -100,11 +99,10 @@ func TestSaveConfigPreservesAndUpdatesModelFallback(t *testing.T) {
 // TestSaveConfigHotAppliesWithoutRestart 本次改造的核心契约：面板上每一样「以前要重启」
 // 的配置，保存后都必须立刻作用于运行中的组件，且不进「需重启」清单。
 //
-// 逐族抽查：出站身份与超时、global 闸、会话粘性、入站读超时、upstash、api_key。
+// 逐族抽查：出站身份与超时、global 闸、会话粘性、入站读超时、upstash。
 func TestSaveConfigHotAppliesWithoutRestart(t *testing.T) {
 	rig := newSaveRig(t)
 	fields := rig.save(t, `{
-		"api_key": "rotated-key",
 		"global": {"enabled": false},
 		"prompt": {"mode": "custom"},
 		"upstream": {"user_agent": "new-agent", "timeout_seconds": 45},
@@ -127,10 +125,10 @@ func TestSaveConfigHotAppliesWithoutRestart(t *testing.T) {
 	if rig.sess.Enabled() {
 		t.Error("session_sticky.enabled=false 必须立刻关掉会话粘性")
 	}
-	if got := rig.live.Load().APIKey; got != "rotated-key" {
-		t.Errorf("live api_key = %q, want rotated-key", got)
-	}
 	cur := rig.hub.Current()
+	if cur.Prompt.Mode != "custom" {
+		t.Errorf("prompt.mode = %q, want custom", cur.Prompt.Mode)
+	}
 	if cur.ServerReadTimeoutDur != 120*time.Second {
 		t.Errorf("server.read_timeout = %v, want 120s", cur.ServerReadTimeoutDur)
 	}
@@ -180,37 +178,37 @@ func TestSaveConfigSurvivesUnwritableBootstrapFile(t *testing.T) {
 	}
 	rig.hub.path = filepath.Join(blocker, "config.json") // 父路径是普通文件 → MkdirAll 必失败
 
-	if _, err := saveConfig([]byte(`{"api_key":"still-saved"}`), rig.hub, rig.ap); err != nil {
+	if _, err := saveConfig([]byte(`{"upstream":{"user_agent":"still-saved"}}`), rig.hub, rig.ap); err != nil {
 		t.Fatalf("引导文件不可写不应让保存失败: %v", err)
 	}
-	if got := rig.live.Load().APIKey; got != "still-saved" {
-		t.Fatalf("api_key 未热应用: %q", got)
+	if got := rig.up.UserAgent(); got != "still-saved" {
+		t.Fatalf("upstream.user_agent 未热应用: %q", got)
 	}
 	if raw, ok, err := store.KVGet(rig.db, settingsKVKey); err != nil || !ok || raw == "" {
 		t.Fatalf("设置没入库: ok=%v err=%v", ok, err)
 	}
 }
 
-// WB2A_API_KEY 托管时：保存提交的值不得抢班（运行值恒为 env 值），且不产生重启项。
-func TestSaveConfigRetainsEnvironmentManagedKey(t *testing.T) {
-	t.Setenv("WB2A_API_KEY", "environment-key")
+// WB2A_USER_AGENT 托管时：保存提交的值不得抢班（运行值恒为 env 值），且不产生重启项。
+func TestSaveConfigRetainsEnvironmentManagedField(t *testing.T) {
+	t.Setenv("WB2A_USER_AGENT", "environment-agent")
 	rig := newSaveRig(t)
 	envCfg := Default()
-	envCfg.APIKey = "environment-key"
+	envCfg.Upstream.UserAgent = "environment-agent"
 	if err := envCfg.normalize(); err != nil {
 		t.Fatal(err)
 	}
 	rig.hub.Store(envCfg)
 	rig.ap.Apply(envCfg)
 
-	fields := rig.save(t, `{"api_key":"submitted-key"}`)
+	fields := rig.save(t, `{"upstream":{"user_agent":"submitted-agent"}}`)
 	if len(fields) != 0 {
 		t.Fatalf("fields=%v", fields)
 	}
-	if got := rig.live.Load().APIKey; got != "environment-key" {
-		t.Fatalf("env 托管的 key 被提交值覆盖了: %q", got)
+	if got := rig.up.UserAgent(); got != "environment-agent" {
+		t.Fatalf("env 托管的 UA 被提交值覆盖了: %q", got)
 	}
-	if got := rig.hub.Current().APIKey; got != "environment-key" {
+	if got := rig.hub.Current().Upstream.UserAgent; got != "environment-agent" {
 		t.Fatalf("库里存了提交值: %q", got)
 	}
 }
@@ -233,7 +231,7 @@ func TestSaveConfigRejectsInvalidValue(t *testing.T) {
 // TestEnvironmentManagedFieldsMatchesValidOverrides 托管清单只收「值合法」的 env：
 // 非法值（WB2A_TIMEOUT_SECONDS=invalid）等同未设置，不进清单。
 func TestEnvironmentManagedFieldsMatchesValidOverrides(t *testing.T) {
-	t.Setenv("WB2A_API_KEY", "env-key")
+	t.Setenv("WB2A_USER_AGENT", "env-agent")
 	t.Setenv("WB2A_SOFT_RATE", "30s")
 	t.Setenv("WB2A_TIMEOUT_SECONDS", "invalid")
 	fields := Default().EnvironmentManagedFields()
@@ -245,7 +243,7 @@ func TestEnvironmentManagedFieldsMatchesValidOverrides(t *testing.T) {
 		}
 		return false
 	}
-	if !has("api_key") || !has("cooldown.soft_rate") || has("upstream.timeout_seconds") {
+	if !has("upstream.user_agent") || !has("cooldown.soft_rate") || has("upstream.timeout_seconds") {
 		t.Fatalf("managed=%v", fields)
 	}
 }
@@ -285,5 +283,49 @@ func TestSavedSettingsRoundTripJSON(t *testing.T) {
 	}
 	if back.Pool.MaxInFlight != 7 {
 		t.Fatalf("max_in_flight=%d", back.Pool.MaxInFlight)
+	}
+}
+
+// TestPromptTextPersistsThroughSettingsDB 后台提示词正文的完整持久化链路：
+// 面板提交 prompt.text → 原文进库 → 重启后 ParseConfig 解析出同一段正文。
+//
+// 钉住的是「提示词只是后台设置」这条契约：库里只有正文文本，没有 file 键，
+// 部署侧不存在任何 .md 文件可丢，也就不存在「保存成功、重启后回落到内置默认」的错位。
+func TestPromptTextPersistsThroughSettingsDB(t *testing.T) {
+	rig := newSaveRig(t)
+	text := "第一行\n\n- 规则一\n- 规则二"
+	body, err := json.Marshal(map[string]any{
+		"prompt": map[string]any{"mode": "custom", "text": text},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.save(t, string(body))
+
+	raw, ok, err := store.KVGet(rig.db, settingsKVKey)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	// 库里存原文，且 prompt 段不该再有遗留的 file 键（旧配置的路径值就此失联，
+	// 用户需要把正文贴进面板一次——这是「不再用文件路径」的必然代价）。
+	var probe struct {
+		Prompt map[string]any `json:"prompt"`
+	}
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		t.Fatalf("库里的设置解析不回来: %v", err)
+	}
+	if _, hasFile := probe.Prompt["file"]; hasFile {
+		t.Fatalf("库里仍留着 prompt.file: %s", raw)
+	}
+	if probe.Prompt["text"] != text {
+		t.Fatalf("库里的 prompt.text=%q want %q", probe.Prompt["text"], text)
+	}
+
+	back, err := ParseConfig([]byte(raw))
+	if err != nil {
+		t.Fatalf("重启后解析库里的设置: %v", err)
+	}
+	if back.Prompt.Mode != "custom" || back.PromptText != text {
+		t.Fatalf("mode=%q PromptText=%q want custom / %q", back.Prompt.Mode, back.PromptText, text)
 	}
 }

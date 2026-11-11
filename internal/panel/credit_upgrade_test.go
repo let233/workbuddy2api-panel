@@ -236,7 +236,6 @@ func upgNewEnv(t *testing.T, seeds ...upgSeed) *upgEnv {
 	e.up.SetCreditObserver(e.ledger.Observe)
 	e.panel = New(Config{
 		Version:       "test",
-		APIKey:        "test-key",
 		Pool:          e.pool,
 		Upstream:      e.up,
 		CreditHistory: e.ledger,
@@ -681,7 +680,7 @@ func TestUpgRestartContinuesBaseline(t *testing.T) {
 
 	up2 := testUpstream(e.fake.srv.Client(), func(rt *upstream.Runtime) { rt.ChatBaseCN = e.fake.srv.URL; rt.BillingBaseCN = e.fake.srv.URL })
 	up2.SetCreditObserver(l2.Observe)
-	pn2 := New(Config{Version: "test", APIKey: "test-key", Pool: p2, Upstream: up2, CreditHistory: l2, AuthDir: e.authDir})
+	pn2 := New(Config{Version: "test", Pool: p2, Upstream: up2, CreditHistory: l2, AuthDir: e.authDir})
 
 	// 同值不记
 	e.fake.setPersonal("u1", 150)

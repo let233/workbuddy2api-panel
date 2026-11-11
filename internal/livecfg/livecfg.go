@@ -16,7 +16,6 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429/限流软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 总开关（features.embeddings_enabled）；

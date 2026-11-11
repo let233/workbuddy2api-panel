@@ -4,8 +4,6 @@ package server
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -83,11 +81,13 @@ type AuditLog struct {
 
 // NewAuditLog 创建审计器。enabled 来自配置（原先是文件路径，现在只当开关）；
 // 关闭时调用方不传 AuditLog，不会走到这里。
-func NewAuditLog(db *store.Store, apiKey string) (*AuditLog, error) {
+func NewAuditLog(db *store.Store) (*AuditLog, error) {
 	if db == nil {
 		return nil, errors.New("审计日志需要数据库：当前为纯内存模式")
 	}
-	return &AuditLog{db: db, keyFP: keyFingerprint(apiKey)}, nil
+	// 面板改成账号登录后不再有全局密钥，「操作者」统一记 "-"；调用方仍可用
+	// auditEntry.Key 显式指定（保持旧字段可读）。
+	return &AuditLog{db: db, keyFP: "-"}, nil
 }
 
 // Path 兼容旧接口：审计已入库，没有文件路径。
@@ -96,14 +96,6 @@ func (a *AuditLog) Path() string {
 		return ""
 	}
 	return "数据库表 admin_audit"
-}
-
-func keyFingerprint(apiKey string) string {
-	if apiKey == "" {
-		return "-"
-	}
-	sum := sha256.Sum256([]byte(apiKey))
-	return hex.EncodeToString(sum[:4])
 }
 
 type auditEntry struct {
@@ -120,7 +112,9 @@ func (a *AuditLog) record(e auditEntry) {
 	if a == nil || a.db == nil {
 		return
 	}
-	e.Key = a.keyFP
+	if e.Key == "" {
+		e.Key = a.keyFP
+	}
 	ts, err := time.Parse(time.RFC3339, e.TS)
 	if err != nil {
 		ts = time.Now()

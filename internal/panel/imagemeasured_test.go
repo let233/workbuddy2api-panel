@@ -51,7 +51,7 @@ func TestPanelImageModelMeasuredCreditFallback(t *testing.T) {
 		Credit: 0.27, HasCredit: true, LatencyMs: 24000, HasLatency: true,
 	}, true)
 
-	pn := New(Config{Version: "test", APIKey: "k", Pool: p, Upstream: up, Usage: rec})
+	pn := New(Config{Version: "test", Pool: p, Upstream: up, Usage: rec})
 	rec2 := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/panel/api/models", nil)
 	req.Header.Set("Authorization", "Bearer k")

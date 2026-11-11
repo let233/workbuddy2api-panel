@@ -39,15 +39,15 @@ func TestModelProbesEndpoint(t *testing.T) {
 	}
 
 	// 0) 纯内存模式：推送返回 503（数据必须落库），读仍然 200 空集
-	if rec := post(Config{Version: "test", APIKey: "test-key"}, body); rec.Code != http.StatusServiceUnavailable {
+	if rec := post(Config{Version: "test"}, body); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("memory-only ingest: code=%d want 503", rec.Code)
 	}
 
 	// 1) 推送成功 → 读回：透传 + exists + updated_at
-	if rec := post(Config{Version: "test", APIKey: "test-key", DB: db}, body); rec.Code != http.StatusOK {
+	if rec := post(Config{Version: "test", DB: db}, body); rec.Code != http.StatusOK {
 		t.Fatalf("ingest: code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	rec := get(Config{Version: "test", APIKey: "test-key", DB: db})
+	rec := get(Config{Version: "test", DB: db})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -76,7 +76,7 @@ func TestModelProbesEndpoint(t *testing.T) {
 	// 2) 库里没有数据：空集 200（不是错误——无数据 = 无标注）。
 	//    注意每个 case 用全新结构体：向已非 nil 的 map 再次 Unmarshal 是合并不是替换。
 	empty := storetest.Open(t)
-	rec = get(Config{Version: "test", APIKey: "test-key", DB: empty})
+	rec = get(Config{Version: "test", DB: empty})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("empty table: code=%d want 200", rec.Code)
 	}
@@ -92,17 +92,17 @@ func TestModelProbesEndpoint(t *testing.T) {
 	}
 
 	// 3) 未接线（无数据库）：同库里没数据
-	rec = get(Config{Version: "test", APIKey: "test-key"})
+	rec = get(Config{Version: "test"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unwired: code=%d want 200", rec.Code)
 	}
 
 	// 4) 推送体损坏：400（让工具知道没存进去，而不是静默失败）
-	if rec := post(Config{Version: "test", APIKey: "test-key", DB: db}, `{not json`); rec.Code != http.StatusBadRequest {
+	if rec := post(Config{Version: "test", DB: db}, `{not json`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("corrupt push: code=%d want 400", rec.Code)
 	}
 	// 推送是整表替换：空 probes 清空历史结论
-	if rec := post(Config{Version: "test", APIKey: "test-key", DB: db}, `{"version":1,"probes":{}}`); rec.Code != http.StatusOK {
+	if rec := post(Config{Version: "test", DB: db}, `{"version":1,"probes":{}}`); rec.Code != http.StatusOK {
 		t.Fatalf("empty push: code=%d", rec.Code)
 	}
 	if n, err := store.Count[modelProbeRow](db); err != nil || n != 0 {

@@ -18,8 +18,8 @@ import (
 // TestBatchEndpointsRejectConcurrentRuns 五个手动全量运维接口共用防重入闸门：
 // 一轮在跑时再次触发任何全量接口都返回 409，而不是并发再跑一轮逐号打上游。
 func TestBatchEndpointsRejectConcurrentRuns(t *testing.T) {
-	p := newTestPanel()
-	p.batchRunning.Store(true) // 模拟一轮全量任务执行中
+	p := New(Config{Version: "test"}) // 鉴权与闸门无关：这里只要路由能进 handler
+	p.batchRunning.Store(true)        // 模拟一轮全量任务执行中
 	for _, path := range []string{
 		"/panel/api/checkin_all",
 		"/panel/api/travel_all",
@@ -28,9 +28,7 @@ func TestBatchEndpointsRejectConcurrentRuns(t *testing.T) {
 		"/panel/api/balance_all",
 	} {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", path, nil)
-		req.Header.Set("Authorization", "Bearer test-key")
-		p.ServeHTTP(rec, req)
+		p.ServeHTTP(rec, httptest.NewRequest("POST", path, nil))
 		if rec.Code != http.StatusConflict {
 			t.Errorf("%s: got %d want 409 (body=%s)", path, rec.Code, rec.Body.String())
 		}
@@ -38,9 +36,7 @@ func TestBatchEndpointsRejectConcurrentRuns(t *testing.T) {
 	// 闸门释放后恢复 501（无 scheduler 的既有语义），不再 409。
 	p.batchRunning.Store(false)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/panel/api/checkin_all", nil)
-	req.Header.Set("Authorization", "Bearer test-key")
-	p.ServeHTTP(rec, req)
+	p.ServeHTTP(rec, httptest.NewRequest("POST", "/panel/api/checkin_all", nil))
 	if rec.Code != http.StatusNotImplemented {
 		t.Errorf("闸门释放后应回到 501 语义, got %d", rec.Code)
 	}
@@ -77,7 +73,7 @@ func fakeModelsPool() *pool.Pool {
 // 打上游（cached=true），refresh=1 绕过缓存并刷新它，TTL 过期后重新聚合。
 func TestModelsCacheShortTTL(t *testing.T) {
 	var calls atomic.Int32
-	pn := New(Config{Version: "test", APIKey: "k", Pool: fakeModelsPool(), Upstream: fakeModelsUpstream(&calls)})
+	pn := New(Config{Version: "test", Pool: fakeModelsPool(), Upstream: fakeModelsUpstream(&calls)})
 
 	get := func(query string) (int, bool) {
 		rec := httptest.NewRecorder()

@@ -136,24 +136,24 @@ func TestLoggingDefaults(t *testing.T) {
 func TestLoadFile(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k"}`), 0o600)
+	os.WriteFile(fp, []byte(`{"listen":":9999","upstream":{"user_agent":"from-file"}}`), 0o600)
 	c, err := Load(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":9999" || c.APIKey != "k" {
+	if c.Listen != ":9999" || c.Upstream.UserAgent != "from-file" {
 		t.Errorf("c=%+v", c)
 	}
 }
 
 func TestEnvOverride(t *testing.T) {
 	t.Setenv("WB2A_LISTEN", ":7777")
-	t.Setenv("WB2A_API_KEY", "envkey")
+	t.Setenv("WB2A_USER_AGENT", "env-agent")
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":7777" || c.APIKey != "envkey" {
+	if c.Listen != ":7777" || c.Upstream.UserAgent != "env-agent" {
 		t.Errorf("c=%+v", c)
 	}
 }
@@ -802,47 +802,61 @@ func TestPromptInvalidMode(t *testing.T) {
 	}
 }
 
-// TestPromptFileMissing 文件路径非空但不存在 → 启动报错（fail fast）。
-func TestPromptFileMissing(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","file":"/nonexistent/p.md"}}`), 0o600)
-	if _, err := Load(fp); err == nil {
-		t.Fatal("want error for missing prompt file")
-	}
-}
-
-// TestPromptFileOverride 自定义 file 覆盖内置默认。
-func TestPromptFileOverride(t *testing.T) {
-	dir := t.TempDir()
-	pf := filepath.Join(dir, "my.md")
-	want := "我的自定义人格入口"
-	os.WriteFile(pf, []byte(want), 0o600)
-	cf := filepath.Join(dir, "c.json")
-	// 用 json.Marshal 拼路径：Windows 反斜杠必须转义，手工字符串拼接会产出非法 JSON。
-	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": pf}})
+// TestPromptTextFromSettings 后台设置的 prompt.text 生效（custom/append 两种模式同源）。
+func TestPromptTextFromSettings(t *testing.T) {
+	want := "我的自定义人格入口\n\n- 规则一\n- 规则二"
+	cfgJSON, err := json.Marshal(map[string]any{
+		"prompt": map[string]any{"mode": "custom", "text": want},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(cf, cfgJSON, 0o600)
-	c, err := Load(cf)
+	c, err := ParseConfig(cfgJSON)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.Prompt.Text != want {
+		t.Errorf("prompt.text=%q want %q", c.Prompt.Text, want)
 	}
 	if c.PromptText != want {
 		t.Errorf("PromptText=%q want %q", c.PromptText, want)
 	}
+	if _, err := ParseConfig([]byte(`{"prompt":{"mode":"append","text":"仅追加这一句"}}`)); err != nil {
+		t.Fatalf("append mode with text: %v", err)
+	}
 }
 
-// TestPromptEnvOverride env 覆盖 prompt.mode 与 prompt.file。
+// TestPromptTextBlankFallsBackToBuiltin text 空 / 纯空白 → 内置默认（非空），
+// 且正文不再来自任何文件路径。
+func TestPromptTextBlankFallsBackToBuiltin(t *testing.T) {
+	for _, body := range []string{
+		`{"prompt":{"mode":"custom"}}`,
+		`{"prompt":{"mode":"custom","text":"   \n\t "}}`,
+		`{"prompt":{"mode":"append","text":" "}}`,
+	} {
+		c, err := ParseConfig([]byte(body))
+		if err != nil {
+			t.Fatalf("%s: %v", body, err)
+		}
+		if strings.TrimSpace(c.PromptText) == "" {
+			t.Errorf("%s: PromptText 为空，应回落内置默认", body)
+		}
+	}
+}
+
+// TestPromptEnvOverride env 覆盖 prompt.mode 与 prompt.text。
 func TestPromptEnvOverride(t *testing.T) {
-	t.Setenv("WB2A_PROMPT_MODE", "passthrough")
+	t.Setenv("WB2A_PROMPT_MODE", "custom")
+	t.Setenv("WB2A_PROMPT_TEXT", "env 注入的人格")
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "passthrough" {
-		t.Errorf("mode=%q want passthrough", c.Prompt.Mode)
+	if c.Prompt.Mode != "custom" {
+		t.Errorf("mode=%q want custom", c.Prompt.Mode)
+	}
+	if c.PromptText != "env 注入的人格" {
+		t.Errorf("PromptText=%q want env 注入的人格", c.PromptText)
 	}
 }
 

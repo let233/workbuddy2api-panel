@@ -1006,8 +1006,13 @@ func TestLogoutWired(t *testing.T) {
 	if !strings.Contains(src, "$('btnLogout')") {
 		t.Error("app.js 未绑定 $('btnLogout')：按钮点了不会有反应")
 	}
-	if !strings.Contains(src, "localStorage.removeItem(LS_KEY)") {
-		t.Error("登出必须清掉本地密钥（LS_KEY），否则刷新后仍免密进入面板")
+	// 会话在服务端（HttpOnly Cookie），前端没有可清的本地密钥：
+	// 登出必须真的打一次 auth/logout，否则刷新后 Cookie 还在，等于没登出。
+	if !strings.Contains(src, "api('auth/logout'") {
+		t.Error("登出必须调用服务端 auth/logout 作废会话")
+	}
+	if strings.Contains(src, "LS_KEY") {
+		t.Error("前端不应再持有任何本地密钥（LS_KEY）")
 	}
 }
 
@@ -1183,8 +1188,9 @@ func TestUsageChartSingleLegend(t *testing.T) {
 
 // TestAppJSCollectConfigClearable 钉住 collectConfig 的空串语义（吸收上游 10e17ef）。
 //
-// 覆盖型字段（user_agent / prompt_file）空串必须照发：漏发会让面板显示"已保存"
-// 而 config.json 里的值没变（issue #102 附带发现 2）。
+// 覆盖型字段（user_agent / prompt_text）空串必须照发：漏发会让面板显示"已保存"
+// 而 config.json 里的值没变（issue #102 附带发现 2）。提示词正文尤其致命——
+// 用户清空文本框想退回内置默认，不发就等于继续用旧人格。
 //
 // 同时钉住反面：其余文本字段空串仍然不下发。这条同样重要——若哪天为了修上面那个
 // 问题改成"所有空串都发"，表单里任何一个没填的框都会变成"请清空"，静默抹掉配置。
@@ -1202,9 +1208,8 @@ if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region n
 const mk = v => ({ type: 'text', value: v });
 const cfgForm = { elements: {
   listen: mk(''),
-  api_key: mk('secret'),
   user_agent: mk(''),
-  prompt_file: mk(''),
+  prompt_text: mk('第一行\n第二行   '),
   checkin_hours: mk(''),
 }};
 const ctx = {
@@ -1216,12 +1221,16 @@ vm.createContext(ctx);
 vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
 const out = ctx.collectConfig();
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+// 第二轮：把提示词正文改成纯空白 —— 必须仍然下发（值归一为空串 = 清空回内置默认）。
+cfgForm.elements.prompt_text = mk('   \n\t ');
+const out2 = ctx.collectConfig();
 process.stdout.write(JSON.stringify([
   has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
-  has(out.prompt, 'file'), (out.prompt || {}).file,
+  has(out.prompt, 'text'), (out.prompt || {}).text,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),
-  out.api_key
+  has(out, 'api_key'),
+  has(out2.prompt, 'text') && out2.prompt.text === ''
 ]));`
 	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
 	if err != nil {
@@ -1235,8 +1244,9 @@ process.stdout.write(JSON.stringify([
 	if err != nil {
 		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
 	}
-	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
-	const want = `[true,"",true,"",false,false,"secret"]`
+	// [user_agent 已发, 其值, prompt.text 已发, 其值, listen 未发, checkin_hours 未发, api_key 已不存在, 纯空白仍下发()]
+	// 提示词正文只去首尾空白（空/纯空白才能表达"清空回默认"），内部换行原样保留。
+	const want = `[true,"",true,"第一行\n第二行",false,false,false,true]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}
@@ -1324,6 +1334,11 @@ console.log('trange all-history passed');`
 
 // TestConfigFormMatchesCFGMap 配置表单字段与 CFG_MAP 必须一一对应（吸收上游 7339a3c / PR #122）。
 //
+// 「配置表单」有两个：绝大多数键在 #cfgForm（配置页），更新通道那几项跟着
+// 「版本与更新」搬到了 #aboutForm（关于页）。两个表单共用同一份 CFG_MAP 与
+// collectConfig（cfgField 先查 cfgForm 再查 aboutForm），所以按并集校验；
+// 只查 cfgForm 会把搬走的那五项误判成"静默丢弃"。
+//
 // 为什么需要：这套映射断掉时没有任何编译期或运行期报错——表单多一个字段，保存时被静默
 // 丢弃；CFG_MAP 多一个键，回填/保存空转。两者都只能靠人点开配置页才发现。上游当时的
 // 现场是 `logging.request_client_info` 在表单里被连带删掉，而 Go 侧配置键、热生效通路、
@@ -1354,11 +1369,18 @@ func TestConfigFormMatchesCFGMap(t *testing.T) {
 	// thinking_mode（三选一单选组）→ thinking.client_priority + thinking.override_scope，
 	// 配置格式保持不变（手改配置文件仍是这两个字段）。
 	composite := map[string]bool{"thinking_mode": true}
-	f := html[strings.Index(html, `<form id="cfgForm">`):]
-	f = f[:strings.Index(f, "</form>")]
 	names := map[string]bool{}
-	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(f, -1) {
-		names[m[1]] = true
+	for _, id := range []string{"cfgForm", "aboutForm"} {
+		open := `<form id="` + id + `">`
+		i := strings.Index(html, open)
+		if i < 0 {
+			t.Fatalf("页面里找不到 <form id=%q>（配置项控件就挂在这两个表单上）", id)
+		}
+		f := html[i:]
+		f = f[:strings.Index(f, "</form>")]
+		for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(f, -1) {
+			names[m[1]] = true
+		}
 	}
 	if len(names) == 0 {
 		t.Fatal("未从配置表单解析出任何 name 字段")

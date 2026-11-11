@@ -52,7 +52,7 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 		rec.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u1", "glm-5.2",
 			usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
-	p := New(Config{Version: "test", APIKey: "k", Usage: rec, Pool: pool.New(nil)})
+	p := New(Config{Version: "test", Usage: rec, Pool: pool.New(nil)})
 
 	get := func(query string) map[string]any {
 		t.Helper()
@@ -106,7 +106,7 @@ func TestRequestLogsEmptyRangeReturnsArray(t *testing.T) {
 		Status: 200, OK: true, Outcome: reqlog.OutcomeSuccess})
 	rec.Close()
 
-	p := New(Config{Version: "test", APIKey: "k", Pool: pool.New(nil), RequestLog: rec})
+	p := New(Config{Version: "test", Pool: pool.New(nil), RequestLog: rec})
 	future := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
 	req := httptest.NewRequest("GET", "/panel/api/request_logs?from="+future, nil)
 	req.Header.Set("Authorization", "Bearer k")

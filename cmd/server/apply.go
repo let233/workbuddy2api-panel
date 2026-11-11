@@ -188,7 +188,6 @@ func (a *hotApplier) Apply(c *Config) error {
 
 	// —— 面板自身参数 ——
 	if a.pn != nil {
-		a.pn.SetAPIKey(c.APIKey)
 		a.pn.SetAuthDir(c.AuthDir)
 		a.pn.SetPollIntervalSec(c.Panel.PollIntervalSec)
 		a.pn.SetPackageDetailLimit(c.Panel.PackageDetailLimit)
@@ -230,7 +229,7 @@ func (a *hotApplier) syncAudit(c *Config) {
 	if a.audit != nil {
 		return
 	}
-	al, err := server.NewAuditLog(a.db, c.APIKey)
+	al, err := server.NewAuditLog(a.db)
 	if err != nil {
 		warnApply("审计日志", err)
 		return
@@ -246,7 +245,6 @@ func (a *hotApplier) syncAudit(c *Config) {
 func liveSnapshotOf(c *Config) livecfg.Snapshot {
 	allowed, allowlist := livecfg.NormalizeAllowedModels(c.Models.Allowed)
 	return livecfg.Snapshot{
-		APIKey:                 c.APIKey,
 		SoftCooldown:           c.SoftRateDur,
 		SanitizeFingerprints:   c.Features.SanitizeBlacklistFingerprints,
 		EmbeddingsEnabled:      c.Features.EmbeddingsEnabled,

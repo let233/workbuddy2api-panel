@@ -20,7 +20,6 @@ import (
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // "127.0.0.1:7863"（缺省只绑回环）
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 	// Database 运行数据的存储（gorm）：池状态 / 用量桶 / 请求归档 / 余额趋势 /
@@ -409,9 +408,11 @@ type Config struct {
 		// custom = 网关用自有系统提示词替换客户端 system/developer；
 		// append = 两者并用：开头连续 system/developer 块后插网关 system，既有消息逐字不动（issue #129）。
 		Mode string `json:"mode"` // "passthrough" / "custom" / "append"
-		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
-		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
-		File string `json:"file"`
+		// Text 后台设置里的系统提示词正文（custom/append 模式注入，随整份配置存库）；
+		// 空/纯空白 = 内置默认（defaultprompt.md 编译进二进制，运行时不读磁盘）。
+		// 不再有「提示词文件路径」：面板是唯一编辑入口，保存即热生效，部署侧不存在
+		// 宿主机文件依赖，也不会出现文件丢失后静默回落默认的错位。
+		Text string `json:"text"`
 		// KeepRecentRounds 只保留最近 N 轮对话（issue #99）：出站前丢掉更早的
 		// user/assistant/tool 消息，system 全留。0 = 关闭（全量透传）。
 		// 多轮长对话的输入 token 主要花在这上面；丢的是上下文而不是协议。
@@ -589,7 +590,6 @@ func Default() *Config {
 		// 默认只绑回环：网关 + 面板 + 空/弱 api_key 同时暴露在公网是这份配置最危险的
 		// 组合。要对外先过反代（nginx/caddy），确需直连再显式改 0.0.0.0:7863。
 		Listen:    "127.0.0.1:7863",
-		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 	}
@@ -738,9 +738,6 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
 	}
-	if v := os.Getenv("WB2A_API_KEY"); v != "" {
-		c.APIKey = v
-	}
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
 		c.AuthDir = v
 	}
@@ -817,8 +814,8 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
-	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
-		c.Prompt.File = v
+	if v := os.Getenv("WB2A_PROMPT_TEXT"); v != "" {
+		c.Prompt.Text = v
 	}
 	// 思考档位策略（thinking 节）。bool 解析失败视为不生效（与其它 env 同口径）。
 	if v := os.Getenv("WB2A_THINKING_ENABLED"); v != "" {
@@ -910,7 +907,7 @@ func applyEnv(c *Config) {
 // schedule/admin/metrics/budget/alerting 族）。
 func (c *Config) EnvironmentManagedFields() []string {
 	fields := []struct{ env, path, kind string }{
-		{"WB2A_LISTEN", "listen", ""}, {"WB2A_API_KEY", "api_key", ""},
+		{"WB2A_LISTEN", "listen", ""},
 		{"WB2A_AUTH_DIR", "auth_dir", ""}, {"WB2A_STATE_FILE", "state_file", ""},
 		{"WB2A_DB_DRIVER", "database.driver", ""}, {"WB2A_DB_DSN", "database.dsn", ""},
 		{"WB2A_DNS", "dns_servers", ""},
@@ -923,7 +920,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
 		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
 		{"WB2A_SANITIZE_BRAND_SCOPE", "features.sanitize_brand_scope", ""},
-		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
+		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_TEXT", "prompt.text", ""},
 		{"WB2A_THINKING_ENABLED", "thinking.enabled", "bool"},
 		{"WB2A_THINKING_DEFAULT_EFFORT", "thinking.default_effort", ""},
 		{"WB2A_THINKING_CLIENT_PRIORITY", "thinking.client_priority", "bool"},
@@ -1285,9 +1282,6 @@ func (c *Config) normalize() error {
 	if c.Budget.CacheLowRate < 0 || c.Budget.CacheLowRate > 100 {
 		return fmt.Errorf("budget.cache_low_rate: %v 须在 0-100 之间（百分比）；0 = 关闭", c.Budget.CacheLowRate)
 	}
-	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
-		return fmt.Errorf("admin.enabled=true 但 api_key 为空")
-	}
 	if c.Admin.AuditEnabled {
 		if !c.Admin.Enabled {
 			return fmt.Errorf("admin.audit_enabled=true 但 admin.enabled=false")
@@ -1337,11 +1331,12 @@ func (c *Config) normalize() error {
 	return c.normalizePrompt()
 }
 
-// normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
+// normalizePrompt 校验 prompt.mode，并把后台设置的提示词正文解析成生效文本。
 //
 // mode 非法（非 passthrough/custom/append）启动报错，避免静默回落到某一分支；
-// custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
-// （两模式共用同一加载路径，PromptText 均非空）。
+// custom/append 模式：prompt.text 非空 → 原样生效，空/纯空白 → 内置默认
+// （两模式共用同一解析路径，PromptText 均非空）。提示词来源只有后台设置一项，
+// 不再读文件路径。
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
 // normalizeThinking 校验并规范化 thinking 节（思考档位策略）。
 //
@@ -1396,11 +1391,7 @@ func (c *Config) normalizePrompt() error {
 		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
 	}
 	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
-		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
-		if err != nil {
-			return err
-		}
-		c.PromptText = text
+		c.PromptText = prompt.Effective(c.Prompt.Text)
 	}
 	return nil
 }

@@ -58,7 +58,7 @@ func TestPanelModelsBusyFailureDoesNotBlockCache(t *testing.T) {
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
 	p.SetCredits("g1", 1000, 0)
 
-	pn := New(Config{Version: "test", APIKey: "k", Pool: p, Upstream: up})
+	pn := New(Config{Version: "test", Pool: p, Upstream: up})
 
 	call := func() (int, map[string]any) {
 		rec := httptest.NewRecorder()

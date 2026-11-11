@@ -9,7 +9,7 @@ import (
 
 // 单选框不能被全局的 input{width:100%} 拉成整行（issue #202）。
 //
-// 背景：index.html 给表单控件统一设了 `input, select { width: 100% }`。单选框一旦
+// 背景：index.html 给表单控件统一设了 `input, select, textarea { width: 100% }`。单选框一旦
 // 落在 `display: inline-flex` 的容器里，作为 flex item 的它同样拿到 100%——于是
 // 圆圈被拉到整行宽，文字被挤到下一行（Safari 直接把 radio 压在文字上）。这两处都
 // 在容器里放了 radio：`.radios`（配置页三选一）与 `.realm-opt`（添加账号弹窗的
@@ -28,7 +28,7 @@ func TestRadioInputsNotStretchedByGlobalWidth(t *testing.T) {
 
 	// 先确认「全局 100% 宽」这条前提还在——它一旦被改掉，下面几条断言的动机就变了，
 	// 那时应该重新审视这组规则而不是让测试默默继续通过。
-	globalRe := regexp.MustCompile(`(?s)input, select \{[^}]*width: 100%`)
+	globalRe := regexp.MustCompile(`(?s)input, select(?:, textarea)? \{[^}]*width: 100%`)
 	if !globalRe.MatchString(css) {
 		t.Fatal("index.html 的 `input, select` 全局规则里没有 width:100% 了；" +
 			"若确实去掉了，请连带删掉本测试与两处单选框的规避规则")

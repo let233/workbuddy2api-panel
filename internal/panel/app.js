@@ -1,6 +1,6 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+const LS_THEME = 'wb2api.theme';
 /* 账号备注的本机键（模块级声明放顶部，避开 TDZ）。 */
 const LS_REMARKS = 'wb2api.remarks.v1';
 /* 下拉框记忆（issue #160）的单一键：日志范围、模型排序这类纯 UI 偏好存一份 JSON。
@@ -21,6 +21,8 @@ let proxyData = null, proxyPage = 1, proxyLoading = false, proxyEditID = null, p
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false;
+// 配置文件路径：/panel/api/config 的 path 字段，配置页与关于页都要显示。
+let lastCfgPath = '';
 let logPin = true, loginState = null, loginTimer = null, loginStartAt = 0;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -78,13 +80,13 @@ addEventListener('keydown', e => { if (e.key === 'Escape') navSet(false); });
 /* ── 请求 ─────────────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
+  // 凭据是 HttpOnly 会话 Cookie：浏览器自动带上，前端既不拼 Authorization，
+  // 也没有一份能被 XSS 读走的密钥副本。
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
   // status 挂到错误上：调用方靠它区分「可重试的抖动」与「重试无意义的终态」
   // （登录轮询据此决定继续等 OAuth 还是提示重新发起）。
-  if (r.status === 401) { openKey(); const e = new Error('密钥无效或未填写'); e.status = 401; throw e; }
+  if (r.status === 401) { showLogin('登录已过期，请重新登录'); const e = new Error('请先登录'); e.status = 401; throw e; }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
   return d;
@@ -438,32 +440,110 @@ function formatRate(rate) {
   return n.toFixed(1) + 'tok/s';
 }
 
-/* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
-$('btnKey').onclick = async () => {
-  const v = $('keyInput').value.trim();
-  if (!v) return;
-  localStorage.setItem(LS_KEY, v);
-  try {
-    await api('overview');
-    $('keyErr').hidden = true;
-    $('keyVeil').classList.remove('on');
-    start();
-  } catch (e) { $('keyErr').hidden = false; }
-};
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+/* ── 登录 / 会话 ──────────────────────────────────────────────────── */
+// 面板没有任何前端可读的凭据：会话 token 只在 HttpOnly Cookie 里，JS 连读都读不到。
+// 所以「是否已登录」只能问服务端（auth/session），而不是查 localStorage。
+let authUser = null;
+// 默认口令是否还生效：决定登录框要不要显示「首次部署的默认账号 admin / 123456」。
+// 改过密码就是 false——再提示只会让人照着试一次错的。
+let defaultCreds = false;
 
-// 登出：api_key 是唯一凭据（服务端只做 VerifyBearer 比对，无会话无 cookie 可失效），
-// 所以"登出"= 清掉本机保存的密钥并重载——重载把内存里的定时器与已渲染数据一并清空，
-// 无密钥时 start() 的首次请求 401 会自动弹回密钥门（data-lock="1"，不可绕过）。
-$('btnLogout').onclick = () => {
-  if (!confirm('登出将清空本机保存的 API 密钥，需要重新输入才能进入面板。确认登出？')) return;
-  localStorage.removeItem(LS_KEY);
+function showLogin(msg) {
+  const hint = $('loginHint');
+  if (hint) hint.hidden = !defaultCreds;
+  $('loginVeil').classList.add('on');
+  if (msg) { $('loginErr').textContent = msg; $('loginErr').hidden = false; }
+  const user = $('loginUser');
+  setTimeout(() => (user.value ? $('loginPass') : user).focus(), 60);
+}
+function hideLogin() { $('loginVeil').classList.remove('on'); }
+
+// readSession 走裸 fetch：api() 在 401 时会把登录层推上来，而探测「没登录」本身
+// 就是正常状态，不该触发一次弹层侧效（未登录时服务端返回 200 + authenticated:false）。
+async function readSession() {
+  const r = await fetch('/panel/api/auth/session', { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) return { authenticated: false };
+  return r.json().catch(() => ({ authenticated: false }));
+}
+
+function applyUser(s) {
+  defaultCreds = !!s && (s.default_credentials === true || s.must_change_password === true);
+  authUser = s && s.authenticated ? { username: s.username, isAdmin: !!s.is_admin } : null;
+  const el = $('whoName');
+  if (el) { el.textContent = authUser ? authUser.username : ''; el.hidden = !authUser; }
+  // 初始密码没改过：直接打开改密弹窗。首启 admin/123456 是公开知识，
+  // 只提示不拦，等于把面板留在「谁都能进」的状态。
+  if (authUser && s.must_change_password) { openPassword(); toast('当前仍是初始密码，请先修改', 'err'); }
+}
+
+async function doLogin() {
+  const username = $('loginUser').value.trim(), password = $('loginPass').value;
+  const err = $('loginErr');
+  if (!username || !password) { err.textContent = '请输入账号与密码'; err.hidden = false; return; }
+  const btn = $('btnLogin');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/panel/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      err.textContent = d.error === 'too_many_attempts' ? '尝试次数过多，请稍后再试'
+        : d.error === 'invalid_credentials' ? '账号或密码不正确'
+          : ('登录失败：' + (d.error || ('HTTP ' + r.status)));
+      err.hidden = false;
+      return;
+    }
+    err.hidden = true;
+    $('loginPass').value = '';
+    hideLogin();
+    applyUser(d);
+    start();
+  } catch (e) {
+    err.textContent = '登录失败：' + e.message; err.hidden = false;
+  } finally { btn.disabled = false; }
+}
+$('btnLogin').onclick = doLogin;
+$('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+$('loginUser').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginPass').focus(); });
+
+// 登出：会话在服务端，本机没有可清的凭据——必须让服务端把这条会话删掉。
+// 只重载页面的话 Cookie 还活着，换个人打开同一浏览器就直接进去了。
+$('btnLogout').onclick = async () => {
+  if (!confirm('确认登出？下次进入需要重新输入账号密码。')) return;
+  try { await api('auth/logout', { method: 'POST' }); } catch (e) { /* 会话已失效也算登出成功 */ }
+  authUser = null;
   location.reload();
 };
 
+function openPassword() {
+  $('pwVeil').classList.add('on');
+  $('pwErr').hidden = true;
+  $('pwOld').value = ''; $('pwNew').value = ''; $('pwNew2').value = '';
+  setTimeout(() => $('pwOld').focus(), 60);
+}
+if ($('btnPw')) $('btnPw').onclick = openPassword;
+if ($('btnPwCancel')) $('btnPwCancel').onclick = () => $('pwVeil').classList.remove('on');
+if ($('btnPwSave')) $('btnPwSave').onclick = async () => {
+  const oldPw = $('pwOld').value, next = $('pwNew').value, again = $('pwNew2').value;
+  const fail = m => { $('pwErr').textContent = m; $('pwErr').hidden = false; };
+  if (!oldPw || !next) return fail('请填写当前密码与新密码');
+  if (next !== again) return fail('两次输入的新密码不一致');
+  if (next.length < 6) return fail('新密码至少 6 位');
+  try {
+    await api('auth/password', { method: 'POST', body: JSON.stringify({ old_password: oldPw, new_password: next }) });
+    // 口令已经换掉：登录框那句「首次部署的默认账号 admin / 123456」到此作废。
+    defaultCreds = false;
+    $('pwVeil').classList.remove('on');
+    toast('密码已修改', 'ok');
+  } catch (e) {
+    fail(e.message === 'invalid_old_password' ? '当前密码不正确' : ('修改失败：' + e.message));
+  }
+};
+
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', expiry: '积分到期', proxies: '代理池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志' };
+const TITLES = { accounts: '账号池', apikeys: 'API Key', expiry: '积分到期', proxies: '代理池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志', about: '关于' };
 function go(v) {
   navSet(false);
   view = v;
@@ -471,7 +551,12 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  // 客户端 API Key：每次进页都拉一遍（配置变更要立刻可见）。
+  if (v === 'apikeys') loadGatewayKeys();
   if (v === 'config') loadConfig();
+  // 关于页：更新通道的输入框在 #aboutForm 里，同样靠 loadConfig 回填；
+  // 版本/运行时长/配置路径由 loadAbout 从 overview + 配置响应里取。
+  if (v === 'about') { loadConfig(); loadAbout(); }
   if (v === 'proxies') loadProxies();
   // 切到日志视图：本地窗口为空（首次）时全量拉一次；已有窗口则继续增量。
   // 注意**不要**在每次切视图时 resetLogWindow()——那会把增量游标清掉，下一轮
@@ -937,8 +1022,10 @@ if ($('btnUpdateCheck')) $('btnUpdateCheck').onclick = checkForUpdates;
 if ($('btnUpdateProbe')) $('btnUpdateProbe').onclick = probeUpdateChannel;
 if ($('btnUpdateInstall')) $('btnUpdateInstall').onclick = installUpdate;
 if ($('btnUpdateRelease')) $('btnUpdateRelease').onclick = openLatestRelease;
+// 顶栏「有更新」角标直接跳到关于页：版本与更新整块已经搬到那里（配置页不再有入口，
+// 角标是唯一的快捷跳转，仍指向配置页就会落在没有更新控件的页面上）。
 if ($('navUpdate')) $('navUpdate').onclick = () => {
-  go('config');
+  go('about');
   $('updateNote').scrollIntoView({ block: 'center', behavior: 'smooth' });
 };
 
@@ -978,6 +1065,11 @@ async function loadOverview(quiet) {
     $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
     if (typeof renderUpdateStatus === 'function') renderUpdateStatus(d.update || { current_version: d.version });
+    // 关于页可见时顺手刷新运行环境（版本/运行时长/Redis）：首次进页时 overview
+    // 可能还没到，那时写的是占位符，这里补上。隐藏页不写，免得每 5 秒白动 DOM。
+    // typeof 守卫不是为了防呆：单测会把 loadOverview 单独切出来在 vm 里跑，
+    // 那里既没有 view 也没有 renderAboutRuntime。
+    if (typeof view !== 'undefined' && view === 'about' && typeof renderAboutRuntime === 'function') renderAboutRuntime(d);
     if (d.update && d.update.update_available &&
       (!previousUpdate || !previousUpdate.update_available || previousUpdate.latest_version !== d.update.latest_version)) {
       toast('发现新版本 v' + d.update.latest_version, 'ok');
@@ -1265,10 +1357,7 @@ function accStamp() {
 /* downloadAccountsJSON 下载导出文件。走 fetch 而不是 api()：api() 按 JSON 解析并返回
    对象，这里要的是原始 body 落盘，文件名也由前端算（后端只给 Content-Disposition）。 */
 async function downloadAccountsJSON(path, name) {
-  const h = {};
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
-  const r = await fetch('/panel/api/' + path, { headers: h });
+  const r = await fetch('/panel/api/' + path);
   if (!r.ok) {
     let msg = 'HTTP ' + r.status;
     try {
@@ -2299,7 +2388,7 @@ $('btnLogPin').onclick = () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
-  listen: ['listen'], api_key: ['api_key'],
+  listen: ['listen'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   update_auto_enabled: ['update', 'auto_enabled'], update_auto_time: ['update', 'auto_time'],
   update_proxy: ['update', 'proxy'], update_mirror: ['update', 'mirror'],
@@ -2334,7 +2423,7 @@ const CFG_MAP = {
   ttl: ['session_sticky', 'ttl'],
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
-  prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
+  prompt_mode: ['prompt', 'mode'], prompt_text: ['prompt', 'text'],
   keep_recent_rounds: ['prompt', 'keep_recent_rounds'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   sanitize_brand_scope: ['features', 'sanitize_brand_scope'],
@@ -2357,11 +2446,8 @@ const CFG_MAP = {
  *
  * 但覆盖型字段正好相反：清空 = 明确要求回到默认。漏发它们会让面板显示"已保存"
  * 而值其实没变（吸收上游 10e17ef：user_agent 清空后 config.json 里仍是旧值）。
- *
- * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
- * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'cn_chat_base', 'cn_billing_base', 'global_chat_base', 'global_billing_base']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_text', 'cn_chat_base', 'cn_billing_base', 'global_chat_base', 'global_billing_base']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -2370,15 +2456,46 @@ function put(obj, path, val) {
   o[path[path.length - 1]] = val;
 }
 
+// loadAbout 只做展示：版本与运行时长来自 /panel/api/overview（本来就在轮询），
+// 配置路径与更新通道来自 loadConfig；更新状态由 renderUpdateStatus 填（轮询与
+// 手动「检查更新」共用同一条渲染路径，这里不另算一份）。
+function aboutUptime(sec) {
+  const s = Number(sec);
+  if (!Number.isFinite(s) || s < 0) return '—';
+  if (s < 60) return s + ' 秒';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + ' 分钟';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + ' 小时 ' + (m % 60) + ' 分钟';
+  return Math.floor(h / 24) + ' 天 ' + (h % 24) + ' 小时';
+}
+// renderAboutRuntime 只写「运行环境」那几格。抽出来是因为首次 go('about') 时
+// overview 往往还没回来（深链直接开 #about 尤其明显），那时候只能先写占位符，
+// 等 overview 第一份到了再补——loadOverview 在关于页可见时会调它。
+function renderAboutRuntime(d) {
+  d = d || {};
+  if ($('aboutVer')) $('aboutVer').textContent = displayVersion(d.version || (cfgLoaded && cfgLoaded.version));
+  if ($('aboutUptime')) $('aboutUptime').textContent = d.uptime_sec == null ? '—' : '已运行 ' + aboutUptime(d.uptime_sec);
+  if ($('aboutRedis')) $('aboutRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像（upstash）' : '本地内存 / sqlite';
+}
+function loadAbout() {
+  const d = overviewData || {};
+  renderAboutRuntime(d);
+  if ($('aboutCfgPath')) $('aboutCfgPath').textContent = lastCfgPath || '（默认路径）';
+  if (d.update) renderUpdateStatus(d.update);
+}
+
 async function loadConfig() {
   try {
     const d = await api('config');
     cfgLoaded = d.config;
     $('cfgPath').textContent = d.path || '';
     const f = $('cfgForm');
+    lastCfgPath = d.path || '';
+    if ($('aboutCfgPath')) $('aboutCfgPath').textContent = lastCfgPath || '（默认路径）';
     const managed = d.environment_managed_fields || [];
     for (const [name, path] of Object.entries(CFG_MAP)) {
-      const el = f.elements[name];
+      const el = cfgField(name);
       if (!el) continue;
       el.disabled = managed.includes(path.join('.'));
       el.title = el.disabled ? '此项由启动环境变量设置，请在部署配置中修改。' : '';
@@ -2397,8 +2514,6 @@ async function loadConfig() {
     try {
       for (const r of f.querySelectorAll('input[name="thinking_mode"]')) r.checked = r.value === mode;
     } catch (e) { /* DOM 桩没有 NodeList 迭代器 */ }
-    $('cfgKey').disabled = !!d.api_key_env_managed;
-    $('cfgKey').title = d.api_key_env_managed ? '访问密钥由启动环境变量设置，请在部署配置中修改。' : '';
     $('cfgNote').textContent = managed.length ? '由启动环境管理：' + managed.join('、') : '';
     refreshEffortDowngradeNote(); // 回填后按当前值算一次降级提示
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
@@ -2444,10 +2559,21 @@ function thinkingModeOf(t) {
   return String(t.override_scope || '').toLowerCase() === 'all' ? 'all' : 'level';
 }
 
+// 配置项现在散在两个表单里：绝大部分在 #cfgForm（配置页），
+// 更新通道那几项跟着「版本与更新」搬到了 #aboutForm（关于页）。
+// 名字在两处不重复，按「先配置页、后关于页」找即可，两边共用同一份
+// CFG_MAP / collectConfig / loadConfig，不再写两套读写逻辑。
+function cfgField(name) {
+  for (const id of ['cfgForm', 'aboutForm']) {
+    const f = $(id);
+    if (f && f.elements && f.elements[name]) return f.elements[name];
+  }
+  return null;
+}
 function collectConfig() {
   const f = $('cfgForm'), out = {};
   for (const [name, path] of Object.entries(CFG_MAP)) {
-    const el = f.elements[name];
+    const el = cfgField(name);
     if (!el) continue;
     let v;
     if (el.type === 'checkbox') v = el.checked;
@@ -2506,12 +2632,6 @@ $('cfgForm').addEventListener('input', ev => {
 $('cfgForm').addEventListener('change', ev => {
   if (ev.target.name === 'thinking_default_effort') refreshEffortDowngradeNote();
 });
-$('btnEye').onclick = () => {
-  const el = $('cfgKey');
-  const show = el.type === 'password';
-  el.type = show ? 'text' : 'password';
-  $('btnEye').textContent = show ? '隐藏' : '显示';
-};
 $('btnCfgReload').onclick = loadConfig;
 // cfgRealmFilter 配置页分域切换：all 显示全部；cn/global 仅显示该域专属字段
 // （data-realm 标记）。共享配置（无 data-realm）始终显示。保存时仍回传整份配置，
@@ -2538,18 +2658,21 @@ if ($('cfgRealmTabs')) {
   });
   applyCfgRealmFilter();
 }
-$('cfgForm').onsubmit = async ev => {
-  ev.preventDefault();
+$('cfgForm').onsubmit = async ev => { ev.preventDefault(); await saveConfig($('btnCfgSave'), '保存配置'); };
+// 关于页的「保存更新设置」走同一条保存路径：collectConfig 会带上两个表单的当前值，
+// 只改更新通道时其余字段本来就是刚回填的现值，等价于一次全量提交。
+if ($('btnAboutSave')) $('btnAboutSave').onclick = () => saveConfig($('btnAboutSave'), '保存更新设置');
+
+async function saveConfig(btn, idleText) {
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
   markDurationFields();
   const firstBad = DURATION_FIELDS.find(durationBad);
   if (firstBad) {
-    const el = $('cfgForm').elements[firstBad];
-    el.focus();
-    toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
+    const el = cfgField(firstBad);
+    if (el) el.focus();
+    toast('「' + ((el && el.closest('.fld')?.querySelector('.lb')?.textContent) || firstBad) + '」' + DURATION_TIP, 'err');
     return;
   }
-  const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
     const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
@@ -2557,21 +2680,21 @@ $('cfgForm').onsubmit = async ev => {
     // 只剩引导参数会进这份清单（listen 走 listener 热切，不在此列）：其余全部当场生效。
     const restartNote = fields.length ? '需重启进程（引导参数）：' + fields.join('、') : '';
     toast(fields.length ? '配置已保存，其中 ' + fields.length + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-    // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
-    // 由启动环境变量托管时不写入本地（避免把无效值当会话密钥）。
-    const k = $('cfgKey').value.trim();
-    if (k && !r.api_key_env_managed) localStorage.setItem(LS_KEY, k);
     await loadConfig();
-    $('cfgNote').textContent = [restartNote, (r.environment_managed_fields || []).length ? '由启动环境管理：' + r.environment_managed_fields.join('、') : ''].filter(Boolean).join('；');
+    if ($('cfgNote')) $('cfgNote').textContent = [restartNote, (r.environment_managed_fields || []).length ? '由启动环境管理：' + r.environment_managed_fields.join('、') : ''].filter(Boolean).join('；');
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '保存配置'; }
-};
+  finally { btn.disabled = false; btn.textContent = idleText; }
+}
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 // 导入预览态的暂存：{files: File[], ready: bool, result?: 预览响应}。
 // 只活到确认导入或关闭弹窗为止；File 对象本身在浏览器里，再次 POST 时重发即可。
 let importPending = null;
+// 已选文件队列（多选 + 追加 + 单个移除）。File 对象只活在浏览器里，重发即可。
+let importQueue = [];
+// 预览请求序号：队列在 dryRun 途中又变了，旧响应必须作废，否则预览与队列不符。
+let importSeq = 0;
 function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到登录标签
@@ -2696,8 +2819,12 @@ function closeAdd() {
   stopPoll(); loginState = null; $('addVeil').classList.remove('on');
   // 导入预览态一并清掉：关掉弹窗再打开时不该还挂着上一次的文件和「确认导入」。
   importPending = null;
+  importQueue = [];
+  renderImportQueue();
   $('importPreview').hidden = true;
   $('importPreview').innerHTML = '';
+  $('importProg').hidden = true;
+  $('importProg').innerHTML = '';
   $('btnImportCommit').hidden = true;
   $('importDone').hidden = true;
   $('importErr').hidden = true;
@@ -2733,48 +2860,73 @@ $('btnAddApiKey').onclick = async () => {
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+function importFileKey(f) { return f.name + ':' + f.size + ':' + (f.lastModified || 0); }
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+// 已选文件队列：多选不只是「一次能勾几个」——选错一个要能单独移除，再点一次
+// 「选择文件」是追加而不是替换，否则用户只能全部重来。
+function renderImportQueue() {
+  const box = $('importQueue');
+  if (!box) return;
+  if (!importQueue.length) { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  const rows = importQueue.map((f, i) =>
+    '<div class="iq"><span class="iq-n" title="' + esc(f.name) + '">' + esc(f.name) + '</span>'
+    + '<span class="iq-s">' + esc(fmtBytes(f.size)) + '</span>'
+    + '<button class="xs ghost" data-iq="' + i + '">移除</button></div>');
+  box.innerHTML = '<div class="hint" style="font-size:12px;margin-bottom:4px">已选 ' + importQueue.length
+    + ' 个文件，按选择顺序合并校验（重复账号保留先出现的那条）</div>' + rows.join('');
+}
+$('importQueue').addEventListener('click', ev => {
+  const btn = ev.target.closest('[data-iq]');
+  if (!btn) return;
+  importQueue.splice(Number(btn.getAttribute('data-iq')), 1);
+  renderImportQueue();
+  previewImportQueue(); // 队列变了，旧预览作废
+});
 $('importFile').onchange = async () => {
   const files = Array.from($('importFile').files || []);
+  // 立刻清空：不清的话同一个文件再选一次不触发 change，「追加/重选」就成了死路。
+  $('importFile').value = '';
   $('importDone').hidden = true; $('importErr').hidden = true;
-  importPending = null;
-  $('importPreview').hidden = true;
-  $('btnImportCommit').hidden = true;
   if (!files.length) return;
-  // 导入是不可逆动作（覆盖已有凭据前还要过上游校验），所以分两步：选中文件后先
-  // 发一次 dryRun 预览——服务端只做解析、必填、uid 合法性与批内去重，不落盘、
-  // 不发上游请求；点「确认导入」才真正写入。
-  //
-  // 多文件在服务端是整体事务：任一文件不是合法 JSON 或没有任何账号就整体 400，
-  // 不做「先把前面那部分导进去」。顺序即选择顺序（先选的优先）。
-  importPending = { files, ready: false };
-  const label = files.length > 1 ? files.length + ' 个文件' : files[0].name;
-  $('importPreview').hidden = false;
-  $('importPreview').innerHTML = '<div class="hint">正在校验 ' + esc(label) + '…</div>';
-  try {
-    const d = await postImport(true);
-    importPending.result = d;
-    importPending.ready = true;
-    renderImportPreview(label, d);
-    $('btnImportCommit').hidden = false;
-  } catch (e) {
-    importPending = null;
-    $('importPreview').innerHTML = '<div class="hint" style="color:var(--warn)">校验失败，未导入任何账号：' + esc(e.message) + '</div>';
-    $('btnImportCommit').hidden = true;
+  const seen = new Set(importQueue.map(importFileKey));
+  let added = 0;
+  for (const f of files) {
+    const k = importFileKey(f);
+    if (seen.has(k)) continue; // 同名同大小同 mtime 视为重复选择，不重复计入
+    seen.add(k); importQueue.push(f); added++;
   }
+  renderImportQueue();
+  if (!added) toast('这几个文件已经在队列里了', '');
+  await previewImportQueue();
 };
 $('btnImportCommit').onclick = async () => {
   if (!importPending || !importPending.ready) return;
   const btn = $('btnImportCommit');
   btn.disabled = true;
-  const label = importPending.files.length > 1 ? importPending.files.length + ' 个文件' : importPending.files[0].name;
+  $('importErr').hidden = true;
+  $('importProg').hidden = true;
+  $('importProg').innerHTML = '';
+  const label = importQueue.length > 1 ? importQueue.length + ' 个文件' : importQueue[0].name;
   try {
     const d = await postImport(false);
-    $('importPreview').hidden = true;
-    $('importDone').hidden = false;
-    $('importDone').textContent = '导入完成（' + label + '）：新增 ' + (d.creates || 0)
-      + ' 个，覆盖 ' + (d.overwrites || 0) + ' 个'
-      + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
-    if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+    // 真实导入是后台任务：每个覆盖项都要先向上游求证一次，上百个号能跑十几分钟。
+    // 这里拿 job_id 开始轮询进度（进度条 + 当前账号 + 计数），按钮不再空转。
+    if (d && d.job_id) {
+      $('importPreview').hidden = true;
+      btn.hidden = true;
+      const out = await watchImportJob(d.job_id, label);
+      renderImportDone(label, out);
+    } else {
+      renderImportDone(label, d);
+    }
+    importQueue = [];
+    renderImportQueue();
     importPending = null;
     $('btnImportCommit').hidden = true;
     invalidatePackages();
@@ -2782,17 +2934,105 @@ $('btnImportCommit').onclick = async () => {
   } catch (e) {
     $('importErr').hidden = false;
     $('importErr').textContent = '导入失败：' + e.message;
-    btn.disabled = false;
   }
+  btn.disabled = false;
   $('importFile').value = '';
 };
 
-// 预览区：先给一句人话结论（新增/覆盖/跳过），再列具体条目问题。
+// 轮询导入任务进度：running 时 400ms 一跳，结束即停。连续 3 次取不到任务
+// （面板重启 / 任务过期）就停下并把最后一次快照留在界面上——总比让用户对着
+// 一根永远不动的进度条等下去好。
+function watchImportJob(id, label) {
+  const path = 'import/cockpit/jobs/' + encodeURIComponent(id);
+  return new Promise(resolve => {
+    let last = null, misses = 0;
+    const tick = async () => {
+      try {
+        last = await api(path);
+        misses = 0;
+      } catch (e) {
+        if (++misses >= 3) {
+          $('importErr').hidden = false;
+          $('importErr').textContent = '进度查询中断（' + e.message + '）：可能已导入部分账号，刷新账号列表确认';
+          resolve(last || { creates: 0, overwrites: 0, skipped: 0 });
+          return;
+        }
+        setTimeout(tick, 800);
+        return;
+      }
+      renderImportProgress(last, label);
+      if (last.state === 'running') { setTimeout(tick, 400); return; }
+      resolve(last);
+    };
+    tick();
+  });
+}
+// 进度区：一条进度条 + 一行计数 + 当前处理中的账号（昵称优先）。
+function renderImportProgress(d, label) {
+  const box = $('importProg');
+  if (!box) return;
+  box.hidden = false;
+  const total = Math.max(1, d.total || 0);
+  const pct = Math.round(Math.min(d.processed || 0, total) / total * 100);
+  const bits = ['已处理 ' + (d.processed || 0) + '/' + (d.total || 0)];
+  bits.push('新增 ' + (d.creates || 0));
+  bits.push('覆盖 ' + (d.overwrites || 0));
+  if (d.skipped) bits.push('跳过 ' + d.skipped);
+  if (d.elapsed_ms) bits.push('用时 ' + (d.elapsed_ms / 1000).toFixed(1) + 's');
+  box.innerHTML = '<div class="hint" style="font-size:12px;margin-bottom:4px">' + esc(label || '')
+    + ' · ' + (d.state === 'running' ? '正在导入' : '导入完成') + '</div>'
+    + '<div class="prog"><i style="width:' + pct + '%"></i></div>'
+    + '<div class="prog-note"><span>' + esc(bits.join(' · ')) + '</span>'
+    + (d.current ? '<span class="cur">当前：' + esc(d.current) + '</span>' : '')
+    + '</div>';
+}
+function renderImportDone(label, d) {
+  $('importProg').hidden = true;
+  $('importProg').innerHTML = '';
+  $('importDone').hidden = false;
+  $('importDone').textContent = '导入完成（' + label + '）：新增 ' + (d.creates || 0)
+    + ' 个，覆盖 ' + (d.overwrites || 0) + ' 个'
+    + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
+  if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+}
+
+// 预览：整批 dryRun 一次（服务端只解析、校验、批内去重；不落盘、不发上游）。
+// 多文件在服务端是整体事务：任一文件不是合法 JSON 或没有账号就整体 400，不做
+// 「先把前面那部分导进去」。顺序即队列顺序（先选的优先）。
+async function previewImportQueue() {
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('btnImportCommit').hidden = true;
+  if (!importQueue.length) { $('importPreview').innerHTML = ''; return; }
+  const label = importQueue.length > 1 ? importQueue.length + ' 个文件' : importQueue[0].name;
+  const seq = ++importSeq;
+  importPending = { ready: false };
+  $('importPreview').hidden = false;
+  $('importPreview').innerHTML = '<div class="hint">正在校验 ' + esc(label) + '…</div>';
+  try {
+    const d = await postImport(true);
+    if (seq !== importSeq) return; // 途中队列又变了，这次结果作废
+    importPending = { ready: true, result: d };
+    renderImportPreview(label, d);
+    $('btnImportCommit').hidden = false;
+  } catch (e) {
+    if (seq !== importSeq) return;
+    importPending = null;
+    $('importPreview').innerHTML = '<div class="hint" style="color:var(--warn)">校验失败，未导入任何账号：' + esc(e.message) + '</div>';
+    $('btnImportCommit').hidden = true;
+  }
+}
+
+// 预览区：先给一句人话结论（新增/覆盖/跳过），再按文件列来源，最后列条目问题。
 // 跳过项只列前 20 条——几百条的清单塞进弹窗只会把「结论」顶出视野。
 function renderImportPreview(label, d) {
   const bits = ['新增 ' + (d.creates || 0) + ' 个', '覆盖 ' + (d.overwrites || 0) + ' 个'];
   if (d.skipped) bits.push('跳过 ' + d.skipped + ' 个');
   let html = '<div class="hint"><b>' + esc(label) + '</b> · 共 ' + (d.total || 0) + ' 条：' + bits.join('，') + '</div>';
+  if (d.files && d.files.length > 1) {
+    html += '<div class="hint" style="font-size:12px">按文件：'
+      + d.files.map(f => esc(f.name) + '（' + (f.items || 0) + ' 条）').join('、') + '</div>';
+  }
   if (d.overwrites) {
     html += '<div class="hint" style="font-size:12px">覆盖项会先用 refresh 向上游求证新凭据可用，通过才写盘；不通过则保留原有凭据。</div>';
   }
@@ -2810,15 +3050,14 @@ function renderImportPreview(label, d) {
   $('importPreview').innerHTML = html;
 }
 
-// 导入请求：多文件按选择顺序塞进同一个 multipart，服务端逐份解码后合并。
+// 导入请求：队列里的文件按选择顺序塞进同一个 multipart，服务端逐份解码后合并。
+// dryRun 同步返回预览；写入带 async=1，返回 job_id 由前端轮询进度。
 function postImport(dryRun) {
   const fd = new FormData();
-  for (const f of importPending.files) fd.append('file', f, f.name);
+  for (const f of importQueue) fd.append('file', f, f.name);
   if (dryRun) fd.append('dryRun', 'true');
-  const h = {};
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
-  return fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h })
+  else fd.append('async', '1');
+  return fetch('/panel/api/import/cockpit', { method: 'POST', body: fd })
     .then(async r => {
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
@@ -2891,13 +3130,19 @@ function startPolling() {
 function start() {
   loadOverview(true);
   startPolling();
-  checkAuthGate();
 }
-async function checkAuthGate() {
-  try { await api('overview'); }
-  catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
+// 启动：先问服务端「我登录了吗」，再决定渲染什么。
+// 未登录时不做任何数据请求——登录层在 HTML 里默认可见，这里只是把状态补齐；
+// 顺手补一次 readSession 也让「Cookie 过期但页面还开着」在刷新后立刻回到登录框。
+async function boot() {
+  let s;
+  try { s = await readSession(); } catch (e) { s = { authenticated: false }; }
+  applyUser(s);
+  if (!s.authenticated) { showLogin(); return; }
+  hideLogin();
+  start();
 }
-start();
+boot();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
 let taskUID = null, taskCapabilities = { accept: false, claim: false, automate: false };
@@ -6254,3 +6499,379 @@ for (const [id, realm] of [['proxyRealmCn', 'cn'], ['proxyRealmGlobal', 'global'
     await loadProxies(true);
   };
 }
+
+/* ── 客户端 API Key（多 Key + 分组模板）─────────────────────────────
+   客户端 Key = 网关签发给下游的密钥（sk- 开头），与账号池里的上游 key 无关。
+   每个 Key 可单独限定：到期时间 / 可用模型（空 = 全部）/ 积分额度 /
+   系统提示词模式与正文（模式空 = 跟随全局配置）。
+   「分组模板」把这几个字段打成可复用的一包，新建 Key 时预填。 */
+let gkData = { keys: [], templates: [], global: { prompt_mode: '', prompt_text: '' }, now: 0 };
+let gkEditID = null;
+let gkTplEditID = null;
+
+const GK_STATUS = { ok: '可用', disabled: '已禁用', expired: '已到期', quota_exceeded: '额度用尽' };
+const GK_MODE = { '': '跟随全局', custom: 'custom 替换', passthrough: 'passthrough 透传', append: 'append 追加' };
+
+function gkPad(n) { return String(n).padStart(2, '0'); }
+function gkLocalInput(unix) {
+  if (!unix) return '';
+  const d = new Date(unix * 1000);
+  return d.getFullYear() + '-' + gkPad(d.getMonth() + 1) + '-' + gkPad(d.getDate()) + 'T' + gkPad(d.getHours()) + ':' + gkPad(d.getMinutes());
+}
+function gkUnix(v) {
+  if (!v) return 0;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0;
+}
+function gkDateText(unix) {
+  if (!unix) return '永不过期';
+  return gkLocalInput(unix).replace('T', ' ');
+}
+function gkNum(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '0';
+  return String(Math.round(n * 100) / 100);
+}
+function gkSplitModels(text) {
+  return String(text || '').split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+}
+function gkModelText(models) {
+  const list = Array.isArray(models) ? models.filter(Boolean) : [];
+  return list.length ? list.join('、') : '不限';
+}
+function gkCreditText(k) {
+  const limit = Number(k.credit_limit) || 0;
+  const used = Number(k.credit_used) || 0;
+  if (!limit) return gkNum(used) + ' / 不限';
+  const pct = Math.min(999, Math.round(used / limit * 100));
+  return gkNum(used) + ' / ' + gkNum(limit) + '（' + pct + '%）';
+}
+function gkPromptText(k) { return GK_MODE[k.prompt_mode || ''] || k.prompt_mode || ''; }
+function gkStatusClass(status) {
+  if (status === 'ok') return 'ok';
+  if (status === 'quota_exceeded') return 'bad';
+  return 'warn';
+}
+
+function gkShowErr(id, msg) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = msg || '';
+  el.hidden = !msg;
+}
+function gkClearErr(id) { gkShowErr(id, ''); }
+
+async function loadGatewayKeys() {
+  let d = null;
+  try {
+    d = await api('apikeys');
+  } catch (e) {
+    if (e.status === 501) {
+      setHTML($('gkBody'), '<tr><td colspan="9" class="hint">该实例未启用客户端 Key 管理（网关只认这里分发的 Key）。</td></tr>');
+      return;
+    }
+    toast('API Key 读取失败：' + e.message, 'err');
+    return;
+  }
+  gkData = d || gkData;
+  renderGatewayKeys();
+  gkFillTplPick($('gkTplPick') ? $('gkTplPick').value : '');
+}
+
+function renderGatewayKeys() {
+  const keys = Array.isArray(gkData.keys) ? gkData.keys : [];
+  const tpls = Array.isArray(gkData.templates) ? gkData.templates : [];
+  let ok = 0, expired = 0, quota = 0, credit = 0, reqs = 0;
+  const rows = keys.map(k => {
+    const status = k.status || 'ok';
+    if (status === 'ok') ok++;
+    else if (status === 'quota_exceeded') quota++;
+    else expired++;
+    credit += Number(k.credit_used) || 0;
+    reqs += Number(k.requests) || 0;
+    const id = esc(k.id || '');
+    return '<tr>' +
+      '<td>' + esc(k.name || '未命名') + (k.note ? '<div class="hint">' + esc(k.note) + '</div>' : '') + '</td>' +
+      '<td><code title="' + esc(k.secret || '') + '">' + esc(k.secret || '') + '</code> ' +
+        '<button class="xs ghost" data-gk-act="copy" data-gk-id="' + id + '">复制</button></td>' +
+      '<td><span class="' + gkStatusClass(status) + '">' + esc(GK_STATUS[status] || status) + '</span></td>' +
+      '<td>' + esc(gkDateText(k.expires_at)) + '</td>' +
+      '<td>' + esc(gkModelText(k.models)) + '</td>' +
+      '<td>' + esc(gkCreditText(k)) + '</td>' +
+      '<td>' + esc(gkPromptText(k)) + '</td>' +
+      '<td>' + (k.last_used_at ? esc(gkDateText(k.last_used_at)) : '从未使用') + '</td>' +
+      '<td class="ops">' +
+        '<button class="xs ghost" data-gk-act="edit" data-gk-id="' + id + '">编辑</button> ' +
+        '<button class="xs ghost" data-gk-act="reset" data-gk-id="' + id + '">重置用量</button> ' +
+        '<button class="xs ghost" data-gk-act="del" data-gk-id="' + id + '">删除</button>' +
+      '</td>' +
+    '</tr>';
+  });
+  if (!rows.length) {
+    rows.push('<tr><td colspan="9" class="hint">还没有 Key。点右上「新建 Key」签发第一把，或先在「分组模板」里把常用配置存成一包。</td></tr>');
+  }
+  setHTML($('gkBody'), rows.join(''));
+  if ($('gkStatTotal')) $('gkStatTotal').textContent = String(keys.length);
+  if ($('gkStatOk')) $('gkStatOk').textContent = String(ok);
+  if ($('gkStatExpired')) $('gkStatExpired').textContent = String(expired);
+  if ($('gkStatQuota')) $('gkStatQuota').textContent = String(quota);
+  if ($('gkStatCredit')) $('gkStatCredit').textContent = gkNum(credit);
+  if ($('gkStatReq')) $('gkStatReq').textContent = String(reqs);
+  if ($('gkNote')) {
+    const g = gkData.global || {};
+    const gm = g.prompt_mode ? (GK_MODE[g.prompt_mode] || g.prompt_mode) : '未设置（内置默认）';
+    $('gkNote').textContent = '全局提示词：' + gm + ' · 模板 ' + tpls.length + ' 个';
+  }
+  renderGatewayTemplates();
+}
+
+function gkFillTplPick(selected) {
+  const sel = $('gkTplPick');
+  if (!sel) return;
+  const tpls = Array.isArray(gkData.templates) ? gkData.templates : [];
+  const keep = selected == null ? sel.value : selected;
+  sel.innerHTML = '<option value="">不套用</option>' + tpls.map(t =>
+    '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>').join('');
+  sel.value = tpls.some(t => t.id === keep) ? keep : '';
+}
+
+function gkFindKey(id) { return (gkData.keys || []).find(k => k.id === id) || null; }
+
+function gkResetForm() {
+  gkEditID = null;
+  $('gkDlgTitle').textContent = '新建 API Key';
+  $('gkName').value = '';
+  $('gkSecret').value = '';
+  $('gkExpires').value = '';
+  $('gkLimit').value = '';
+  $('gkUsedView').value = '0';
+  $('gkModels').value = '';
+  $('gkMode').value = '';
+  $('gkPrompt').value = '';
+  $('gkMemo').value = '';
+  $('gkEnabled').checked = true;
+  gkFillTplPick('');
+  gkClearErr('gkErr');
+}
+
+function openGatewayKeyCreate() {
+  gkResetForm();
+  $('gkVeil').classList.add('on');
+  $('gkName').focus();
+}
+
+function openGatewayKeyEdit(id) {
+  const k = gkFindKey(id);
+  if (!k) return;
+  gkResetForm();
+  gkEditID = k.id;
+  $('gkDlgTitle').textContent = '编辑 API Key · ' + (k.name || k.id);
+  $('gkName').value = k.name || '';
+  $('gkSecret').value = k.secret || '';
+  $('gkExpires').value = gkLocalInput(k.expires_at);
+  $('gkLimit').value = k.credit_limit ? gkNum(k.credit_limit) : '';
+  $('gkUsedView').value = gkNum(k.credit_used);
+  $('gkModels').value = (k.models || []).join('\n');
+  $('gkMode').value = k.prompt_mode || '';
+  $('gkPrompt').value = k.prompt_text || '';
+  $('gkMemo').value = k.note || '';
+  $('gkEnabled').checked = k.enabled !== false;
+  gkFillTplPick(k.template_id || '');
+  $('gkVeil').classList.add('on');
+}
+
+function gkApplyTemplate() {
+  const id = $('gkTplPick').value;
+  if (!id) return;
+  const tpl = (gkData.templates || []).find(t => t.id === id);
+  if (!tpl) return;
+  $('gkModels').value = (tpl.models || []).join('\n');
+  $('gkLimit').value = tpl.credit_limit ? gkNum(tpl.credit_limit) : '';
+  $('gkMode').value = tpl.prompt_mode || '';
+  $('gkPrompt').value = tpl.prompt_text || '';
+  // 到期时间只在新建时按模板天数推算：改已有 Key 时不能悄悄挪走它的到期日。
+  if (!gkEditID && Number(tpl.expiry_days) > 0) {
+    const at = Math.floor((Date.now() + Number(tpl.expiry_days) * 86400000) / 1000);
+    $('gkExpires').value = gkLocalInput(at);
+  }
+  toast('已套用模板「' + tpl.name + '」，保存前可继续改', 'ok');
+}
+
+async function saveGatewayKey() {
+  gkClearErr('gkErr');
+  const body = {
+    id: gkEditID || '',
+    name: $('gkName').value.trim(),
+    secret: $('gkSecret').value.trim(),
+    enabled: !!$('gkEnabled').checked,
+    expires_at: gkUnix($('gkExpires').value),
+    credit_limit: Number($('gkLimit').value) || 0,
+    models: gkSplitModels($('gkModels').value),
+    prompt_mode: $('gkMode').value,
+    prompt_text: $('gkPrompt').value,
+    template_id: $('gkTplPick').value || '',
+    note: $('gkMemo').value.trim(),
+  };
+  const btn = $('btnGkSave');
+  btn.disabled = true;
+  try {
+    await api(body.id ? 'apikeys/update' : 'apikeys/create', { method: 'POST', body: JSON.stringify(body) });
+    $('gkVeil').classList.remove('on');
+    toast(body.id ? 'Key 已更新' : 'Key 已创建', 'ok');
+    await loadGatewayKeys();
+  } catch (e) {
+    gkShowErr('gkErr', e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function gkDeleteKey(id) {
+  const k = gkFindKey(id);
+  if (!k) return;
+  if (!confirm('删除 Key「' + (k.name || k.id) + '」？删除后立刻失效，无法恢复。')) return;
+  try {
+    await api('apikeys/delete', { method: 'POST', body: JSON.stringify({ id: id }) });
+    toast('已删除', 'ok');
+    await loadGatewayKeys();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function gkResetUsage(id) {
+  const k = gkFindKey(id);
+  if (!k) return;
+  if (!confirm('把「' + (k.name || k.id) + '」的已用积分与请求计数清零？额度按周期重置时用。')) return;
+  try {
+    await api('apikeys/reset_usage', { method: 'POST', body: JSON.stringify({ id: id }) });
+    toast('用量已重置', 'ok');
+    await loadGatewayKeys();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function gkCopySecret(id) {
+  const k = gkFindKey(id);
+  if (!k) return;
+  const text = k.secret || '';
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => toast('Key 已复制', 'ok'), () => toast('复制失败，请手动选中', 'err'));
+  } else {
+    toast('Key：' + text);
+  }
+}
+
+/* 分组模板 */
+function renderGatewayTemplates() {
+  const body = $('gkTplBody');
+  if (!body) return;
+  const tpls = Array.isArray(gkData.templates) ? gkData.templates : [];
+  const rows = tpls.map(t =>
+    '<tr>' +
+      '<td>' + esc(t.name || '未命名') + (t.note ? '<div class="hint">' + esc(t.note) + '</div>' : '') + '</td>' +
+      '<td>' + esc(gkModelText(t.models)) + '</td>' +
+      '<td>' + (Number(t.credit_limit) ? gkNum(t.credit_limit) : '不限') + '</td>' +
+      '<td>' + esc(GK_MODE[t.prompt_mode || ''] || '跟随全局') + '</td>' +
+      '<td>' + (Number(t.expiry_days) ? String(t.expiry_days) + ' 天' : '不设到期') + '</td>' +
+      '<td class="ops">' +
+        '<button class="xs ghost" data-gktpl-act="edit" data-gktpl-id="' + esc(t.id) + '">编辑</button> ' +
+        '<button class="xs ghost" data-gktpl-act="del" data-gktpl-id="' + esc(t.id) + '">删除</button>' +
+      '</td>' +
+    '</tr>');
+  if (!rows.length) {
+    rows.push('<tr><td colspan="6" class="hint">还没有模板。把「试用 7 天 / 指定模型 + 额度」这类常用配置存下来，新建 Key 时一键套用。</td></tr>');
+  }
+  setHTML(body, rows.join(''));
+}
+
+function gkResetTplForm() {
+  gkTplEditID = null;
+  $('gkTplName').value = '';
+  $('gkTplDays').value = '';
+  $('gkTplLimit').value = '';
+  $('gkTplMode').value = '';
+  $('gkTplModels').value = '';
+  $('gkTplPrompt').value = '';
+  gkClearErr('gkTplErr');
+  if ($('gkTplNote')) $('gkTplNote').textContent = '新建模板';
+}
+
+function gkEditTpl(id) {
+  const tpl = (gkData.templates || []).find(t => t.id === id);
+  if (!tpl) return;
+  gkResetTplForm();
+  gkTplEditID = tpl.id;
+  $('gkTplName').value = tpl.name || '';
+  $('gkTplDays').value = tpl.expiry_days ? String(tpl.expiry_days) : '';
+  $('gkTplLimit').value = tpl.credit_limit ? gkNum(tpl.credit_limit) : '';
+  $('gkTplMode').value = tpl.prompt_mode || '';
+  $('gkTplModels').value = (tpl.models || []).join('\n');
+  $('gkTplPrompt').value = tpl.prompt_text || '';
+  if ($('gkTplNote')) $('gkTplNote').textContent = '编辑模板 · ' + (tpl.name || tpl.id);
+}
+
+async function gkSaveTpl() {
+  gkClearErr('gkTplErr');
+  const body = {
+    id: gkTplEditID || '',
+    name: $('gkTplName').value.trim(),
+    credit_limit: Number($('gkTplLimit').value) || 0,
+    expiry_days: Number($('gkTplDays').value) || 0,
+    models: gkSplitModels($('gkTplModels').value),
+    prompt_mode: $('gkTplMode').value,
+    prompt_text: $('gkTplPrompt').value,
+  };
+  if (!body.name) { gkShowErr('gkTplErr', '模板名称必填'); return; }
+  const btn = $('btnGkTplSave');
+  btn.disabled = true;
+  try {
+    await api('apikey_templates/save', { method: 'POST', body: JSON.stringify(body) });
+    toast('模板已保存', 'ok');
+    await loadGatewayKeys();
+    if (body.id) gkEditTpl(body.id); else gkResetTplForm();
+  } catch (e) {
+    gkShowErr('gkTplErr', e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function gkDeleteTpl(id) {
+  const tpl = (gkData.templates || []).find(t => t.id === id);
+  if (!tpl) return;
+  if (!confirm('删除模板「' + (tpl.name || tpl.id) + '」？已套用它的 Key 不受影响。')) return;
+  try {
+    await api('apikey_templates/delete', { method: 'POST', body: JSON.stringify({ id: id }) });
+    toast('模板已删除', 'ok');
+    if (gkTplEditID === id) gkResetTplForm();
+    await loadGatewayKeys();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+if ($('btnGkNew')) $('btnGkNew').onclick = openGatewayKeyCreate;
+if ($('btnGkCancel')) $('btnGkCancel').onclick = () => $('gkVeil').classList.remove('on');
+if ($('btnGkSave')) $('btnGkSave').onclick = saveGatewayKey;
+if ($('gkTplPick')) $('gkTplPick').onchange = gkApplyTemplate;
+if ($('btnGkTpl')) $('btnGkTpl').onclick = () => {
+  renderGatewayTemplates();
+  if ($('gkTplVeil')) $('gkTplVeil').classList.add('on');
+  if (!gkTplEditID) gkResetTplForm();
+};
+if ($('btnGkTplClose')) $('btnGkTplClose').onclick = () => $('gkTplVeil').classList.remove('on');
+if ($('btnGkTplClear')) $('btnGkTplClear').onclick = gkResetTplForm;
+if ($('btnGkTplSave')) $('btnGkTplSave').onclick = gkSaveTpl;
+if ($('gkBody')) $('gkBody').addEventListener('click', ev => {
+  const btn = ev.target.closest('[data-gk-act]');
+  if (!btn) return;
+  const id = btn.dataset.gkId;
+  const act = btn.dataset.gkAct;
+  if (act === 'edit') openGatewayKeyEdit(id);
+  else if (act === 'del') gkDeleteKey(id);
+  else if (act === 'reset') gkResetUsage(id);
+  else if (act === 'copy') gkCopySecret(id);
+});
+if ($('gkTplBody')) $('gkTplBody').addEventListener('click', ev => {
+  const btn = ev.target.closest('[data-gktpl-act]');
+  if (!btn) return;
+  const id = btn.dataset.gkTplId;
+  if (btn.dataset.gktplAct === 'edit') gkEditTpl(id);
+  else if (btn.dataset.gktplAct === 'del') gkDeleteTpl(id);
+});

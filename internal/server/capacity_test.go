@@ -8,11 +8,12 @@ import (
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 )
 
 func TestCapacityRequiresBearerKeyAndModel(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1"}), APIKey: "secret"})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1"}), Keys: testKeys(t, "secret")})
 
 	for _, test := range []struct {
 		name   string
@@ -40,10 +41,16 @@ func TestCapacityRequiresBearerKeyAndModel(t *testing.T) {
 	}
 }
 
-func TestCapacityRejectsUnconfiguredKey(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1"})})
+// 表里一把 Key 都没有时，任何 bearer 都进不来（没有回落、没有万能钥匙）。
+func TestCapacityRejectsUnknownKey(t *testing.T) {
+	h := NewHandler(Config{
+		Pool: testPoolWith(&auth.Auth{UID: "u1"}),
+		Keys: gatewaykeys.NewManager(nil),
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/capacity?model=gpt-4", nil)
+	req.Header.Set("Authorization", "Bearer anything")
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/capacity?model=gpt-4", nil))
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d want 401", rec.Code)
 	}
@@ -70,7 +77,7 @@ func TestCapacityCountsHealthyModelAccountsWithoutInFlightFiltering(t *testing.T
 	}
 	t.Cleanup(func() { p.Release("in-flight-full") })
 
-	h := NewHandler(Config{Pool: p, APIKey: "secret"})
+	h := NewHandler(Config{Pool: p})
 	req := httptest.NewRequest(http.MethodGet, "/v1/capacity?model=gpt-4", nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
@@ -110,7 +117,7 @@ func TestCapacityHonorsRealmAliasesAndHiddenModels(t *testing.T) {
 	global := &auth.Auth{UID: "global-account", Domain: "www.workbuddy.ai"}
 	p := testPoolWith(&auth.Auth{UID: "cn-account"}, global)
 	p.SetModelOff("cn-account", "gpt-4", "")
-	h := NewHandler(Config{Pool: p, APIKey: "secret", ModelsAliases: []string{"cn:alias=global:gpt-4"}, ModelsHidden: []string{"cn:hidden"}})
+	h := NewHandler(Config{Pool: p, ModelsAliases: []string{"cn:alias=global:gpt-4"}, ModelsHidden: []string{"cn:hidden"}})
 	for _, tc := range []struct {
 		model string
 		want  int

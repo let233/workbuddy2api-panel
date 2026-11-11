@@ -11,7 +11,7 @@ import (
 )
 
 // hotString 可热改字符串槽位（带 set 标志）。atomic.Pointer[string] 才能表达
-// 「没设置过」与「设置为空串」的区别——空串是合法取值（如清空 APIKey 关鉴权）。
+// 「没设置过」与「设置为空串」的区别——空串是合法取值（如清空账号目录）。
 type hotString struct{ v atomic.Pointer[string] }
 
 // Store 写入热改值（此后以它为准）。
@@ -54,10 +54,6 @@ type stickyCountFn struct{ fn func() int }
 type modelFallbackFn struct{ fn func() map[string]string }
 
 // ---- Setter（面板保存配置后调用；并发安全，下一条请求生效） ----
-
-// SetAPIKey 热改面板访问密钥（空串 = 关闭鉴权，与 config.api_key 语义一致）。
-// 鉴权在 ServeHTTP 最外层每请求现读，所以下一条请求就用新值，不需要重登。
-func (p *Panel) SetAPIKey(key string) { p.apiKeyHot.Store(key) }
 
 // SetAuthDir 热改账号目录。
 //

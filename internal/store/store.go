@@ -307,12 +307,17 @@ func redactDSN(dsn string) string {
 	return dsn[:start] + cred[:colon] + ":****" + dsn[at:]
 }
 
-// EnsureDir 为 SQLite 库文件创建父目录（路径为 :memory: / file: 时不动）。
+// EnsureDir 为 SQLite 库文件创建父目录（:memory: / file::memory: / 远端 authority 不动）。
+//
+// file: 前缀的 DSN 也要处理：它一样是本地文件，SQLite 不会替你建目录——
+// file:./data/wb2api.db 在 data/ 不存在时直接报 unable to open database file，
+// 而报错信息里的 errno 是 "out of memory (14)"，看起来像内存问题，实际是路径不存在。
 func EnsureDir(dsn string) error {
-	if dsn == "" || dsn == ":memory:" || strings.HasPrefix(dsn, "file:") {
+	path, ok := localDBPath(dsn)
+	if !ok {
 		return nil
 	}
-	dir := filepath.Dir(dsn)
+	dir := filepath.Dir(path)
 	if dir == "" || dir == "." {
 		return nil
 	}
@@ -320,6 +325,35 @@ func EnsureDir(dsn string) error {
 		return fmt.Errorf("创建数据库目录 %s: %w", dir, err)
 	}
 	return nil
+}
+
+// localDBPath 从 SQLite DSN 里取出库文件的本地路径（去掉 file: 前缀与 ?param 部分）。
+//
+// ok=false 表示这不是一个「需要且能够」建目录的本地文件：空 DSN、:memory:、
+// file::memory:、以及 file://host/... 这种带远端 authority 的形态（那由 SQLite
+// 自己当 URI 处理，别在这里替它决定路径）。
+func localDBPath(dsn string) (string, bool) {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" || dsn == ":memory:" {
+		return "", false
+	}
+	p := dsn
+	if strings.HasPrefix(p, "file:") {
+		p = strings.TrimPrefix(p, "file:")
+		// file:// 形态（file:///C:/x.db、file://localhost/x.db、file://host/…）不碰：
+		// authority 与「绝对路径要不要去掉前导斜杠」都随平台变，判错了会在 Windows 上
+		// 拼出 "\\C:\…" 这种路径。这类写法请自己先把目录建好，SQLite 认得它。
+		if strings.HasPrefix(p, "//") {
+			return "", false
+		}
+	}
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	if p == "" || p == ":memory:" {
+		return "", false
+	}
+	return p, true
 }
 
 // LogSummary 启动时打一条连接摘要（口令已隐去）。

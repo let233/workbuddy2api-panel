@@ -19,6 +19,7 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
@@ -1708,11 +1709,17 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 }
 
-func TestAPIKeyAuth(t *testing.T) {
+// TestGatewayKeyAuth 网关只认多 Key 表里的客户端 Key：没有全局万能钥匙，
+// 无凭据 / 错凭据一律 401，表里有的才放行。
+func TestGatewayKeyAuth(t *testing.T) {
+	km := gatewaykeys.NewManager(nil)
+	if _, err := km.Create(gatewaykeys.Key{Name: "ok", Secret: "secret"}); err != nil {
+		t.Fatalf("create key: %v", err)
+	}
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
 		Upstream: upstream.New(),
-		APIKey:   "secret",
+		Keys:     km,
 	})
 	// 无 key
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
@@ -1734,8 +1741,8 @@ func TestAPIKeyAuth(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer secret")
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Errorf("right key: code=%d", rec.Code)
+	if rec.Code == 401 {
+		t.Errorf("right key must pass: code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1970,7 +1977,6 @@ func TestHealthzServiceIdentityWithoutAuth(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
 		Upstream: upstream.New(),
-		APIKey:   "secret",
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
@@ -1984,7 +1990,7 @@ func TestHealthzServiceIdentityWithoutAuth(t *testing.T) {
 
 func TestStatusRequiresAuth(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "secret"})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), Keys: testKeys(t, "secret")})
 
 	// 无 token → 401
 	rec := httptest.NewRecorder()

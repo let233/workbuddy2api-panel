@@ -22,11 +22,13 @@ func TestProxyAPIAuthenticationBindingAndRemoval(t *testing.T) {
 	defer manager.Close()
 	accounts := pool.New(nil)
 	accounts.Add(&auth.Auth{UID: "u1", AccessToken: "token"})
-	p := New(Config{Pool: accounts, ProxyPool: manager, APIKey: "panel-key"})
-	call := func(method, path, body, key string) *httptest.ResponseRecorder {
+	p := New(Config{Pool: accounts, ProxyPool: manager, Users: authUsers()})
+	session := authSession(t, p)
+	// key 参数保留原签名，但鉴权现在只看会话 Cookie：它的值不再影响结果。
+	call := func(method, path, body, _ string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(method, "/panel/api/"+path, strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+key)
+		req.AddCookie(session)
 		rec := httptest.NewRecorder()
 		p.ServeHTTP(rec, req)
 		return rec
@@ -36,8 +38,11 @@ func TestProxyAPIAuthenticationBindingAndRemoval(t *testing.T) {
 		{"DELETE", "proxies/missing"}, {"POST", "proxies/check"}, {"POST", "proxies/missing/check"},
 		{"PUT", "proxies/health"}, {"PUT", "accounts/u1/proxy"}, {"PUT", "proxies/realm/cn"},
 	} {
-		if got := call(route.method, route.path, "{}", "wrong"); got.Code != http.StatusUnauthorized {
-			t.Fatalf("unauthorized %s %s: %d", route.method, route.path, got.Code)
+		anon := httptest.NewRequest(route.method, "/panel/api/"+route.path, strings.NewReader("{}"))
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, anon)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthorized %s %s: %d", route.method, route.path, rec.Code)
 		}
 	}
 	imported := call("POST", "proxies", `{"lines":"http://user:TOPSECRET@localhost:8080\nbad://host\nhttp://user:TOPSECRET@localhost:8080"}`, "panel-key")

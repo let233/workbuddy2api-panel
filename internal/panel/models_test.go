@@ -45,7 +45,7 @@ func TestPanelModelsIncludesImageModels(t *testing.T) {
 		t.Fatalf("FetchModels: %v", err)
 	}
 
-	pn := New(Config{Version: "test", APIKey: "k", Pool: p, Upstream: up})
+	pn := New(Config{Version: "test", Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/panel/api/models", nil)
 	req.Header.Set("Authorization", "Bearer k")
@@ -117,7 +117,7 @@ func TestPanelModelsAttachesBusyLevels(t *testing.T) {
 	p.SetCredits("c1", 1000, 0)
 	up.FetchModels(p.AuthByUID("c1"))
 
-	pn := New(Config{Version: "test", APIKey: "k", Pool: p, Upstream: up})
+	pn := New(Config{Version: "test", Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/panel/api/models", nil)
 	req.Header.Set("Authorization", "Bearer k")

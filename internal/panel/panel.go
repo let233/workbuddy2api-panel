@@ -4,8 +4,8 @@
 //
 // 设计约束：
 //   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
-//   - 鉴权复用网关 api_key（Bearer），与 /v1/* 同一口径；api_key 为空 = 不鉴权
-//     （仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，密钥只发给 /panel/api/*；
+//   - 鉴权是账号密码登录（internal/panelauth，会话 Cookie），与网关的客户端 Key
+//     完全分离：面板 API 只认会话，网关只认 Key。HTML/CSS/JS 本身无秘密，可匿名加载；
 //   - 不改写既有池语义：所有运维操作落到 pool 已有入口（Revive/Disable/Remove...），
 //     添加账号走 auth.SaveAtomic + pool.Add，重启后与 auths/ 目录天然对齐。
 package panel
@@ -28,8 +28,9 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
 	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
-	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
+	"github.com/misakano7545/workbuddy2api-panel/internal/panelauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
@@ -51,10 +52,12 @@ type Config struct {
 	// AutoTasksEnabled 与成长任务开关共用热配置；nil 时只允许手动启动后台任务。
 	AutoTasksEnabled func() bool
 	AuthDir          string // OAuth 登录完成后凭证落盘目录
-	APIKey           string // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode        string // "upstash" / "noop"，仅观测透出
-	Version          string // 面板版本号（展示用）
-	Updater          *updater.Manager
+	// Users 面板登录账号管理器（internal/panelauth）。nil = 不鉴权：仅测试与
+	// 纯内存裸用路径会这样传；main 装配时永远给非 nil。
+	Users     *panelauth.Manager
+	RedisMode string // "upstash" / "noop"，仅观测透出
+	Version   string // 面板版本号（展示用）
+	Updater   *updater.Manager
 
 	// PollIntervalSec 前端自动刷新间隔（秒）。0 = 用前端缺省值。
 	// 面板每轮刷新会重建若干表格并打一批接口；账号多、或只是开着面板当监控用
@@ -90,6 +93,9 @@ type Config struct {
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	// Balance 余额趋势采样记录器（nil = 该视图返回 501）
 	Balance *balance.Recorder
+	// Keys 客户端 API Key 管理器（多 Key：到期/可用模型/积分额度/提示词策略）。
+	// nil = 未启用，Key 管理接口一律 501；网关只认这里分发的客户端 Key。
+	Keys *gatewaykeys.Manager
 	// ModelFallback 模型降级路由表（读 live 快照，支持热更）。nil = 未配置。
 	// 面板据它在限流提示里标注「已路由至 X」—— 否则用户看到「v4.1 限流」
 	// 会以为服务断了，实际请求已被自动改道到等价模型继续服务。
@@ -156,6 +162,12 @@ type Panel struct {
 	// 持久化的账号后台任务（taskjobs.go），由 main 管理生命周期。
 	taskJobs *taskJobManager
 
+	// importJobs 导入任务进度槽（import_job.go）：key 是随机任务 id。
+	// 导入是逐号打上游的长动作，前端靠轮询这里的快照画进度条；常驻进程，
+	// 所以登记时按「结束超 10 分钟」与总量上限做清理。
+	importJobsMu sync.Mutex
+	importJobs   map[string]*importJob
+
 	// growthConc 排程轮次的账号间并发（config schedule.growth_concurrency，热生效）。
 	// 0 = 未配置 → 1。
 	growthConc atomic.Int64
@@ -167,12 +179,14 @@ type Panel struct {
 	// 为什么不写回 cfg：cfg 是装配期快照，运行期就地写会与并发请求抢同一块内存
 	// （作者要求消除数据竞争）；槽位带「设过才覆盖」语义，未设置时仍回退 cfg，
 	// 老用法（含单测直接改 p.cfg.AuthDir）语义不变。
-	apiKeyHot             hotString
 	authDirHot            hotString
 	pollIntervalHot       hotInt
 	packageDetailLimitHot hotInt
 	stickyCountHot        atomic.Pointer[stickyCountFn]
 	modelFallbackHot      atomic.Pointer[modelFallbackFn]
+
+	// loginGuard 登录失败限速（按 IP）；零值即可用（见 auth.go）。
+	loginGuard loginGuard
 
 	// reloadKick 唤醒 ReloadLoop 重算下一轮等待：SetReloadConfig 改间隔/开关后
 	// 立刻生效，不必等旧周期的 timer 走完（容量 1，重复 kick 合并）。
@@ -270,6 +284,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	// 登录/会话（默认拒绝的白名单里放行，见 publicPanelPaths）。
+	p.mux.HandleFunc("GET /panel/api/auth/session", p.authSession)
+	p.mux.HandleFunc("POST /panel/api/auth/login", p.authLogin)
+	p.mux.HandleFunc("POST /panel/api/auth/logout", p.authLogout)
+	p.mux.HandleFunc("POST /panel/api/auth/password", p.authPassword)
 	p.mux.HandleFunc("GET /panel/api/overview", p.overview)
 	// 账号列表按页取（分页在数据库里做：COUNT + ORDER BY uid LIMIT/OFFSET）。
 	p.mux.HandleFunc("GET /panel/api/accounts", p.accountsPage)
@@ -302,6 +321,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.loginPoll)
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.loginRegions)
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.importCockpit)
+	// 导入进度轮询（async=1 时返回的 job_id 用这个查）：已处理/总数、当前账号、跳过明细。
+	p.mux.HandleFunc("GET /panel/api/import/cockpit/jobs/{id}", p.importJobStatus)
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.addAPIKey)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.accountRevive)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.accountDisable)
@@ -340,6 +361,14 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/config", p.saveConfig)
 	p.mux.HandleFunc("POST /panel/api/model_hidden", p.setModelHidden)
 	p.mux.HandleFunc("POST /panel/api/model_effort", p.setModelEffort)
+	// 客户端 API Key 管理（多 Key + 分组模板）：到期/可用模型/积分额度/提示词策略。
+	p.mux.HandleFunc("GET /panel/api/apikeys", p.gatewayKeys)
+	p.mux.HandleFunc("POST /panel/api/apikeys/create", p.gatewayKeyCreate)
+	p.mux.HandleFunc("POST /panel/api/apikeys/update", p.gatewayKeyUpdate)
+	p.mux.HandleFunc("POST /panel/api/apikeys/delete", p.gatewayKeyDelete)
+	p.mux.HandleFunc("POST /panel/api/apikeys/reset_usage", p.gatewayKeyResetUsage)
+	p.mux.HandleFunc("POST /panel/api/apikey_templates/save", p.gatewayKeyTemplateSave)
+	p.mux.HandleFunc("POST /panel/api/apikey_templates/delete", p.gatewayKeyTemplateDelete)
 	p.mux.HandleFunc("GET /panel/api/update", p.updateStatus)
 	p.mux.HandleFunc("POST /panel/api/update/check", p.checkUpdate)
 	p.mux.HandleFunc("POST /panel/api/update/install", p.installUpdate)
@@ -347,11 +376,15 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/update/probe", p.probeUpdate)
 }
 
-// publicPanelPaths 免鉴权的精确路径：静态页面与脚本本身不含秘密，其余一律要密钥。
+// publicPanelPaths 免登录的精确路径：静态页面与脚本本身不含秘密，登录相关接口
+// 自己校验凭据（登录前当然没有会话）。其余 /panel/api/* 一律要会话。
 var publicPanelPaths = map[string]struct{}{
-	"/panel/":         {},
-	"/panel/theme.js": {},
-	"/panel/app.js":   {},
+	"/panel/":                 {},
+	"/panel/theme.js":         {},
+	"/panel/app.js":           {},
+	"/panel/api/auth/session": {},
+	"/panel/api/auth/login":   {},
+	"/panel/api/auth/logout":  {},
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -359,28 +392,27 @@ var publicPanelPaths = map[string]struct{}{
 //
 // 鉴权在这里默认拒绝，而不是逐条包在路由上：逐条包的话，新增一条路由忘了包
 // 就是静默公开；这里的失效方向是「忘了登记白名单 → 401」，看得见。
+//
+// 会话经 Cookie 现查 panelauth（每请求一次，不缓存）：退出登录、改密踢人、
+// 会话过期都是下一条请求立即生效，不用等任何轮询周期。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	if _, ok := publicPanelPaths[r.URL.Path]; !ok && !httpauth.VerifyBearer(r, p.apiKey()) {
-		// 密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求即用新值。
-		writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+	if _, ok := publicPanelPaths[r.URL.Path]; ok {
+		p.mux.ServeHTTP(w, r)
 		return
 	}
+	if p.cfg.Users != nil {
+		if _, ok := p.sessionUser(r); !ok {
+			if strings.HasPrefix(r.URL.Path, "/panel/api/") {
+				writeErr(w, http.StatusUnauthorized, "login_required")
+				return
+			}
+			// 页面请求：跳回面板首页（那里会弹出登录层），而不是给一段 401 文本。
+			http.Redirect(w, r, "/panel/", http.StatusFound)
+			return
+		}
+	}
 	p.mux.ServeHTTP(w, r)
-}
-
-// apiKey 当前生效密钥（显式 Setter > Live 快照 > 静态字段）。
-//
-// 三者指向同一份配置，正常情况下一致；Setter 排第一是因为它代表「面板刚刚保存的
-// 值」，出现分歧时必须按最新一次落地的口径鉴权，否则保存完还要等一个轮询周期。
-func (p *Panel) apiKey() string {
-	if v, ok := p.apiKeyHot.Load(); ok {
-		return v
-	}
-	if p.cfg.Live != nil {
-		return p.cfg.Live.Load().APIKey
-	}
-	return p.cfg.APIKey
 }
 
 // expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
@@ -420,7 +452,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"poll_interval_sec": p.pollIntervalSec(),
 		"update":            p.updateSnapshot(),
 		"uptime_sec":        int(time.Since(p.started).Seconds()),
-		"auth_required":     p.apiKey() != "",
+		"login_required":    p.cfg.Users != nil,
 		"redis_mode":        p.cfg.RedisMode,
 		"sticky_sessions":   sticky,
 		"total":             total,

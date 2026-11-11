@@ -5,54 +5,11 @@
 package panel
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"testing"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/store/storetest"
 )
-
-// logsPanel 造一个只够跑 /panel/api/logs 的最小面板：鉴权与日志都不依赖上游。
-func logsPanel(t *testing.T) *Panel {
-	t.Helper()
-	return New(Config{Version: "test"})
-}
-
-func getLogsWithKey(pn *Panel, key string) int {
-	req := httptest.NewRequest(http.MethodGet, "/panel/api/logs", nil)
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
-	rec := httptest.NewRecorder()
-	pn.ServeHTTP(rec, req)
-	return rec.Code
-}
-
-// TestSetAPIKeyHot 面板访问密钥热改后立即生效，且旧密钥当轮失效。
-//
-// 为什么值得钉：这个键是面板唯一的门。热改若只写进 cfg 而鉴权读的是旧快照，
-// 用户会以为「改了密码却没生效」——反过来若读取了还没发布的中间态，就会把自己锁在门外。
-func TestSetAPIKeyHot(t *testing.T) {
-	pn := logsPanel(t)
-	if code := getLogsWithKey(pn, ""); code == http.StatusUnauthorized {
-		t.Fatalf("未配置密钥时不应要求鉴权, code=%d", code)
-	}
-	pn.SetAPIKey("hot-key")
-	if code := getLogsWithKey(pn, ""); code != http.StatusUnauthorized {
-		t.Fatalf("热改出密钥后无头请求应 401, code=%d", code)
-	}
-	if code := getLogsWithKey(pn, "hot-key"); code == http.StatusUnauthorized {
-		t.Fatal("热改后的密钥应被接受")
-	}
-	pn.SetAPIKey("next-key")
-	if code := getLogsWithKey(pn, "hot-key"); code != http.StatusUnauthorized {
-		t.Fatalf("改密钥后旧密钥应立即失效, code=%d", code)
-	}
-	if code := getLogsWithKey(pn, "next-key"); code == http.StatusUnauthorized {
-		t.Fatal("新密钥应被接受")
-	}
-}
 
 // TestSetAuthDirHot 账号目录热改后，新增账号立刻落到新目录（而不是等重启）。
 func TestSetAuthDirHot(t *testing.T) {

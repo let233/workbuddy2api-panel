@@ -169,10 +169,10 @@ func TestBndCreditHistoryFullLedgerFieldTypes(t *testing.T) {
 	}
 }
 
-// 账本未装配 → 501 固定文案；空账本 → entries=[]；api_key 为空 → 不鉴权。
+// 账本未装配 → 501 固定文案；空账本 → entries=[]；未装配账号库 → 不鉴权。
 func TestBndCreditHistoryNilLedgerAndOpenAuth(t *testing.T) {
 	// 未装配账本 = 501（与 RequestLog 同语义）。
-	missing := New(Config{Version: "test", APIKey: "test-key", Pool: pool.New(nil)})
+	missing := New(Config{Version: "test", Pool: pool.New(nil)})
 	code, body := creditGet(t, missing, "")
 	if code != 501 || !strings.Contains(body, "credit history not available") {
 		t.Fatalf("nil 账本应回 501 + 固定文案，得到 %d %s", code, body)
@@ -180,13 +180,14 @@ func TestBndCreditHistoryNilLedgerAndOpenAuth(t *testing.T) {
 
 	// 空账本 → entries 必须是 []，不是 null。
 	l := credithist.New(nil, 100)
-	empty := New(Config{Version: "test", APIKey: "test-key", Pool: pool.New(nil), CreditHistory: l})
+	empty := New(Config{Version: "test", Pool: pool.New(nil), CreditHistory: l})
 	code, body = creditGet(t, empty, "")
 	if code != 200 || !strings.Contains(body, `"entries":[]`) {
 		t.Fatalf("空账本应回 200 且 entries=[]，得到 %d %s", code, body)
 	}
 
-	// api_key 为空 = 不启用鉴权（既有语义）：无 Authorization 头也应放行。
+	// Config.Users 为 nil = 本进程不做登录校验（只用于测试/纯内存装配）：
+	// 无会话 Cookie 也应放行，这样单独验证账本语义不必先造账号。
 	l.Observe("u1", 0)
 	l.Observe("u1", 5)
 	open := New(Config{Version: "test", Pool: pool.New(nil), CreditHistory: l})

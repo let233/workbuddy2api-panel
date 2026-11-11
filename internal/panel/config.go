@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 )
 
 // getConfig 返回当前配置文件内容与路径（前端按 schema 渲染表单）。
@@ -29,7 +28,6 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		"ok":                         true,
 		"path":                       p.cfg.ConfigPath,
 		"config":                     cfg,
-		"api_key_env_managed":        os.Getenv("WB2A_API_KEY") != "",
 		"environment_managed_fields": configManagedFields(cfg),
 	})
 }
@@ -64,7 +62,6 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                         true,
 		"restart_required":           restartRequired,
-		"api_key_env_managed":        os.Getenv("WB2A_API_KEY") != "",
 		"environment_managed_fields": managedFields,
 	})
 }

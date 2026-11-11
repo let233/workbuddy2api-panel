@@ -96,7 +96,7 @@ func TestSetPromptHotRewrite(t *testing.T) {
 func TestSetAdminEnabledHotToggle(t *testing.T) {
 	block := make(chan struct{})
 	defer close(block)
-	h := NewHandler(Config{AdminEnabled: true, APIKey: "k", Tasks: &fakeTasks{block: block}})
+	h := NewHandler(Config{AdminEnabled: true, Tasks: &fakeTasks{block: block}})
 	call := func(withAuth bool) int {
 		r := httptest.NewRequest(http.MethodPost, "/admin/tasks/checkin/run", nil)
 		if withAuth {
@@ -147,7 +147,7 @@ func TestSetMetricsEnabledHotToggle(t *testing.T) {
 func TestSetAuditNilDisables(t *testing.T) {
 	block := make(chan struct{})
 	defer close(block)
-	h := NewHandler(Config{AdminEnabled: true, APIKey: "k", Tasks: &fakeTasks{block: block}})
+	h := NewHandler(Config{AdminEnabled: true, Tasks: &fakeTasks{block: block}})
 	h.SetAudit(nil)
 	if h.auditLog() != nil {
 		t.Fatal("SetAudit(nil) 后应为关闭状态")

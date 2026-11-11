@@ -2,8 +2,6 @@ package prompt
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -190,35 +188,26 @@ func TestRewriteEmptyPromptReturnedAsIs(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultWhenFileEmpty(t *testing.T) {
-	got, err := Load("custom", "")
-	if err != nil {
-		t.Fatal(err)
+func TestEffectiveDefaultsToBuiltin(t *testing.T) {
+	for _, text := range []string{"", "   \n\t "} {
+		got := Effective(text)
+		if got != defaultPrompt {
+			t.Errorf("Effective(%q) returned non-default prompt (len=%d vs %d)", text, len(got), len(defaultPrompt))
+		}
 	}
-	if got != defaultPrompt {
-		t.Errorf("Load() returned non-default prompt (len=%d vs %d)", len(got), len(defaultPrompt))
-	}
-	if len(got) == 0 {
+	if len(Default()) == 0 {
 		t.Error("default prompt is empty")
 	}
 }
 
-func TestLoadFileOverride(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "my.md")
+func TestEffectiveUsesSettingText(t *testing.T) {
 	want := "这是我的自定义人格入口。"
-	os.WriteFile(fp, []byte(want), 0o600)
-	got, err := Load("custom", fp)
-	if err != nil {
-		t.Fatal(err)
+	if got := Effective(want); got != want {
+		t.Errorf("Effective()=%q want %q", got, want)
 	}
-	if got != want {
-		t.Errorf("Load()=%q want %q", got, want)
-	}
-}
-
-func TestLoadFileMissingFailsFast(t *testing.T) {
-	if _, err := Load("custom", "/nonexistent/promp.md"); err == nil {
-		t.Fatal("missing file should return error (fail fast)")
+	// 多行正文原样保留（含内部换行与 Markdown 列表），只按空白判空、不改写内容。
+	multi := "第一行\n\n- 条目一\n- 条目二\n"
+	if got := Effective(multi); got != multi {
+		t.Errorf("Effective() 改写了多行正文: %q", got)
 	}
 }

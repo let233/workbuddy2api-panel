@@ -26,8 +26,10 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
 	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
+	"github.com/misakano7545/workbuddy2api-panel/internal/panelauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
@@ -46,13 +48,11 @@ import (
 var appVersion = "dev"
 var appRepository = "misakano7545/workbuddy2api-panel"
 
-// insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
-// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（显式配成
-// "0.0.0.0:7863" 或 ":7863"）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
-// 打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给「照抄样例 /
-// 显式清空」的最后提醒，不阻塞启动。
-func insecureKeyWarning(listen, apiKey string) string {
-	if apiKey != "" && apiKey != "test_key" {
+// defaultCredWarning 首次部署的初始口令 + 非回环监听 = 把面板交给整个内网：
+// 只要管理员还是「刚建出来、没改过密码」的状态就提醒一次（改密后不再打扰）。
+// 只打印告警，不阻塞启动。
+func defaultCredWarning(listen string, defaultAdmin bool) string {
+	if !defaultAdmin {
 		return ""
 	}
 	host, _, err := net.SplitHostPort(listen)
@@ -65,11 +65,7 @@ func insecureKeyWarning(listen, apiKey string) string {
 	case host == "127.0.0.1", host == "::1", strings.EqualFold(host, "localhost"):
 		return "" // 只听回环：暴露面有限，不打扰
 	}
-	what := "为空（网关与面板完全不鉴权）"
-	if apiKey != "" {
-		what = "为样例占位符 test_key"
-	}
-	return fmt.Sprintf("api_key %s，且监听 %s 非回环地址——对外无有效鉴权，请尽快修改配置里的 api_key", what, listen)
+	return fmt.Sprintf("面板监听 %s 非回环地址，而管理员仍是初始口令 %s——请登录后立即修改密码", listen, panelauth.DefaultAdminPassword)
 }
 
 // dataDirOf 返回数据目录（旧版 state.json 所在目录）。
@@ -165,13 +161,19 @@ func main() {
 			*cfgPath, settingsKVKey)
 	}
 	cfg = settings.Current()
-	if EnsureAPIKey(cfg) {
-		if serr := settings.Save(cfg); serr != nil {
-			log.Fatalf("save settings: %v", serr)
-		}
-		// 只在生成这一次打印明文：面板登录本身要这把 key，无头部署（容器 / 不开浏览器）
-		// 得从这里抄走第一次的密钥；之后任何日志都只出现掩码形态。
-		log.Printf("[config] 首次部署：已自动生成 api_key=%s（已入库，面板「服务」页可查看/复制；此行只打印一次，请记下）", cfg.APIKey)
+
+	// 面板登录账号：首次部署播种 admin/123456（bcrypt 哈希入 panel_users 表）。
+	// 密码不再是配置项——没有 account 就没有任何管理员密钥可泄漏。
+	users := panelauth.NewManager(db)
+	defer users.Close()
+	defaultAdminPending := false
+	if _, created, uerr := users.EnsureDefaultAdmin(); uerr != nil {
+		log.Fatalf("panel auth: %v", uerr)
+	} else if created {
+		defaultAdminPending = true
+		// 只在这一次打印明文：无头部署（容器 / 不开浏览器）得从这里抄走初始密码。
+		log.Printf("[auth] 首次部署：面板管理员 %s / 初始密码 %s（登录后请立即修改；此行只打印一次）",
+			panelauth.DefaultAdminUsername, panelauth.DefaultAdminPassword)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -462,6 +464,17 @@ func main() {
 		db: db, up: up, pool: p, sch: sch, live: live, sess: sessRouter,
 		rl: requestLog, rdb: rstore, redisURL: cfg.Upstash.URL, redisTok: cfg.Upstash.Token,
 	}
+	// 客户端 API Key 管理器：多 Key（到期时间 / 可用模型 / 积分额度 / 提示词策略）
+	// 与分组模板落库，重启后原样恢复；网关照它鉴权并按 Key 计费。
+	gatewayKeys := gatewaykeys.NewManager(db)
+	defer gatewayKeys.Close()
+	// 首次部署播种一把最高级别 Key（不限积分/模型、提示词跟随全局）：否则新装实例
+	// 一把客户端 Key 都没有，网关对全部请求 401，用户会以为服务坏了。
+	if k, created, kerr := gatewayKeys.EnsureSystemKey(); kerr != nil {
+		log.Printf("WARN: 首次部署系统 Key 创建失败（可在面板「API Key」页手建）: %v", kerr)
+	} else if created {
+		log.Printf("[gateway] 首次部署：已创建系统 Key「%s」secret=%s（不限积分/模型；面板「API Key」页可复制；此行只打印一次）", k.Name, k.Secret)
+	}
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		DB:         db,
@@ -478,7 +491,7 @@ func main() {
 		// 后台任务的自动触发开关与成长任务排程共用热配置（schedule.growth_enabled）。
 		AutoTasksEnabled: sch.GrowthEnabled,
 		AuthDir:          cfg.AuthDir,
-		APIKey:           cfg.APIKey,
+		Users:            users,
 		RedisMode:        redisMode,
 		StickyCount:      sessCount,
 		Version:          appVersion,
@@ -504,6 +517,8 @@ func main() {
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
+		// 客户端 API Key 管理器（面板「API Key」页读写）。
+		Keys: gatewayKeys,
 	})
 	// 面板运行日志全频道按天落盘（logging.panel_log_*）：重启后回填、支持按区间导出。
 	// 装配顺序必须在 log.SetOutput 之前——回填完再把实时输出接上，否则启动期的
@@ -539,7 +554,7 @@ func main() {
 	var auditLog *server.AuditLog
 	if cfg.Admin.AuditEnabled {
 		// 审计记录进 admin_audit 表（admin.audit_file 不再决定落点，仅旧配置兼容保留）。
-		al, aerr := server.NewAuditLog(db, cfg.APIKey)
+		al, aerr := server.NewAuditLog(db)
 		if aerr != nil {
 			p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退，否则丢整轮运行状态
 			log.Fatalf("admin audit: %v", aerr)
@@ -552,7 +567,7 @@ func main() {
 	gw = server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
-		APIKey:       cfg.APIKey,
+		Keys:         gatewayKeys,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -693,7 +708,7 @@ func main() {
 		}
 	}()
 
-	if warn := insecureKeyWarning(cfg.Listen, cfg.APIKey); warn != "" {
+	if warn := defaultCredWarning(cfg.Listen, defaultAdminPending); warn != "" {
 		log.Printf("WARN: %s", warn)
 	}
 	addr, err := serveMgr.Start(cfg.Listen)
@@ -702,7 +717,7 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	ap.listen = addr // 之后 Listen 变化时才需要热切（启动这次由 Start 完成）
-	log.Print(listenBanner(addr, loadedFrom, cfg.APIKey))
+	log.Print(listenBanner(addr, loadedFrom, defaultAdminPending))
 	<-ctx.Done()
 	<-shutdownDone
 	log.Printf("bye")
@@ -748,38 +763,20 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	}
 }
 
-// listenBanner 组装启动横幅。api_key 的来源必须写明（issue #155：改了 config.json 却不
-// 生效，旧日志只写 api_key=true，看不出是 WB2A_API_KEY 覆盖了文件还是改错了文件），
-// 密钥本身只出掩码。path 传「实际加载的那份」，退回默认时传空。
-func listenBanner(listen, path, key string) string {
-	return fmt.Sprintf("workbuddy2api listening on %s (api_key=%s, 来源 %s)，管理面板 http://127.0.0.1%s/panel/",
-		listen, maskSecret(key), apiKeySource(path), panelListenPath(listen))
-}
-
-// apiKeySource 报生效的 api_key 来自哪里，顺序同 applyEnv：env 非空即覆盖库里
-// 的值。配置文件不再是密钥来源（首次部署自动生成随机 sk- key 入库），所以给的是
-// 文件路径时必须顺带说明「那个文件里没有密钥」，否则 issue #155 的困惑会原样复现：
-// 用户改完文件里的 api_key，发现毫无作用。
-func apiKeySource(path string) string {
-	if os.Getenv("WB2A_API_KEY") != "" {
-		return "环境变量 WB2A_API_KEY"
+// listenBanner 组装启动横幅。不再有任何密钥要打码：面板是账号密码登录，
+// 客户端 Key 只在面板「API Key」页展示。path 传「实际加载的那份」配置文件，
+// 退回默认时传空——启动横幅仍要说清配置从哪来（issue #155 的教训）。
+func listenBanner(listen, path string, defaultAdmin bool) string {
+	source := path
+	if source == "" {
+		source = "默认配置"
 	}
-	if path == "" {
-		return "数据库（首次部署自动生成 sk- key）"
+	login := "账号密码登录"
+	if defaultAdmin {
+		login = "初始账号 " + panelauth.DefaultAdminUsername + "（密码见启动日志）"
 	}
-	return "数据库（" + path + " 不含密钥）"
-}
-
-// maskSecret 只留首尾各两位便于对号入座；不足 8 位或未设置则整条隐去。
-func maskSecret(s string) string {
-	if s == "" {
-		return "(未设置)"
-	}
-	r := []rune(s)
-	if len(r) < 8 {
-		return strings.Repeat("*", len(r))
-	}
-	return string(r[:2]) + strings.Repeat("*", len(r)-4) + string(r[len(r)-2:])
+	return fmt.Sprintf("workbuddy2api listening on %s (配置 %s；面板 %s)，管理面板 http://127.0.0.1%s/panel/",
+		listen, source, login, panelListenPath(listen))
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL

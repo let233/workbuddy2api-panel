@@ -12,7 +12,7 @@ import (
 func TestSetModelEffortWritesDomainKey(t *testing.T) {
 	var saved map[string]any
 	pn := New(Config{
-		Version: "test", APIKey: "k",
+		Version: "test",
 		LoadConfig: func() (any, error) {
 			return map[string]any{
 				"thinking": map[string]any{
@@ -56,7 +56,7 @@ func TestSetModelEffortWritesDomainKey(t *testing.T) {
 func TestSetModelEffortAcceptsOff(t *testing.T) {
 	var saved map[string]any
 	pn := New(Config{
-		Version: "test", APIKey: "k",
+		Version: "test",
 		LoadConfig: func() (any, error) {
 			return map[string]any{"thinking": map[string]any{"model_defaults": map[string]any{"cn:glm-5.2": "high"}}}, nil
 		},
@@ -95,7 +95,7 @@ func TestSetModelEffortRejectsInvalid(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			saved := false
 			pn := New(Config{
-				Version: "test", APIKey: "k",
+				Version:    "test",
 				LoadConfig: func() (any, error) { return map[string]any{}, nil },
 				SaveConfig: func([]byte) ([]string, error) { saved = true; return nil, nil },
 			})

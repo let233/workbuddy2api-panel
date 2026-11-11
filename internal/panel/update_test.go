@@ -12,6 +12,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
 )
 
+// 更新接口必须要求登录：无会话 401，带会话才走到「未装配 updater」的 501。
 func TestUpdateAPIRequiresAuthentication(t *testing.T) {
 	for _, endpoint := range []struct{ method, path string }{
 		{http.MethodGet, "/panel/api/update"},
@@ -20,12 +21,12 @@ func TestUpdateAPIRequiresAuthentication(t *testing.T) {
 	} {
 		p := newTestPanel()
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(endpoint.method, endpoint.path, nil)
-		p.ServeHTTP(rec, req)
+		p.ServeHTTP(rec, httptest.NewRequest(endpoint.method, endpoint.path, nil))
 		if rec.Code != http.StatusUnauthorized {
 			t.Errorf("%s: got %d", endpoint.path, rec.Code)
 		}
-		req.Header.Set("Authorization", "Bearer test-key")
+		req := httptest.NewRequest(endpoint.method, endpoint.path, nil)
+		req.AddCookie(authSession(t, p))
 		rec = httptest.NewRecorder()
 		p.ServeHTTP(rec, req)
 		if rec.Code != http.StatusNotImplemented {
@@ -35,7 +36,7 @@ func TestUpdateAPIRequiresAuthentication(t *testing.T) {
 }
 
 func TestUpdateStatusAndUnsupportedInstall(t *testing.T) {
-	p := New(Config{APIKey: "test-key", Updater: updater.New("dev", "", "", updater.Settings{AutoEnabled: true, AutoTime: "06:30"})})
+	p := New(Config{Updater: updater.New("dev", "", "", updater.Settings{AutoEnabled: true, AutoTime: "06:30"})})
 	req := httptest.NewRequest(http.MethodGet, "/panel/api/update", nil)
 	req.Header.Set("Authorization", "Bearer test-key")
 	rec := httptest.NewRecorder()
@@ -90,8 +91,10 @@ vm.runInContext('let updateData = null, updateBusy = false;\n' +
   response = {current_version:'2026.10.22.1823', latest_version:'2026.10.23.1859', update_available:true, can_install:true};
   await ctx.checkForUpdates();
   assert.equal(nodes.get('btnUpdateInstall').disabled, false, 'install re-enabled after checking');
+  // 版本与更新整块已搬到「关于」页，顶栏角标跟着跳过去（跳到配置页会落在
+  // 没有任何更新控件的页面上）。
   nodes.get('navUpdate').onclick();
-  assert.equal(navigated, 'config');
+  assert.equal(navigated, 'about');
   fail = true;
   await ctx.checkForUpdates();
   assert.equal(nodes.get('btnUpdateCheck').disabled, false, 'retry after network error');

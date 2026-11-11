@@ -475,7 +475,7 @@ func TestCapacityHonorsAllowlist(t *testing.T) {
 		&auth.Auth{UID: "cn-account"},
 		&auth.Auth{UID: "global-account", Domain: "www.workbuddy.ai"},
 	)
-	h := NewHandler(Config{Pool: p, APIKey: "secret", ModelsAllowed: []string{"glm-5.2"}})
+	h := NewHandler(Config{Pool: p, ModelsAllowed: []string{"glm-5.2"}})
 	for _, tc := range []struct {
 		model string
 		want  int

@@ -17,14 +17,13 @@ func (f *fakeTasks) RunTravelNow()    {}
 func (f *fakeTasks) RunGrowthNow()    {}
 
 func TestAdminTaskRunOnce(t *testing.T) {
-	audit, err := NewAuditLog(storetest.Open(t), "k")
+	audit, err := NewAuditLog(storetest.Open(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	block := make(chan struct{})
 	h := NewHandler(Config{
 		AdminEnabled: true,
-		APIKey:       "k",
 		Tasks:        &fakeTasks{block: block},
 		Audit:        audit,
 	})

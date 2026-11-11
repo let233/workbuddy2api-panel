@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 )
 
 // modelsAuthHandler 构造只用于鉴权判定的最小 Handler。
@@ -25,13 +26,17 @@ import (
 // 真去连 codebuddy.cn 既慢又 flaky，而上游为 nil 会直接空指针崩掉整个包。
 func modelsAuthHandler(t *testing.T, apiKey string) *Handler {
 	t.Helper()
+	km := gatewaykeys.NewManager(nil)
+	if _, err := km.Create(gatewaykeys.Key{Name: "test", Secret: apiKey}); err != nil {
+		t.Fatalf("create key: %v", err)
+	}
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, `{"code":0,"data":{"models":[{"id":"glm-5.2","maxInputTokens":200000,"maxOutputTokens":32000}]}}`, false
 	})
 	return NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1"}),
 		Upstream: up,
-		APIKey:   apiKey,
+		Keys:     km,
 	})
 }
 

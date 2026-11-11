@@ -8,13 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
-	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
@@ -74,7 +71,8 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var accounts []cockpitAccount
-	var sources []string // 与 accounts 平行：每个条目来自哪个文件，出错时能说清
+	var sources []string
+	var files []importFileInfo // 与 accounts 平行：每个条目来自哪个文件，出错时能说清
 	for _, fh := range headers {
 		f, err := fh.Open()
 		if err != nil {
@@ -97,6 +95,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, fh.Filename+": empty accounts array")
 			return
 		}
+		files = append(files, importFileInfo{Name: fh.Filename, Items: len(list)})
 		for _, acc := range list {
 			accounts = append(accounts, acc)
 			sources = append(sources, fh.Filename)
@@ -117,173 +116,69 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var total, imported, skipped, creates, overwrites int
-	var errs []string
-	seenUID := map[string]string{} // uid -> 首次出现的文件，用于批内去重
-
-	for i, acc := range accounts {
-		src := sources[i]
-		uid := strings.TrimSpace(acc.UID)
-		at := strings.TrimSpace(acc.AccessToken)
-		rt := strings.TrimSpace(acc.RefreshToken)
-		if uid == "" || at == "" || rt == "" {
-			skipped++
-			errs = append(errs, fmt.Sprintf("%s: missing required fields (id=%s)", src, acc.ID))
-			continue
-		}
-		if !validImportUID(uid) {
-			skipped++
-			errs = append(errs, fmt.Sprintf("%s: invalid uid (id=%s)", src, acc.ID))
-			continue
-		}
-		// 批内去重：多个文件可能有重叠账号。保留第一次出现的那条（选择顺序即
-		// 提交顺序，先选的优先），后面的记跳过并说明来源，不静默丢弃。
-		if first, ok := seenUID[uid]; ok {
-			skipped++
-			if first == src {
-				errs = append(errs, fmt.Sprintf("%s: duplicate uid=%s in the same file", src, uid))
-			} else {
-				errs = append(errs, fmt.Sprintf("%s: duplicate uid=%s (already provided by %s)", src, uid, first))
-			}
-			continue
-		}
-		seenUID[uid] = src
-
-		// 文件里带了 realm 就用它（cn/global 之外的值退回按 domain 推断）。
-		realm := importRealm(acc.Realm, acc.Domain)
-
-		// expires_at 先统一成毫秒再转秒：批量导出是毫秒，单账号详情导出是秒，
-		// 直接除以 1000 会把秒级值算成 1970 年（账号一进池就是「已过期」）。
-		expiresAt := normalizeExpiresAtMillis(acc.ExpiresAt) / 1000
-		if expiresAt <= 0 {
-			expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
-		}
-
-		nickname := acc.Nickname
-		if strings.TrimSpace(nickname) == "" {
-			nickname = acc.Email
-		}
-		enterpriseID := strings.TrimSpace(acc.EnterpriseID)
-		if enterpriseID == "" {
-			enterpriseID = strings.TrimSpace(acc.EnterpriseIDCamel)
-		}
-
-		a := &auth.Auth{
-			AccessToken:  at,
-			RefreshToken: rt,
-			ExpiresAt:    expiresAt,
-			Domain:       acc.Domain,
-			UID:          uid,
-			EnterpriseID: enterpriseID,
-			Nickname:     nickname,
-			FilePath:     filepath.Join(p.authDir(), fmt.Sprintf("workbuddy-%s.json", uid)),
-		}
-
-		if realm == "global" {
-			if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
-				skipped++
-				errs = append(errs, fmt.Sprintf("uid=%s: set realm failed: %v", uid, err))
-				continue
-			}
-		} else {
-			// 显式写 cn，而不是让 BackfillRealm 按 domain 再推一遍：文件里说了是
-			// 国内版就照写，避免 domain 缺失/通用域名时推出的口径与 realm 变量不一致。
-			if _, err := auth.BackfillRealmFor(a, "cn"); err != nil {
-				skipped++
-				errs = append(errs, fmt.Sprintf("uid=%s: set realm failed: %v", uid, err))
-				continue
-			}
-		}
-
-		// 覆盖已有凭据是不可逆动作：先用 refresh 求证这份新凭据还活着，只接受
-		// 「明确活着」。起因是把一份旧 cockpit 导出重新导入时，文件里的 RT 早已被
-		// 轮换，直接覆盖会让本来能用的账号变成要重新登录——.bak 里虽然留着旧凭据，
-		// 但没有任何东西会自动拿它回退。判据用 VerifySessionByRefresh 的三态
-		// （alive/dead/inconclusive）：dead 是上游明确拒绝，inconclusive 是没判词
-		// （网络/5xx/429），后者同样不覆盖——主动销毁时没有判词就不能动手。
-		// 顺带一提：alive 分支里 a 已被 refresh 轮换过 RT，下面的落盘存的是新值。
-		existing := p.cfg.Pool.AuthByUID(uid)
-		if existing == nil {
-			creates++
-		} else {
-			overwrites++
-		}
-		if dryRun {
-			// 预览到此为止，**绝不**往上游发请求：VerifySessionByRefresh 会真的
-			// 轮换一次 refresh token（单次有效），只为看一眼就烧掉一个 RT 不行，
-			// 更别说它还会顺手改掉内存里的凭据。真实导入时这份校验照旧执行。
-			imported++
-			continue
-		}
-		if existing != nil {
-			verdict := p.cfg.Upstream.VerifySessionByRefresh(a)
-			if verdict != upstream.VerifyAlive {
-				skipped++
-				errs = append(errs, fmt.Sprintf("%s: 新凭据校验未通过（%s），保留原有凭据", src, verdict))
-				continue
-			}
-		}
-
-		if err := a.SaveAtomic(); err != nil {
-			skipped++
-			errs = append(errs, fmt.Sprintf("%s: save auth failed: %v", src, err))
-			continue
-		}
-
-		isNewAccount := existing == nil
-		p.cfg.Pool.Add(a)
-		p.cfg.Pool.Revive(uid)
-
-		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-		if realm == "global" {
-			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-				log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
-			} else if activated {
-				log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
-			}
-			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-				log.Printf("panel: import global trial uid=%s: %v", uid, err)
-			} else if claimed {
-				log.Printf("panel: import global trial uid=%s 已领", uid)
-			}
-		} else {
-			// 企业版 / 静态 API Key 无个人成长体系：CN 签到端点对企业号直接
-			// 400 code 10001「企业账号不支持该操作」。跳过签到，但下方余额查询
-			// 照常（企业额度走 get-enterprise-user-usage 口径）。
-			if !a.SupportsPersonalGrowth() {
-				log.Printf("panel: import 跳过签到 uid=%s（企业版/API Key 无个人成长体系）", uid)
-			} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
-			}
-		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-		}
-
-		if isNewAccount {
-			p.StartNewAccountTasks(uid)
-		}
-		imported++
-	}
-
-	total = len(accounts)
 	if dryRun {
+		// 预览：只统计不落盘、不发上游请求，可以同步返回（很快）。
+		out := p.runImport(accounts, sources, true, nil)
 		log.Printf("panel: cockpit import preview total=%d would_import=%d skipped=%d creates=%d overwrites=%d",
-			total, imported, skipped, creates, overwrites)
-	} else {
-		log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d creates=%d overwrites=%d",
-			total, imported, skipped, creates, overwrites)
+			out.Total, out.Imported, out.Skipped, out.Creates, out.Overwrites)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"dry_run":    true,
+			"total":      out.Total,
+			"imported":   out.Imported, // 预览时是「将会导入」的条数
+			"skipped":    out.Skipped,
+			"creates":    out.Creates,
+			"overwrites": out.Overwrites,
+			"errors":     out.Errors,
+			"files":      files,
+		})
+		return
 	}
+
+	// 真实导入：逐号要先用 refresh 向上游求证（覆盖项），上百个号能跑十几分钟。
+	// 异步模式下立刻返回 job_id，写入在后台跑，前端轮询 …/jobs/{id} 画进度条；
+	// 这是「确认导入要能看到实时进展」的实现方式——同步等待只会让按钮一直转圈，
+	// 用户分不清是在跑还是已经挂了。
+	if importAsync(r) {
+		job := newImportJob(len(accounts))
+		id := p.registerImportJob(job)
+		go func() {
+			out := p.runImport(accounts, sources, false, job.set)
+			log.Printf("panel: cockpit import finished job=%s total=%d imported=%d skipped=%d creates=%d overwrites=%d",
+				id, out.Total, out.Imported, out.Skipped, out.Creates, out.Overwrites)
+		}()
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":      true,
+			"dry_run": false,
+			"async":   true,
+			"job_id":  id,
+			"total":   len(accounts),
+			"files":   files,
+		})
+		return
+	}
+
+	out := p.runImport(accounts, sources, false, nil)
+	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d creates=%d overwrites=%d",
+		out.Total, out.Imported, out.Skipped, out.Creates, out.Overwrites)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
-		"dry_run":    dryRun,
-		"total":      total,
-		"imported":   imported, // dryRun 时是「将会导入」的条数
-		"skipped":    skipped,
-		"creates":    creates,
-		"overwrites": overwrites,
-		"errors":     errs,
+		"dry_run":    false,
+		"total":      out.Total,
+		"imported":   out.Imported,
+		"skipped":    out.Skipped,
+		"creates":    out.Creates,
+		"overwrites": out.Overwrites,
+		"errors":     out.Errors,
+		"files":      files,
 	})
+}
+
+// importAsync 是否为「后台任务 + 进度轮询」模式（确认导入走这条）。
+// 只认显式的 async=1/true：默认仍是同步返回，脚本/测试的旧语义不受影响。
+func importAsync(r *http.Request) bool {
+	v := strings.TrimSpace(r.FormValue("async"))
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // importRealm 归一化导入文件里的 realm：只认 cn/global（大小写/空白不敏感），

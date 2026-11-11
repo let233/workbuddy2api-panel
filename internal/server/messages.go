@@ -15,7 +15,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -27,11 +26,12 @@ func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 				r.Header.Set("Authorization", "Bearer "+k)
 			}
 		}
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
+		k, status, _, msg := h.authenticate(r)
+		if status != 0 {
+			writeAnthropicError(w, status, anthropicErrorType(status), msg)
 			return
 		}
-		next(w, r)
+		next(w, withGatewayKey(r, k))
 	}
 }
 
@@ -53,15 +53,13 @@ func (h *Handler) withDualAuth(next http.HandlerFunc) http.HandlerFunc {
 				r.Header.Set("Authorization", "Bearer "+k)
 			}
 		}
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			if r.Header.Get("x-api-key") != "" || r.Header.Get("anthropic-version") != "" {
-				writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
-				return
-			}
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		anthropicShape := r.Header.Get("x-api-key") != "" || r.Header.Get("anthropic-version") != ""
+		k, status, code, msg := h.authenticate(r)
+		if status != 0 {
+			writeAuthFailure(w, r, status, code, msg, anthropicShape)
 			return
 		}
-		next(w, r)
+		next(w, withGatewayKey(r, k))
 	}
 }
 

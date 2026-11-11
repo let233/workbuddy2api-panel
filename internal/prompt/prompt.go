@@ -1,4 +1,4 @@
-// Package prompt 提供网关自有系统提示词：内置默认 + 文件覆盖 + 降级中性提示词。
+// Package prompt 提供网关自有系统提示词：内置默认 + 后台设置正文 + 降级中性提示词。
 //
 // 背景：客户端（Claude Code/Codex 等 CLI）在 system prompt 注入固定模板句，
 // 上游内容审核按逐字精确匹配误杀合法流量（issue #36/PR39 的 11128）。
@@ -10,8 +10,6 @@ package prompt
 import (
 	_ "embed"
 	"encoding/json"
-	"fmt"
-	"os"
 	"strings"
 	"sync/atomic"
 
@@ -28,21 +26,21 @@ var defaultPrompt string
 // system 来源的误报，不改变用户指令的合法性语义。
 const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
 
-// Load 按 mode 与 file 加载系统提示词文本。
-//   - file 非空 → 读文件（不存在/读失败返回 error，调用方 fail fast）；
-//   - file 空 → 返回内置 defaultPrompt。
+// Default 返回内置默认提示词（面板「留空 = 内置默认」的兜底文本）。
+func Default() string { return defaultPrompt }
+
+// Effective 返回实际注入的提示词文本：
+//   - text 非空白 → 原样使用（后台设置里的 prompt.text，随整份配置存库）；
+//   - text 空/纯空白 → 内置 defaultPrompt。
 //
-// mode 在此仅做透传记录（实际 custom/passthrough 路由由调用方决定），
-// Load 只负责"拿到一段提示词文本"，不关心路由语义。
-func Load(mode, file string) (string, error) {
-	if file == "" {
-		return defaultPrompt, nil
+// 不再读任何文件路径：提示词正文就是一条后台设置（app_kv 的 config:settings），
+// 面板是唯一编辑入口，保存即热生效。容器/多机部署不再依赖宿主机上是否存在某个
+// .md 文件，也不会出现「面板保存成功、下次启动却因文件丢失回落到默认」的错位。
+func Effective(text string) string {
+	if strings.TrimSpace(text) != "" {
+		return text
 	}
-	raw, err := os.ReadFile(file)
-	if err != nil {
-		return "", fmt.Errorf("prompt file %s: %w", file, err)
-	}
-	return string(raw), nil
+	return defaultPrompt
 }
 
 // Rewrite 解析 OpenAI 请求体并替换系统提示词：

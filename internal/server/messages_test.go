@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
@@ -476,7 +477,11 @@ func TestMessagesEndpointStreamErrorBeforeSSE(t *testing.T) {
 func TestMessagesAuthXAPIKey(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "secret"})
+	km := gatewaykeys.NewManager(nil)
+	if _, err := km.Create(gatewaykeys.Key{Name: "test", Secret: "secret"}); err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up, Keys: km})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))

@@ -57,6 +57,7 @@ WorkBuddy2API 是一个**自托管的反向代理网关**：把腾讯 CodeBuddy�
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动对齐到模型支持的**最近档**（同距优先模型默认档，行里显示生效档位）；网关侧 `thinking.*` 档位策略（客户端优先 / 网关优先 + 作用域「只档位 / 档位与开关」，含按模型覆盖、`off` 尊重与保存后热生效） |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
+| 🔐 **账号登录 + 客户端多 Key** | 面板改成**账号密码登录**（首次部署 `admin` / `123456`，登录后改密），网关没有全局密钥；客户端 Key 逐把限定**到期时间 / 可用模型 / 积分额度 / 提示词模式与正文**，这套配置可存成**分组模板**复用。首启自动签发一把不限额度、不限模型、提示词跟随全局的**系统 Key** |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；**运行日志按天落盘**（重启回填、按今日/3 天/7 天导出 ZIP）；**上游劣化滑窗告警**（5 分钟窗内 TTFB≥8s 占比≥30% 或 5xx≥10% 时打一条聚合 WARN——「全 200 但每个请求 20 秒」这种无告警停摆从此可见）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态落数据库（`gorm`：SQLite 默认 / MySQL / PostgreSQL，建表自动迁移）+ Upstash Redis 异步镜像（可选），重启择新恢复 |
@@ -67,7 +68,7 @@ WorkBuddy2API 是一个**自托管的反向代理网关**：把腾讯 CodeBuddy�
 
 运行数据统一存数据库，**默认 SQLite，双击即用**（纯 Go 实现，不需要 CGO、不需要另外装服务）；同一个二进制也支持 MySQL 与 PostgreSQL，改两行配置即可切换。账号凭证仍是 `auth_dir` 下的 `workbuddy*.json`，存储方式不变。
 
-**配置文件只剩引导参数**：端口、状态文件路径、数据库连接。其余全部配置（上游地址与超时、号池策略、排程、提示词、告警、预算、脱敏、模型名单、`api_key` …）都存在数据库 `app_kv` 的 `config:settings` 键里，面板保存即生效、**不需要重启**。
+**配置文件只剩引导参数**：端口、状态文件路径、数据库连接。其余全部配置（上游地址与超时、号池策略、排程、提示词、告警、预算、脱敏、模型名单 …）都存在数据库 `app_kv` 的 `config:settings` 键里，面板保存即生效、**不需要重启**。
 
 ```jsonc
 {
@@ -81,9 +82,10 @@ WorkBuddy2API 是一个**自托管的反向代理网关**：把腾讯 CodeBuddy�
 ```
 
 - `listen` / `state_file` / `database` 之外的键写进这个文件会被忽略（启动时搬进数据库后把文件改写成上面这一小份）。真正还要重启进程的只有 `state_file` 与 `database`：库连哪儿、状态文件放哪儿，改完得重启才重新打开。
-- `api_key` 不入文件：首次部署 `crypto/rand` 生成 `sk-` 前缀随机串存进数据库，面板「服务」页点「显示」即可查看复制；容器部署想固定密钥仍可用环境变量 `WB2A_API_KEY`（优先级最高）。
+- **没有全局 `api_key`**：配置里不存、环境变量 `WB2A_API_KEY` 也不再读取。面板进入靠账号密码登录（会话 Cookie），网关只认面板签发的客户端 Key——首启自动建一把「系统 Key」（不限额度 / 不限模型 / 提示词跟随全局），明文只在那一次启动日志里打印，之后可在面板「API Key」页重新生成 secret。
 - 建表 / 改表由 `gorm` 的 `AutoMigrate` 在启动时自动完成，升级不用手工跑 SQL；表名见下。
 - MySQL DSN 形如 `user:pass@tcp(127.0.0.1:3306)/wb2api?charset=utf8mb4&parseTime=True`；PostgreSQL 形如 `host=127.0.0.1 user=wb2api password=xxx dbname=wb2api port=5432 sslmode=disable`（缺的参数会按需补默认）。
+- **连接样例在根目录 `config.example.json` 的 `_数据库示例` 里**：SQLite（相对路径 / 数据目录 / 自带 pragma / 内存库 / Windows 绝对路径）、MySQL（TCP / 容器服务名 / TLS / unix socket / MariaDB 别名）、PostgreSQL（key=value / URL / `sslmode=require` / `verify-full` / `search_path`）各给一组可直接粘贴的 `driver` + `dsn`，另附 `WB2A_DB_DRIVER` / `WB2A_DB_DSN` 覆盖写法。挑一组替换 `database` 段即可；`_` 开头的键是注释，启动时会被忽略。注意 SQLite 的 `dsn` 父目录会自动创建（`file:./data/x.db` 也算），但 `file://` URI 形态不建，得先把目录备好。
 - **旧版 JSON 自动导入**：首次启动若发现同目录的 `state.json` / `usage.json` / `proxy-pool.json` / `request-logs/` 等旧数据，会一次性写进数据库并把原文件改名为 `*.imported`（导入失败则保留原文件、下次启动重试）；导入过什么记在 `app_kv` 表里，不会重复导入。
 - 环境变量 `WB2A_DB_DRIVER` / `WB2A_DB_DSN` 可覆盖配置，容器部署更省事。
 
@@ -98,6 +100,7 @@ WorkBuddy2API 是一个**自托管的反向代理网关**：把腾讯 CodeBuddy�
 | `proxy_nodes` / `proxy_bindings` / `proxy_realms` | 代理节点、账号绑定、realm 默认出口 |
 | `task_jobs` | 面板批量任务记录 |
 | `model_catalog` / `model_probes` | 模型上限缓存（上游 `/v1/models`）/ 实测输出上限 |
+| `gateway_keys` / `gateway_key_templates` | 客户端 API Key（密钥 / 到期 / 可用模型 / 额度 / 提示词）/ 可复用的分组模板 |
 | `admin_audit` | 管理接口审计 |
 | `app_kv` | 杂项键值（**面板配置整份 JSON（`config:settings`）**、池快照时刻、补跑标记、旧数据导入标记等） |
 
@@ -187,7 +190,7 @@ curl -s http://127.0.0.1:7863/v1/videos/1312831544-WandVideo-… \
 
 ### MCP 端点（`POST /mcp`）
 
-MCP 端点走 **Streamable HTTP** 的纯 POST 形态（不提供 SSE 流、不维护 session）：客户端发一条 JSON-RPC 就回一条 JSON-RPC。鉴权与 REST 相同（`Authorization: Bearer <api_key>`）；`GET /mcp` 回 405 + `Allow: POST`（客户端据此退回纯 POST）。
+MCP 端点走 **Streamable HTTP** 的纯 POST 形态（不提供 SSE 流、不维护 session）：客户端发一条 JSON-RPC 就回一条 JSON-RPC。鉴权与 REST 相同（`Authorization: Bearer <客户端 Key 的 secret>`）；`GET /mcp` 回 405 + `Allow: POST`（客户端据此退回纯 POST）。
 
 ```bash
 curl -s http://127.0.0.1:7863/mcp \
@@ -209,7 +212,7 @@ curl -s http://127.0.0.1:7863/mcp \
 
 ```json
 {"mcpServers":{"wb2api":{"type":"http","url":"http://127.0.0.1:7863/mcp",
-  "headers":{"Authorization":"Bearer <api_key>"}}}}
+  "headers":{"Authorization":"Bearer <客户端 Key 的 secret>"}}}}
 ```
 
 约定：**工具执行失败**（上游 4xx/5xx、任务 failed）回 `result.isError=true` + 上游原话进 `content[0].text`，让模型自己读到「时长只支持 4-15 秒」这类可行动信息；**参数不合法**（缺 `prompt` / 缺 `task_id` / 未知工具）才走 JSON-RPC `-32602`。工具调用内部直接复用网关自己的 HTTP handler（`httptest` 形态），所以换号、错误策略、记账、请求日志与 REST 完全同一条路径——不会出现「REST 记了账、MCP 漏了账」这种分叉。
@@ -258,6 +261,53 @@ curl -s http://127.0.0.1:7863/v1/images/strip-watermark   -H "Authorization: Bea
 
 边界：只裁「整条纯白留白」，不做 inpainting；`min_blank_px` 调小会切到画面内容；裁切会改画幅，介意就 `keep_blank` 少裁一点。图片地址只允许上游产物域（`.myqcloud.com`），防止被当成 SSRF 跳板。
 
+## 🔐 客户端多 Key（按 Key 限模型 / 限额度 / 设到期）
+
+客户端 Key 是网关**唯一**的凭据来源（全局 `api_key` 已移除，见上文「数据存储」）。首次部署会自动签发一把「系统 Key」，等于旧版不限量的那把；要发给别人用、或者给自己分场景用，再在面板 **API Key** 页签签发任意多把——每把都能单独约束：
+
+| 字段 | 缺省 | 语义 |
+|---|---|---|
+| `name` / `note` | `未命名 Key` / 空 | 面板显示用，不参与鉴权 |
+| `secret` | 自动生成 `sk-` + 24 位 | 客户端放进 `Authorization: Bearer <secret>`（也接受 `x-api-key`）；留空即保留原值，重复会被拒（409） |
+| `enabled` | `true` | 关掉立刻 403，不必删 Key |
+| `expires_at` | `0` = 永不过期 | 秒级时间戳；到点后 `403 key_expired` |
+| `models` | `[]` = **全部** | 条目可写 `cn:glm-5.2`（只此分区）或 `glm-5.2`（两个分区都认），`*` 也等于全部；不在名单里的模型请求回 `400 model_unavailable`，`/v1/models` 与 `/v1/models/capacity` 一并按 Key 过滤 |
+| `credit_limit` / `credit_used` | `0` = 不限 | 额度由上游回执的 `usage.credit` 累加；用尽后 `429 insufficient_quota`。`credit_used` 与请求数可随时「重置用量」清零（按周期放额度的用法） |
+| `prompt_mode` / `prompt_text` | `""` = **跟随全局配置** | 非空则覆盖全局：`custom` 替换 system、`passthrough` 原样透传、`append` 追加 |
+
+**分组模板**（`gateway_key_templates`）把这套配置打成一包（模型 / 额度 / 提示词 / 有效天数），新建 Key 时选一下就预填。套用规则是**只补空缺**：你手填的模型不会被模板覆盖，「模型留空 = 全部」这条默认语义也不会被模板悄悄改写；`expiry_days` 只在**新建**且没填到期时间时按天数往后推算，改已有 Key 不会挪走它的到期日。
+
+状态判定顺序：`disabled` → `expired` → `quota_exceeded` → `ok`；面板列表直接显示这个状态。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/panel/api/apikeys` | Key 列表（带状态）+ 模板列表 + 全局提示词（`{keys,templates,global,now}`） |
+| POST | `/panel/api/apikeys/create` | 新建（可带 `template_id` 套模板） |
+| POST | `/panel/api/apikeys/update` | 改配置（用量计数不动） |
+| POST | `/panel/api/apikeys/delete` | 删除，立刻失效 |
+| POST | `/panel/api/apikeys/reset_usage` | 已用积分 + 请求数清零 |
+| POST | `/panel/api/apikey_templates/save` / `…/delete` | 存 / 删分组模板 |
+
+这几张表随其它表一起 `AutoMigrate`，升级不需要手工建表。
+
+## 🔑 登录管理面板
+
+面板没有「访问密钥」这一层了：打开 `/panel/` 就是账号密码登录框，凭据是服务端会话（`HttpOnly` + `SameSite=Lax` Cookie，默认 30 天滑动有效），前端拿不到任何可被 XSS 读走的 token。
+
+- **首次部署**自动创建管理员 `admin` / 密码 `123456`（bcrypt 哈希存数据库，**不写配置文件**），启动日志会打一行提示；监听非回环地址时另打一条告警。登录后顶部钥匙形按钮改密码——密码是公开的默认值，面板却在公网上，这中间没有别的门。
+- **改密即踢人**：改完密码该账号的其它会话全部作废，当前标签页自动换发新会话。
+- **默认口令提示只出现一次**：登录框里那句「首次部署的默认账号 admin / 密码 123456」跟着会话接口的 `default_credentials` 走——改过密码就隐藏，不会再让人照着试一个必然失败的密码。
+- 网关与面板彻底分开：面板入口不认任何客户端 Key，客户端 Key 也进不了面板。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/panel/api/auth/session` | 当前会话（`{authenticated,username,is_admin,must_change_password,default_credentials}`）；未登录也回 200，只是 `authenticated:false` |
+| POST | `/panel/api/auth/login` | `{"username","password"}`；失败回 `401 invalid_credentials`，同 IP 一分钟内 5 次失败后 `429 too_many_attempts` |
+| POST | `/panel/api/auth/logout` | 作废当前会话并清 Cookie |
+| POST | `/panel/api/auth/password` | `{"old_password","new_password"}`；旧密码错回 `400 invalid_old_password` |
+
+未登录访问 `/panel/api/*` 一律 `401 login_required`，访问页面则 302 回 `/panel/`（登录层就在首页里，不另开路由）。
+
 ## 代理池与账号绑定
 
 面板「代理池」支持一行一个批量添加，接受 `http`、`https`、`socks5`、`socks5h` URL，包括用户名密码。空行忽略，重复项跳过，无效行单独报告，其他有效行仍保存。例如：
@@ -287,7 +337,7 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 
 节点、手动启停、账号绑定与测活设置保存在数据库（`proxy_nodes` / `proxy_bindings` / `proxy_realms` 三张表，整表原子替换），健康状态仅保存在内存。代理列表、接口响应和错误日志不返回密码；编辑时密码留空保持原值，从 URL 删除用户名可移除认证。被账号或 realm 默认引用的节点禁止删除（HTTP 409），需先解除引用；从面板删除账号时同步清理绑定。
 
-管理接口沿用面板鉴权：
+管理接口沿用面板登录会话（Cookie）：
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -388,7 +438,7 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 
 二进制**不自带守护**：进程退出后不会自己回来，也没有内置服务（SCM）模式。把面板当本地网关用时（上游客户端写死 `127.0.0.1:<端口>`），进程不在等于该 provider 整体不可用——客户端立刻拿到 `connection refused`，不会重试。所以「开机自启 + 退出即重启」得由系统侧提供，下面两种任选一种。
 
-先确认三件事：`wb2api.exe` 的绝对路径（工作目录就是放 `config.json` 的地方）；配置里 `listen` 默认只绑 `127.0.0.1`，不用额外放通防火墙；手动跑一次能起（首次会自动写出只含端口与数据库的 `config.json`，并生成随机 `sk-` 前缀 `api_key` 存进数据库），再交给常驻项。
+先确认三件事：`wb2api.exe` 的绝对路径（工作目录就是放 `config.json` 的地方）；配置里 `listen` 默认只绑 `127.0.0.1`，不用额外放通防火墙；手动跑一次能起（首次会自动写出只含端口与数据库的 `config.json`，建好管理员 `admin` / `123456`，并签发一把系统 Key），再交给常驻项。
 
 ### 方案 A：NSSM（推荐，真正的服务）
 
@@ -455,14 +505,16 @@ DMG 未公证，首次打开需要右键 →「打开」。
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；归档只把请求元数据写进数据库表 `req_logs`，不写提示词、响应正文或凭证。请求记录表带**调用来源**（客户端 IP / User-Agent，按 `logging.request_client_info` 可关），支持按 IP / UA / 模型 / 账号 / 请求 ID 与结果筛选 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
-| **在线配置编辑（全热生效）** | 面板改的每一项都**立即生效**：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程 / 上游超时与 UA / 提示词 / 模型名单 / 告警 / 预算 / 监听端口……配置存数据库（`app_kv`），不再写回配置文件；唯一还需重启的只剩 `state_file` 与 `database` 两个引导参数 |
+| **在线配置编辑（全热生效）** | 面板改的每一项都**立即生效**：`soft_rate` / 脱敏开关 / 池参数 / 任务排程 / 上游超时与 UA / 提示词 / 模型名单 / 告警 / 预算 / 监听端口……配置存数据库（`app_kv`），不再写回配置文件；唯一还需重启的只剩 `state_file` 与 `database` 两个引导参数 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **25 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 专家召唤 / 技能尝鲜 / 主题 / 资料库等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **模型繁忙度（面板）** | 「模型与档位」列出官方 `/v2/chat/busy` 的实时繁忙度（idle/normal/busy/congested/unavailable），只在 `繁忙 / 拥堵 / 不可用` 时挂色标——它解释了 chat 侧偶发的 429 / 6021 queue.full。**只读观测**：不参与选号；服务端偶发对整批回 `unknown`（实测同批重查可在 idle/unknown 间跳），故取不到就不标；同页每行另有**网关档位**下拉（首项＝模型支持的最高档，其余为具体档与 `off`；写入 `thinking.model_defaults` 精确键、保存即热生效，策略关闭时整体禁用并显示生效档）与**下游可见**开关（与 `models.hidden` 同一份黑名单：关掉的模型从 `/v1/models` 隐藏、点名调用被拒，行尾置灰并排到列表末尾） |
 | **联网检索（官方 agenttool）** | `POST /v1/search` 透传官方 `{base}/agenttool/v1/search`（`{query,max_results}` → `{results[].title/url/snippet/date,total_results}`，查询免费；对 DSH（DeepSeek Harness，按 UA 含 `deepseek-harness` 识别）额外启用 DeepSeek Search API 兼容：接受 `count` 作为条数，`date` 缺失时补 `null`、`title`/`snippet` 缺失时补空串；其余客户端保持上游原文逐字节透传）；同一 base 还提供 `POST /v1/fetch`（`{"url":"https://…"}` → `{"content":"<markdown>"}`，透传官方 `agenttool/v1/webfetch`）；加 `"deep":true` 则改走官方**综述式**检索 `agentic_search`（服务端多轮检索 + 抓页 + 带引用综述，回 `done` 帧原文：`synthesis.content` + `results` 整页正文 + `statuses` + `partial` 降级标记）——实测单次 18~66s、prompt ~48K tokens，故默认走 snippet 快路径（~1s）。另在 `/v1/messages` 与 `/v1/responses` 上落地服务端联网工具：客户端（Claude Code / Codex）只声明 `{"type":"web_search_20250305","name":"web_search"}`（或 Responses 的托管 `{"type":"web_search"}`），网关侧先让模型自己写检索词（探测）、执行检索、把结果注入上下文，再走既有流式管道出答案。Anthropic 侧按协议回报 `server_tool_use` + `web_search_tool_result` 块（含来源 URL，且**不**降级成客户端可执行的 `tool_use`）；没声明该工具的请求零额外开销；检索失败如实告知模型（不静默当成「网上没有」），联网不可用则降级为普通对话 |
 | **托管出图（Responses `image_generation`）** | 客户端（Codex / ChatGPT 那套用法）只声明 `{"type":"image_generation"}`，网关侧先让模型**自己写提示词**（探测），再走本网关的出图管道（选号 / 白名单 / 记账与 `/v1/images/generations` 同口径），成品以 `image_generation_call` 输出项交付：`result` 是 base64，非流式插在 `output` 首位、流式在 `response.created` 之后补 `output_item.added/done`。单请求只出一张（与 `n>1` 拒绝同口径）；出图失败照样回到文本回答，但注入的是「出图接口不可用」，模型不能假装已生成。没声明该工具的请求零额外开销 |
 | **成长任务队列每日排程** | `schedule.growth_hours`（默认 `[11]`）+ `schedule.growth_enabled`：面板任务中心的执行队列按排程每日自动跑一遍（扫描待办 → accept → 动作 → 达标领奖），与手动入口共用同一队列与账号锁；`POST /admin/tasks/growth/run` 可手动补跑 |
 | **国际版每日活跃（网页通道）** | 国际版每日 30/50 积分只认「**跑完的网页 agent 会话**」——桌面身分 chat/completions 与 `/v2/report` 只点亮连登，积分不动（issue #111 实测）。排程的国际版活跃腿因此完整复刻网页端链路：`POST /console/as/conversations/` 建会话 → `GET .../{id}/session` 取沙箱 `link`/`token` → ACP over SSE（`initialize` → `session/load` → `session/set_model` → `session/prompt`）→ 轮询 `data.status` 到 `completed` → `stop`（失败再 `delete`）。三个必须照抄客户端的细节：ACP 鉴权用**沙箱 token**（账号 token 一律 401 `12801`）、走浏览器身份 UA/Origin、跑完必须收尾（单号活跃会话上限 10 条，漏收尾攒满就再也建不出会话）。模型钉 `deepseek-v4.1-flash`（国际版 x0.00，打卡不扣积分）；当日成功一次后不再重复建会话。国内版零调用 |
-| **首启自动生成配置** | 目录下无 `config.json` 时自动写出引导配置（端口 + 数据库），并用 `crypto/rand` 生成随机 `sk-` 前缀 `api_key` 入库，双击即开 |
+| **首启自动生成配置** | 目录下无 `config.json` 时自动写出引导配置（端口 + 数据库），建好管理员 `admin`/`123456` 并签发系统 Key（`crypto/rand` 生成），双击即开 |
+| **面板账号登录** | 会话 Cookie（HttpOnly / SameSite=Lax / 30 天滑动）、bcrypt 口令哈希、登录失败限速、改密即作废旧会话；没有全局 `api_key`，也没有前端可见的 token |
+| **关于页** | 面板新增「关于」视图，顺手把「版本与更新」整块从配置页搬过去放在最上面（自动更新 / 自动更新时间 / 更新代理 / 资产镜像前缀 / 沿用环境变量代理 + 检查更新、测试连通性、打开 Release、立即更新），配一个「保存更新设置」按钮，与配置页共用同一份 `CFG_MAP`（同一份表单字段散在两张表单里，靠 `cfgField()` 按 name 取并集）；下方列项目定位、源码仓库、问题反馈、Release 更新源、上游血缘、许可证，以及运行环境（版本 / 已运行时长 / Redis 模式 / 配置文件路径）。GitHub 链接一律是静态锚点——面板 CSP 是 `connect-src 'self'`，前端不拉 `api.github.com` |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，积分冷却（余额耗尽）账号余额恢复自动解冻 |
 | **模型降级路由（6004）** | `pool.model_fallback`：`{"deepseek-v4.1-flash":"deepseek-v4-flash"}`。上游 `6004`「该模型使用量超限」是**模型级**限流（实测见过 8 小时窗口），此时账号健康、等价模型可用——配了表就**同账号改道等价模型**继续服务。仅 `6004` 触发（`11102`/`11101`/普通 429/5xx 不降级）；冷却仍记在原模型名下（记成等价模型会把好的也冷却，降级白做）；不写持久状态，到期自动回原模型；全池该模型冷却（选号返回空）时也先试降级再报 503。缺省空 = 不降级。面板在限流提示里标注「⤳ 已路由至 <等价模型>」，否则用户看到「v4.1 限流」会以为服务断了。另附 `POST /panel/api/accounts/{uid}/model_toggle`：**手动**关闭某 (账号, 模型) 组合（永久语义、仅手动解，且优先于一切自动冷却——否则「我关了它，一次自动恢复又开了」） |
@@ -472,7 +524,7 @@ DMG 未公证，首次打开需要右键 →「打开」。
 | **用量页积分历史** | 用量视图新增「积分与 token 按小时」表：每小时列出请求数 / prompt / completion / 合计 token / **扣费积分** / 兑换率（1 积分换多少 token，倒序，最近一小时在最上面），卡片另给窗口内积分合计与兑换率。积分取上游末帧 `usage.credit`，**未观测到的请求不计**（「没测到」≠「没花钱」）；随小时桶一起折叠进日桶，保留 90 天；另给窗口内**总积分**卡片（`usage.credit` 求和，无样本时显示 —） |
 | **模型能力透出** | `/v1/models` 附带 `context_length` / `max_output_tokens` / 工具·视觉·思考能力标记 / 积分倍率等上游真实字段，并声明 `reasoning_supported_efforts` / `reasoning_default_effort`：默认档按 `thinking.*` 策略写成网关**实际生效档**（策略关闭时忠于上游），`can_disable_thinking` 的模型在档位表里追加 `off`，目录只给固定档的模型声明为单档 |
 | **models.dev 形状能力声明** | 上一条之外，`/v1/models` 每条再**追加**一组 models.dev 词表字段，给只认这套词的客户端（magpie 等）读：`modalities`（`input` 按 `supports_images` 给 `["text"]` 或 `["text","image"]`；`output` 对话模型恒 `["text"]`、出图模型 `["image"]`）、`limit`（`context`/`output` 直接搬同一轮的 `context_length`/`max_output_tokens`，缺哪个省哪个，**不拿 1M/131072 兜底**）、`tool_call`、`reasoning`、`reasoning_options`（档位取 `reasoning_supported_efforts` 去掉 `off`；有 `off` 或 `can_disable_thinking` 时补 `{"type":"toggle"}`）。**纯追加**：既有键一个字节都不改（`cn:` 前缀、`object`、`created`、`owned_by` 照旧），无数据源的字段（`cost`/`attachment`/`structured_output`/`knowledge`/`release_date`）一律不写——客户端按「字段在不在」判能力，编造比缺失更糟。另加 `supported_reasoning_levels`（`[{"effort":"low"},…]`）：**这是本组里唯一不属于 models.dev 词表的键**，因为 magpie 解析厂商列表时只认它（`internal/catalog/live.go:704` 的 `liveModel.Levels`），「关闭思考」按其 `EffortRank` 写成 `none` 而不是 `off`，出图与无档位模型整键不写。不认这些键的客户端按 JSON 惯例忽略。面板自己的 `/panel/api/models` 不受影响，仍是网关形状 |
-| **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
+| **安全加固** | 常量时间密钥比对（客户端 Key 走 `sha256` + `subtle`）、bcrypt 口令哈希与登录限速、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **入站请求体上限（OOM 护栏）** | `server.max_payload_bytes`（默认 64 MiB，允许 8–512 MiB）：读体是 `io.ReadAll` 无界的，一次几百 MB 的上传就能把网关连同伴生面板一起 OOM。超限**先排空有限字节再回** `413 payload_too_large`（不排空则 net/http 关连接，客户端只看到 connection reset）；OpenAI / Anthropic 两种入口各回各自形状。上限刻意远高于真实会话（多图长会话实测几 MB 量级），**不做大请求预拦截**——8 MiB 那种紧上限曾因多图长会话被移除 |
 | **11140 风控连坐保护** | 11140 的两种形态都认（英文 `request illegal` / 中文「账号存在异常行为，已被限制使用」与 `unusual activity`；**code + 文案必须同时成立**，否则会把同 code 的模型级限流误判成账号终态）。命中**就地停手、不换号**——原来的「禁用该号 + 立刻换下一个」会让一个请求顺着轮转把整池账号逐个送进风控；同一 15 分钟窗内 ≥2 个不同账号被限制 → 全池暂停派发 `upstream.restriction_hold_seconds`（默认 1800s；0 = 只停手不暂停），期间 `503 account_restricted_hold` + `Retry-After` |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |

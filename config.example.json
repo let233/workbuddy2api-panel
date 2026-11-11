@@ -1,9 +1,97 @@
 {
-  "_说明": "本文件只放启动期参数：监听端口、数据目录、数据库连接。其余配置（上游/池/排程/提示词/告警/预算/api_key 等）已入库：启动后在面板里改，保存即生效、无需重启。api_key 首次部署自动生成 sk- 前缀随机串入库，不写在这里。",
+  "_说明": "本文件只放启动期参数：监听端口、数据目录、数据库连接。其余配置（上游/池/排程/提示词/告警/预算/模型名单等）都在数据库里：启动后在面板里改，保存即生效、无需重启。客户端 Key 不再写在配置里：首启自动建一把「系统 Key」（不限额度/不限模型/提示词跟随全局），明文只在那一次启动日志里打印，之后可在面板「API Key」页新建或重发。首次启动后本文件会被改写成最小形态（下面这些示例会消失），需要时从仓库重新取一份；不想动文件也可以用环境变量 WB2A_DB_DRIVER / WB2A_DB_DSN 覆盖。",
   "listen": "127.0.0.1:7863",
   "state_file": "./data/state.json",
   "database": {
     "driver": "sqlite",
     "dsn": "wb2api.db"
+  },
+  "_数据库示例": {
+    "_说明": "挑一组，把上面 database 的 driver / dsn 换成它即可。driver 不区分大小写，也认别名：sqlite3 ／ mariadb ／ postgresql、psql、pgx。dsn 里只写连接串，不要把驱动名再拼进去（写成 sqlite:wb2api.db 那种会当文件名）。换 driver 或 dsn 需要重启进程；listen 与其余配置都能热改。",
+    "sqlite": {
+      "_说明": "默认，纯 Go 实现，不需要 CGO 也不需要另装服务。dsn 是库文件路径，留空 = state_file 同目录下的 wb2api.db。文件不存在会自动建（含父目录）。缺省会自动补 WAL + busy_timeout(10000) + foreign_keys 三个 pragma；自己写过 _pragma= 就按原样用。",
+      "相对工作目录": {
+        "driver": "sqlite",
+        "dsn": "wb2api.db"
+      },
+      "放在数据目录": {
+        "driver": "sqlite",
+        "dsn": "./data/wb2api.db"
+      },
+      "自己指定 pragma": {
+        "driver": "sqlite",
+        "dsn": "file:./data/wb2api.db?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+      },
+      "内存库（重启即丢，只适合试用）": {
+        "driver": "sqlite",
+        "dsn": ":memory:"
+      },
+      "Windows 绝对路径": {
+        "driver": "sqlite",
+        "dsn": "D:/wb2api/data/wb2api.db"
+      },
+      "file:// URI（能用，但不替你建目录）": {
+        "driver": "sqlite",
+        "dsn": "file:///var/lib/wb2api/wb2api.db"
+      },
+      "_注意": "库文件别放在 NFS / SMB / 虚拟共享目录上：SQLite 的锁在跨主机共享的文件系统上不可靠，会偶发 database is locked 或写坏。多实例共用一个库也不行——SQLite 只支持单写者，要横向扩就换 MySQL / PostgreSQL。dsn 的父目录会自动建（file:./data/x.db 也会），只有 file:// 这种 URI 形态不建，请先把目录准备好。"
+    },
+    "mysql": {
+      "_说明": "形如 user:pass@tcp(host:port)/dbname?params。没写 parseTime / charset / loc 会自动补上（parseTime=true 必须有，否则 time.Time 列读不出来）。库名对应的 database 要先建好，表由 AutoMigrate 建。",
+      "本地 TCP": {
+        "driver": "mysql",
+        "dsn": "wb2api:secret@tcp(127.0.0.1:3306)/wb2api?charset=utf8mb4&parseTime=True&loc=Local"
+      },
+      "远程 / 容器（服务名当主机）": {
+        "driver": "mysql",
+        "dsn": "wb2api:secret@tcp(mysql:3306)/wb2api?charset=utf8mb4&parseTime=True&loc=Local"
+      },
+      "强制 TLS": {
+        "driver": "mysql",
+        "dsn": "wb2api:secret@tcp(db.example.com:3306)/wb2api?charset=utf8mb4&parseTime=True&loc=Local&tls=true"
+      },
+      "unix socket": {
+        "driver": "mysql",
+        "dsn": "wb2api:secret@unix(/var/run/mysqld/mysqld.sock)/wb2api?charset=utf8mb4&parseTime=True&loc=Local"
+      },
+      "MariaDB（driver 写别名也行）": {
+        "driver": "mariadb",
+        "dsn": "wb2api:secret@tcp(127.0.0.1:3306)/wb2api?charset=utf8mb4&parseTime=True&loc=Local"
+      },
+      "_注意": "口令里的 @ : / ? # 等字符要按 URL 规则转义（@ → %40、/ → %2F），否则会被当成主机分隔符切开；转义太麻烦就换一个不含这些字符的口令。"
+    },
+    "postgres": {
+      "_说明": "key=value 与 URL 两种写法都收（原样交给 pgx）。缺的参数按驱动默认补；sslmode 建议显式写，别依赖默认值。",
+      "本地 key=value": {
+        "driver": "postgres",
+        "dsn": "host=127.0.0.1 port=5432 user=wb2api password=secret dbname=wb2api sslmode=disable"
+      },
+      "本地 URL 写法": {
+        "driver": "postgres",
+        "dsn": "postgres://wb2api:secret@127.0.0.1:5432/wb2api?sslmode=disable"
+      },
+      "云托管（强制 TLS）": {
+        "driver": "postgres",
+        "dsn": "host=db.example.com port=5432 user=wb2api password=secret dbname=wb2api sslmode=require"
+      },
+      "校验服务端证书": {
+        "driver": "postgres",
+        "dsn": "postgres://wb2api:secret@db.example.com:5432/wb2api?sslmode=verify-full"
+      },
+      "指定 search_path 与超时": {
+        "driver": "postgres",
+        "dsn": "host=127.0.0.1 user=wb2api password=secret dbname=wb2api sslmode=disable search_path=wb2api connect_timeout=10"
+      },
+      "别名 driver（postgresql / psql / pgx）": {
+        "driver": "pgx",
+        "dsn": "host=127.0.0.1 user=wb2api password=secret dbname=wb2api sslmode=disable"
+      },
+      "_注意": "PgBouncer 用 transaction 池模式时，服务端预编译语句会串到别的连接上，需在其配置里开 prepared_statement 兼容或改用 session 池。"
+    },
+    "环境变量覆盖": {
+      "WB2A_DB_DRIVER": "mysql",
+      "WB2A_DB_DSN": "wb2api:secret@tcp(127.0.0.1:3306)/wb2api?charset=utf8mb4&parseTime=True&loc=Local",
+      "_说明": "两个都设时优先于配置文件，容器里换库不用改文件；只设其中一个也可以（另一个仍读文件）。"
+    }
   }
 }

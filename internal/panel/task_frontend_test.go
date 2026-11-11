@@ -46,7 +46,12 @@ console.log('task frontend regression checks passed');`
 	}
 }
 
-func TestConfigSaveKeepsEnvironmentManagedAuthentication(t *testing.T) {
+// TestConfigSavePostsCollectedBody 钉住配置保存的路径：提交 → api('config', POST, JSON(collectConfig()))
+// → 重新拉取配置 + 刷新概览 + 回显环境托管字段。
+//
+// 同时钉住反面：保存配置不再碰任何「本机密钥」——凭据只在 HttpOnly 会话 Cookie 里，
+// 前端既读不到也写不了（旧实现会把 api_key 存进 localStorage，等于给 XSS 留了一份副本）。
+func TestConfigSavePostsCollectedBody(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node unavailable")
@@ -56,19 +61,31 @@ const src=fs.readFileSync(process.argv[2],'utf8');
 const start=src.indexOf("$('cfgForm').onsubmit ="),end=src.indexOf('/* ── 添加账号');
 assert(start>=0&&end>start);
 (async()=>{
- for(const managed of [true,false]) {
-  const hosts={cfgForm:{},btnCfgSave:{},cfgKey:{value:'submitted-key'},cfgNote:{}};
-  let saved='environment-key';
-  const ctx={$:id=>hosts[id],DURATION_FIELDS:[],durationBad:()=>false,markDurationFields(){},collectConfig:()=>({api_key:'submitted-key'}),
-   FALLBACK_FIELDS:[],fallbackBad:()=>false,FALLBACK_TIP:'',
-   api:async()=>({restart_required:[],api_key_env_managed:managed}),
-   localStorage:{setItem:(_,value)=>{saved=value}},LS_KEY:'key',toast(){},loadOverview(){},
-   loadConfig:async()=>{assert.equal(saved,managed?'environment-key':'submitted-key')},JSON};
+  const hosts={cfgForm:{},btnCfgSave:{disabled:false,textContent:''},cfgNote:{textContent:''}};
+  let posted=null,loaded=0,overview=0,keyWrites=0;
+  const ctx={
+    $:id=>hosts[id],
+    DURATION_FIELDS:[],durationBad:()=>false,markDurationFields(){},
+    collectConfig:()=>({upstream:{user_agent:'x'}}),
+    FALLBACK_FIELDS:[],fallbackBad:()=>false,FALLBACK_TIP:'',
+    api:async(path,opts)=>{
+      assert.equal(path,'config');assert.equal(opts.method,'POST');
+      posted=JSON.parse(opts.body);
+      return {restart_required:[],environment_managed_fields:['upstream.user_agent']};
+    },
+    // 凭据在 HttpOnly Cookie 里：保存配置既不该写本地密钥，也不该读它。
+    localStorage:{setItem(){keyWrites++},removeItem(){keyWrites++},getItem(){keyWrites++;return null}},
+    toast(){},loadOverview(){overview++},loadConfig:async()=>{loaded++},JSON};
   vm.createContext(ctx);vm.runInContext(src.slice(start,end),ctx);
-  await hosts.cfgForm.onsubmit({preventDefault(){}});
-  assert.equal(saved,managed?'environment-key':'submitted-key');
- }
- console.log('config authentication regression passed');
+  assert(ctx.$('cfgForm').onsubmit,'cfgForm 未绑定 onsubmit');
+  await ctx.$('cfgForm').onsubmit({preventDefault(){}});
+  assert.deepEqual(posted,{upstream:{user_agent:'x'}},'应提交 collectConfig 的整份结果');
+  assert.equal(loaded,1,'保存后应重新拉取配置');
+  assert.equal(overview,1,'保存后应刷新概览');
+  assert.equal(keyWrites,0,'保存配置不应触碰 localStoarge 里的凭据');
+  assert(hosts.cfgNote.textContent.includes('upstream.user_agent'),'应回显环境托管字段');
+  assert.equal(hosts.btnCfgSave.disabled,false,'保存完按钮要恢复');
+  console.log('config save regression passed');
 })().catch(e=>{console.error(e);process.exit(1)});`
 	path := filepath.Join(t.TempDir(), "config-ui.cjs")
 	if err := os.WriteFile(path, []byte(script), 0600); err != nil {

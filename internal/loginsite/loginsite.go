@@ -37,9 +37,9 @@ const ClientUA = "CLI/" + ClientVersion + " CodeBuddy/" + ClientVersion
 // + resources/install-manifest.json appVersion 三处一致。
 // CLI 段恒 2.165.0（cli/package.json 的 @genie/agent-cli），与业务链路同一个值。
 const (
-	ClientVersionWorkBuddyCN  = "5.9.3"
-	ClientVersionWorkBuddyGL  = "5.9.4"
-	ClientVersionBuiltinCLI   = "2.165.0"
+	ClientVersionWorkBuddyCN = "5.9.3"
+	ClientVersionWorkBuddyGL = "5.9.4"
+	ClientVersionBuiltinCLI  = "2.165.0"
 )
 
 // 站点标识（对外 API 取值）。
@@ -239,8 +239,8 @@ func (s Site) host() string {
 // login/account 只发后三个（它已带 Bearer，唯一缺的是「账号信息还没落库」）。
 func sentinelNo(noAuth bool) map[string]string {
 	out := map[string]string{
-		"X-No-User-Id":        "true",
-		"X-No-Enterprise-Id":  "true",
+		"X-No-User-Id":         "true",
+		"X-No-Enterprise-Id":   "true",
 		"X-No-Department-Info": "true",
 	}
 	if noAuth {
