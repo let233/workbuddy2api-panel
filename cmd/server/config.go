@@ -1,0 +1,1492 @@
+// config.go 加载 JSON 配置 + 环境变量覆盖。
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
+	"github.com/misakano7545/workbuddy2api-panel/internal/store"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
+)
+
+// Config 顶层配置。
+type Config struct {
+	Listen    string `json:"listen"`     // "127.0.0.1:7863"（缺省只绑回环）
+	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	AuthDir   string `json:"auth_dir"`   // ./auths
+	StateFile string `json:"state_file"` // ./data/state.json
+	// Database 运行数据的存储（gorm）：池状态 / 用量桶 / 请求归档 / 余额趋势 /
+	// 任务作业 / 运行日志 / 积分历史 / 模型上限缓存全部落库，不再散落成数据目录下的
+	// 一堆 JSON/JSONL 文件。账号仍只读 auths/*.json（见 auth.LoadDir），不进库。
+	//
+	// 建表由 gorm AutoMigrate 在启动时完成（幂等，升级二进制即自动加表加列）；
+	// 旧版本的 JSON 数据在首次启动时一次性导入并改名成 *.imported 留档。
+	Database struct {
+		// Driver 驱动名：sqlite（缺省，纯 Go 实现、无需 CGO 与外部服务，开箱即用）
+		// / mysql / postgres。
+		Driver string `json:"driver"`
+		// DSN 连接串。sqlite 填库文件路径（留空 = state_file 同目录下的
+		// wb2api.db，随 state_file 一起搬移）；mysql 填
+		// user:pass@tcp(host:port)/dbname?...；postgres 填
+		// host=... user=... password=... dbname=... port=5432 sslmode=disable。
+		DSN string `json:"dsn"`
+	} `json:"database"`
+
+	// DNSServers 出站解析用的 DNS 服务器（空 = 用系统解析器）；也可用 WB2A_DNS 覆盖
+	// （逗号分隔）。给没有 /etc/resolv.conf 的环境用：Android 上 Go 的解析器会退回
+	// [::1]:53，所有域名解析直接失败；本地 DNS 被污染时也可借此直连可信解析器。
+	DNSServers []string `json:"dns_servers,omitempty"`
+
+	Panel struct {
+		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
+		PackageDetailLimit int `json:"package_detail_limit"`
+		// PollIntervalSec 面板自动刷新间隔（秒）。0 = 用前端缺省（5s）；
+		// 负值 = 关闭自动刷新（只在手动操作时更新）。账号多、或只是开着面板
+		// 当监控用时，调大间隔能显著降低浏览器与服务端负担。
+		PollIntervalSec int `json:"poll_interval_sec"`
+	} `json:"panel"`
+
+	Update struct {
+		// AutoEnabled 每日按上海时间自动检查并安装原生 Release。
+		AutoEnabled bool `json:"auto_enabled"`
+		// AutoTime 自动更新时间，格式 HH:MM（Asia/Shanghai）。
+		AutoTime string `json:"auto_time"`
+		// Proxy 更新走哪个出口（issue #198，可热生效）：空 = 不显式设置；
+		// 支持 http:// / https:// / socks5://。出站被墙、api.github.com 通而
+		// release-assets 不通时填这里（或 mirror）。
+		Proxy string `json:"proxy"`
+		// ProxyFromEnv 是否沿用进程环境变量里的 HTTP(S)_PROXY（默认 true）。
+		// 设为 false 时只看 proxy 字段——容器里环境变量被别处塞了值、但更新
+		// 需要走另一条通道时用。
+		ProxyFromEnv *bool `json:"proxy_from_env"`
+		// Mirror 资产下载镜像前缀（issue #198），例如 https://ghfast.top/。
+		// 只作用于**资产下载**：Release 元数据（tag/digest/size）永远直连
+		// api.github.com，校验口径不变，镜像无法投毒。空 = 直连。
+		Mirror string `json:"mirror"`
+	} `json:"update"`
+
+	Accounts struct {
+		// ReloadInterval 账号目录热重载轮询间隔（issue #199）。空 = 默认 10s；
+		// "0s" = 关闭轮询（手动接口 POST /panel/api/accounts/reload 仍然可用）。
+		//
+		// 为什么默认开启：外部脚本/另一台机器往 auths/ 同步文件是最常见用法，
+		// 而重启进程会丢在途请求。轮询只读 ReadDir + 少量解析，几十个号的目录
+		// 是微秒级开销。
+		ReloadInterval string `json:"reload_interval"`
+		// ReloadDeleteConfirm 文件消失后要连续几轮扫描确认才把账号移出池（默认 2）。
+		// 半写文件、临时移走文件都可能让账号「这一轮看不见」；剔除会写进数据库账号状态，
+		// 下次启动也不复活，所以要连续确认。1 = 立即删（不建议）。
+		ReloadDeleteConfirm int `json:"reload_delete_confirm"`
+	} `json:"accounts"`
+
+	Logging struct {
+		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
+		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
+		//
+		// 为什么做成开关而不是恒开：来源信息是排查"谁在打网关"的第一手线索，
+		// 但它比 token 计数敏感（IP 属个人信息），共享部署/多租户场景可能需要
+		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
+		// 热生效（经 livecfg 快照），无需重启。
+		RequestClientInfo bool `json:"request_client_info"`
+		// RequestArchiveContext 是否把会话上下文（system + messages / 出图 prompt）记入
+		// 请求事件，面板「请求事件日志」点行展开即可看当轮发出去的内容。缺省 false。
+		//
+		// 为什么默认关：这是**用户提示词**，比 IP 敏感一个量级——开了等于把每次对话的
+		// 原文落到 state 目录的归档文件里（保留 7 天、上限 100MiB）。排查「上游为什么
+		// 拒这条请求」时它是唯一能对上的证据，但那该是运维主动开的临时手段，
+		// 不是默认行为。热生效，无需重启。
+		RequestArchiveContext bool `json:"request_archive_context"`
+		// PanelLogEnabled 面板「运行日志」是否按天落盘，缺省 true。
+		//
+		// 为什么默认开：内存环每频道只有 500 条，一次长会话就能把上午的行冲掉，
+		// 重启更是全部归零——「昨天下午那波 429 从几点开始的」这类问题原本无解。
+		// 落盘是纯增量文本（一天几 MB），代价远小于丢失事故现场。
+		PanelLogEnabled bool `json:"panel_log_enabled"`
+		// PanelLogRetentionDays 面板日志保留天数，缺省 7；<=0 回落默认。
+		PanelLogRetentionDays int `json:"panel_log_retention_days"`
+		// PanelLogMaxMB 面板日志总量上限（MiB，按天文件，单文件超限轮转），缺省 50。
+		PanelLogMaxMB int `json:"panel_log_max_mb"`
+	} `json:"logging"`
+
+	Server struct {
+		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
+		// http.Server 的 ReadTimeout 覆盖整个请求读取：大上下文/文件块请求经
+		// 反代链转发时上传可超过旧固定值 60s，被掐后客户端拿到
+		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
+		//（慢速 body 可无限占用连接，自担风险）。热生效：面板保存后由
+		// serve 管理器改连接层 deadline，作用于一请求（在途连接保持旧值）。
+		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// ShutdownTimeout 优雅关停窗口（SIGTERM / 更新重启时，等在途请求排干的
+		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
+		// 连接重置。缺省 "30s"；"0" = 不等待直接退。热生效：每次关停读当前值。
+		ShutdownTimeout string `json:"shutdown_timeout"`
+		// HeadKeepalive 等上游首帧期间向客户端补 SSE 注释帧的间隔。
+		// 缺省 "1500ms"；"0" = 关闭（回到首帧否决窗口内零字节的旧行为）。
+		// 热生效：面板保存后立即作用于新请求。
+		HeadKeepalive string `json:"head_keepalive"`
+		// MaxPayloadBytes 入站请求体安全上限（字节），缺省 67108864（64 MiB）。
+		// 这不是「大请求预拦截」：旧的 8 MB 紧上限因为多图/长会话被移除过（大请求
+		// 交上游自然响应）。这里只挡「大到能把进程读死」的上传——读体是 io.ReadAll
+		// 无界的，一次几百 MB 的 body 就能把网关 OOM 掉。允许范围 8–512 MiB；
+		// 热生效。超限回 413（OpenAI 形状 / Anthropic 形状各自适配）。
+		MaxPayloadBytes int64 `json:"max_payload_bytes"`
+	} `json:"server"`
+
+	Cooldown struct {
+		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
+		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
+		// 旧 config 中的这些键因 JSON 未知字段而自然忽略，不报错。
+		SoftRate string `json:"soft_rate"` // "600s"，软限流冷却基数
+		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
+		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
+		SoftRateMax string `json:"soft_rate_max"` // "2h"
+	} `json:"cooldown"`
+
+	Schedule struct {
+		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
+		TravelHours    []int `json:"travel_hours"`    // [9,21]
+		ActivityHours  []int `json:"activity_hours"`  // [10]
+		KeepaliveHours []int `json:"keepalive_hours"` // [22]
+		// KeepaliveRefreshWindow 周期 token 保活的临期窗口（如 "168h"=7 天）：排程到点
+		// 的保活只刷新剩余有效期 <= 窗口（或已过期/无 expiry）的凭证；面板手动
+		// 「全部保活」始终全量，不受影响。空 = 默认 "168h"；非法或 <=0 的值 fail fast。
+		KeepaliveRefreshWindow string `json:"keepalive_refresh_window"`
+		GrowthHours            []int  `json:"growth_hours"` // [11] 成长任务队列（任务中心待办）自动执行
+		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/GrowthEnabled 显式禁用开关（缺省 true）。
+		//
+		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
+		//   - 空数组与 null 在老语义里已被"未配置 → 回落默认"占用，改判会静默翻转
+		//     所有老 config 的行为（用户只想删掉一行，结果关掉了签到）；bool 缺省 true
+		//     则对老配置零影响，向后完全兼容。
+		//   - 开关与取值解耦：禁用时仍保留用户显式配的小时，重新启用无需补配。
+		//   - 无需猜测哨兵（[-1] 之类），非法小时一律报错并提示改用本开关。
+		// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
+		CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true；false = 关签到
+		TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
+		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
+		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
+		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务队列
+		// WebActivityEnabled 国际版「网页通道」每日活跃腿（issue #111）。**缺省 false**，
+		// 与上面五个「缺省 true」的开关相反：上游实测每日 30 积分由活跃上报本身触发，
+		// 网页会话不是必要条件；这条腿每天要为每个国际号建一条真实会话并占一条活跃
+		// 名额（上限 10），没必要默认开着。显式 true 才跑。
+		WebActivityEnabled bool `json:"web_activity_enabled"`
+
+		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
+		// 余额刷新）对**已禁用（disabled）**的账号也执行。
+		//
+		// 为什么需要它：面板「禁用」的语义是「不再参与选号」，但这四类任务此前一律
+		// `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切上游保号行为」
+		// ——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而 ReenableIfCredits
+		// 明确不复活 disabled 账号，于是签到这条唯一的自动回血路径也断了。
+		//
+		// 对「一次只放开一个号、用禁用做流量开关」的轮换用法（同 IP 多号防风控），闲置
+		// 待命的号恰恰是最需要签到的那批——本开关即为该用法提供出口。
+		//
+		// 缺省 false = 保持既有行为，对老配置零影响。打开后禁用号仍会签到 / 保活，但
+		// **依旧不参与选号**：pool 选号侧的 disabled 过滤不受本开关影响。
+		IncludeDisabledInTasks bool `json:"include_disabled_in_tasks"`
+		// GrowthConcurrency 排程轮次的账号间并发（缺省 1，上限 4）：与面板手动
+		// 「执行队列」同一个并发语义；调高更快的代价是上游风控暴露面。
+		GrowthConcurrency int `json:"growth_concurrency"`
+		// JitterMinutes 0 = 精确整点。正值把触发时刻摊在该窗口内，同一小时偏移固定。
+		JitterMinutes int `json:"jitter_minutes"`
+		// AccountSpreadMinutes 账号级摊开窗口（issue #45）：0 = 关闭（同一秒打全池）。
+		// >0 时排程触发的签到 / 旅行 / 活跃上报 / 保活把每个账号放在窗口内
+		// 各自的偏移上（按 账号+任务+日期 哈希，当天固定），面板手动触发不受影响。
+		// 窗口应小于相邻时点的间隔，否则上一批会跨过下一个时点。
+		AccountSpreadMinutes int `json:"account_spread_minutes"`
+		// AccountSpreadMinGapSeconds 同批两个账号的最小间隔（偏移撞车时把后者推开）。
+		// 0 = 只做随机。账号数 × 该值接近窗口时末尾会挤在一起。
+		AccountSpreadMinGapSeconds int `json:"account_spread_min_gap_seconds"`
+
+		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
+		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
+		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
+		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// 补领清扫（issue #174）：周期把「已达标未领」的任务领掉、把「待接受」的接受掉，
+		// 不跑任何行为链路。补的是新号自动跑当时还没达标（awaiting_progress）与
+		// autoActions 白名单外的任务——它们此前除了手动一键完成没有任何补领路径。
+		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
+		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// 周期抖动（人味化，anti-fingerprint）：>0 时余额刷新/补领清扫的每轮间隔
+		// 在 ±（值/1000）×基准间隔内随机偏移，不再精确固定间隔打卡；余额刷新
+		// 另把账号遍历摊开到同量级窗口内（见 internal/scheduler/humanize.go）。
+		// 0 = 关闭（旧行为：精确 interval ticker + 全账号并发齐射）。上限 500 = 50%。
+		// 例：balance_refresh_minutes=5 + 200 → 实际间隔在 3–7 分钟之间抖。
+		BalanceRefreshJitterPermill int `json:"balance_refresh_jitter_permill"` // 缺省 0；0–500
+		TaskSweepJitterPermill      int `json:"task_sweep_jitter_permill"`      // 缺省 0；0–500
+
+		// MakeupCardsPerRound 每轮连登管家最多用几张补签卡，0 = 不限（补到卡用光，
+		// 即 2026-10 之前的行为）。
+		//
+		// 为什么留一个上限：补签是**会改账号历史**的写操作，一次把当月漏签全补齐
+		// （对照实现 workbuddy-scheduled-tasks 的策略是「每轮最多 1 张」，理由写明
+		// 「无卡/无断点/数据异常一律跳过，绝不瞎补」）。这里默认不动既有行为，
+		// 想保守的部署把它设成 1 即可——两轮之间还有次日签到，急不来。
+		MakeupCardsPerRound int `json:"makeup_cards_per_round"` // 缺省 0（不限）；>0 = 每轮上限
+
+		// 额度窗口探针（pool/window.go + scheduler/windowprobe.go）：上游 429 带
+		// 「将在 … 重置」时登记窗口，到点主动发一个最小请求，把新一轮额度窗口的
+		// 计时起点钉在重置那一刻。
+		//
+		// 为什么需要：上游按**首次请求**起算窗口。重置时刻到了却没人发请求，窗口就
+		// 不开始，额度一直空转；等下一条真实请求进来，起点落到那一刻，中间那段额度
+		// 白扔。关闭后行为回到「只解除冷却、不主动起窗」。
+		WindowProbeEnabled bool `json:"window_probe_enabled"` // 缺省 true；false = 关闭
+	} `json:"schedule"`
+
+	Global struct {
+		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
+		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
+		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
+		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
+		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
+		Enabled bool `json:"enabled"`
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 按账号 auth 文件的
+		// domain 选官方主机（internal/loginsite.BaseForDomain）：
+		//   *.codebuddy.ai → https://www.codebuddy.ai（官方 CLI 国际站，缺省）
+		//   *.workbuddy.ai → https://www.workbuddy.ai（旧桌面端）
+		// domain 缺失时回落 https://www.codebuddy.ai。
+		// 两个国际域实测同一后端，差别只在主机名与 WAF 口径——所以不要为了
+		// 「统一」把 base 写死成一个域，老账号的 token 只在签发域可用。
+		ChatBase    string `json:"chat_base"`
+		BillingBase string `json:"billing_base"`
+	} `json:"global"`
+
+	CN struct {
+		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.cn（internal/upstream.New 的 ChatBaseCN，官方桌面端
+		// product.json 的 endpoint）。
+		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
+		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
+		ChatBase string `json:"chat_base"`
+		// BillingBase 国内 billing/growth 上游 base 覆盖；空 = 内置默认
+		// https://www.workbuddy.cn（2026-10-28 起对齐 WorkBuddy 5.9.3 客户端：
+		// 客户端把 CN 全部 billing/activity 都打到 workbuddy.cn）。
+		// 旧口径是 www.codebuddy.cn（CodeBuddy CLI 时代，按 CLI 指纹点亮任务用），
+		// 需要退回时填 "https://www.codebuddy.cn"。
+		BillingBase string `json:"billing_base"`
+	} `json:"cn"`
+
+	Upstream struct {
+		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
+		TimeoutSeconds int `json:"timeout_seconds"`
+		// TLSFingerprint 出站 ClientHello 指纹档位：
+		//   "node"（缺省）复刻官方 Node/OpenSSL 形态，JA3/JA4 与真机一致；
+		//   "go"   用 crypto/tls 原生形态（排障 / 回滚用）。
+		// 默认 node：不配也走复刻，避免"忘了配就裸奔"。
+		// 选 go 的唯一理由是指纹复刻导致握手异常时紧急回滚。
+		TLSFingerprint string `json:"tls_fingerprint"`
+		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
+		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
+		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
+		UserAgent string `json:"user_agent"`
+		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
+		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		ClientVersion string `json:"client_version"`
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		CliVersion string `json:"cli_version"`
+		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
+		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
+		ClientName string `json:"client_name"`
+		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
+		// 每号 auth 文件的 device_token 键优先于本项。
+		DeviceToken string `json:"device_token"`
+		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
+		DeviceTokenFile string `json:"device_token_file"`
+		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
+		PassthroughIP bool `json:"passthrough_ip"`
+		// DumpDir 非空时把 chat 请求的出站报文 + 上游原始响应落盘（诊断用，见
+		// internal/upstream/dump.go）。默认空 = 不落盘：正文含用户提示词。
+		DumpDir string `json:"dump_dir"`
+		// DumpMaxBytes 落盘文件里「出站请求体」片段的上限，默认 262144（256 KB）。
+		// 长会话把 tools 定义排在几百条 messages 之后，256 KB 常在中途截断，
+		// 排障时看不到工具声明（issue #44 的反馈）。0 = 用默认值。
+		DumpMaxBytes int `json:"dump_max_bytes"`
+		// RestrictionHoldSeconds 11140 风控连坐的全池暂停时长（秒），缺省 1800。
+		// 上游把「账号存在异常行为」判在设备/出口上：一个请求顺着换号打下去会把
+		// 一串账号送进风控。命中 11140 网关一律就地停手（不换号）；同一 15 分钟窗
+		// 内出现 2 个不同账号被限制时，再全池暂停这么久（期间 503 + Retry-After）。
+		// 0 = 关掉全池暂停，只保留「命中即停手」。热生效。
+		RestrictionHoldSeconds int `json:"restriction_hold_seconds"`
+	} `json:"upstream"`
+
+	Features struct {
+		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
+		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
+		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
+		SanitizeBrandScope string `json:"sanitize_brand_scope"`
+		// EmbeddingsEnabled 实验特性：OpenAI 兼容嵌入端点 /v1/embeddings 的总开关。
+		// 默认关闭——上游嵌入只注册了 bge-m3 一个模型（1024 维），实际可用性随账号/租户
+		// 而异，且与对话模型是两套注册表，不适合默认敞开。面板保存后经 livecfg 热生效。
+		// 关闭时端点仍在，但回 403 embeddings_disabled（而不是 404：让调用方看得出
+		// 「功能存在、只是没开」，不用去猜路径拼错）。
+		EmbeddingsEnabled bool `json:"embeddings_enabled"`
+
+		// WatermarkStripEnabled 实验特性：水印裁切端点 POST /v1/images/strip-watermark
+		// 与 MCP 工具 strip_watermark 的总开关，默认 false。
+		//
+		// 为什么默认关：这条链路要把成品图回读、解码、裁、再以 base64 回传（一张
+		// 1024x1536 的 PNG 约 2.5MB → base64 3.4MB），只在「成品要彻底去水印」时划算；
+		// 而且它依赖提示词真的留出底部白边（实测模型只肯给 25~38%，深色桌面那张给了
+		// 1%），所以不适合当默认行为。关闭时端点回 403 watermark_strip_disabled，
+		// MCP 工具不出现在 tools/list 里。面板保存后经 livecfg 热生效。
+		WatermarkStripEnabled bool `json:"watermark_strip_enabled"`
+	} `json:"features"`
+
+	Models struct {
+		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
+		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝
+		// （只藏列表不够——知道名字仍可硬调）。面板保存后经 livecfg 热生效，无需重启。
+		Hidden []string `json:"hidden"`
+		// Allowed 对外暴露的模型白名单（issue #68）。条目语法与 Hidden 一致：
+		// 裸名=两域都允许；"cn:xxx"/"global:xxx"=只允许该域。空数组/未配置 =
+		// 白名单不启用（默认放行全部，向后兼容）。非空时仅白名单内模型可出现在
+		// /v1/models 并被点名调用，白名单外一律 400 拒绝（不打上游）。生效点在
+		// 别名映射之后（别名解析出的真实目标同样受检，不能绕过白名单）；与 Hidden
+		// 共存时取交集语义：Allowed 圈定「可能可见」集合，Hidden 仍可从中再剔除。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Allowed []string `json:"allowed"`
+		// Aliases 模型映射表（issue #30）："客户端名=真实模型名" 条目数组，与 Hidden
+		// 同存储形态（数组整体覆盖，面板删条目无需重启）。键：裸名=两域生效，
+		// "cn:x"/"global:x"=只在该域生效；键大小写不敏感。值可带 realm 前缀实现跨域
+		// 指向（"my-glm": "global:glm-5.2"）。生效点：chat 请求解析 realm/裸名之后、
+		// 隐藏检查/选号/出站 body 之前整体替换；被映射到的目标仍受 Hidden 约束
+		// （别名不能绕过黑名单）。响应/日志/账本按实际生效模型名口径。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Aliases []string `json:"aliases"`
+	} `json:"models"`
+
+	// Thinking 网关思考档位策略（issue #18 / #21）。网关按模型声明的
+	// supportedEfforts 解析目标档：缺档时补默认档，可按开关以网关优先改写客户端
+	// 档位；面板保存后经 upstream.Client.SetEffortPolicy 热生效，无需重启。
+	Thinking struct {
+		// Enabled 策略总开关。false = 网关完全不碰档位（只剩既有 injectThinking
+		// 与降级管线），老配置不写本键时按 Default() 的 true 生效。
+		Enabled bool `json:"enabled"`
+		// DefaultEffort 网关目标档。取值 "max"（默认；取模型支持的最高档）或
+		// low/medium/high/xhigh 等具体档位（模型不支持时落到 ≤ 该档的最高支持档）。
+		// 对 deepseek 等缺档请求，网关会同时注入 thinking.type=enabled。
+		DefaultEffort string `json:"default_effort"`
+		// ClientPriority true = 客户端优先：客户端发了档位就照单全收（含 off），
+		// 只在客户端没发时补 DefaultEffort；false = 网关优先，按 OverrideScope 改写。
+		ClientPriority bool `json:"client_priority"`
+		// OverrideScope 网关优先的作用域（ClientPriority=false 时生效）：
+		//   "level"（默认）= 只覆盖档位，客户端「关闭思考」（off/none/disabled 或
+		//       thinking.type=disabled）一律尊重；
+		//   "all" = 档位与开关一起覆盖：客户端的关闭意图也会被改写成开启 + 目标档。
+		OverrideScope string `json:"override_scope"`
+		// ModelDefaults 按模型覆盖 DefaultEffort：键 "cn:model" / "global:model"
+		// （精确到域）或裸 "model"（两域共用）；值 "max"/"high"/…，或 "inherit"
+		// 表示不覆盖。解析时剔除空值与 inherit，键值统一转小写。
+		ModelDefaults map[string]string `json:"model_defaults,omitempty"`
+	} `json:"thinking"`
+
+	Prompt struct {
+		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
+		// custom = 网关用自有系统提示词替换客户端 system/developer；
+		// append = 两者并用：开头连续 system/developer 块后插网关 system，既有消息逐字不动（issue #129）。
+		Mode string `json:"mode"` // "passthrough" / "custom" / "append"
+		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
+		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
+		File string `json:"file"`
+		// KeepRecentRounds 只保留最近 N 轮对话（issue #99）：出站前丢掉更早的
+		// user/assistant/tool 消息，system 全留。0 = 关闭（全量透传）。
+		// 多轮长对话的输入 token 主要花在这上面；丢的是上下文而不是协议。
+		KeepRecentRounds int `json:"keep_recent_rounds"`
+	} `json:"prompt"`
+
+	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
+	PromptText string `json:"-"`
+
+	Upstash struct {
+		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
+		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
+	} `json:"upstash"`
+
+	Pool struct {
+		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		// 连败降权（issue #114）：ErrClient/传输层这类「不罚号」失败连续计数，达阈
+		// 临时出池。与冷却/熔断并存取更长者不叠加。默认 5 次 / 10m。
+		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		// SelectionStrategy 选号策略（pool 包 strategy.go）：weighted（缺省，加权随机）/
+		// round_robin（轮询，每次请求换下一个）/ sequential（顺序耗尽，当前号用到不可用
+		// 才换）。空或未知值 = weighted。
+		//
+		// 三条策略都只在**已过全部可用性判定**的候选里决定「选哪个」：健康、冷却、
+		// 在途上限、积分保底、成本分层、账号优先级全部先于它生效。所以切到
+		// sequential 也烧不穿 credit_floor——这是有意的边界，不是实现疏忽。
+		// 热生效（面板保存配置即换），无需重启。
+		SelectionStrategy string  `json:"selection_strategy"`
+		IdleWeightPerHour float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+		IdleWeightMax     float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
+		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
+		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
+		// 关闭后完全不使用到期信息选号。
+		PreferExpiring bool `json:"prefer_expiring"`
+		// ExpiringSoon 快过期积分窗口（如 "720h"=30天）：签到/余额刷新时，到期时间在
+		// 此窗口内的批次令账号命中上述加权；窗口开大 → 命中账号变多、
+		// 偏好被稀释。空/0 = 禁用该加权门槛。
+		// 窗口外的批次完全不参与：账号最早批次在窗口外时即使它最近到期也不加权。
+		ExpiringSoon string `json:"expiring_soon"`
+		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
+		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
+		// tier 1-only（探索=搭车改道，零新增上游请求；成功即毕业，失败走既有
+		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
+		// 空值回落默认。
+		CostExploreInterval string `json:"cost_explore_interval"`
+		// BalanceWindow 窗口用量调度窗口（issue #112，默认 "1h"，"0" 关停）：
+		// 按 (账号, 模型) 在该窗口内累计消费的 token 反比降权，把热点号打散，
+		// 避免一个号烧到 6004 限额而同期其他号闲置。与快过期加权/闲置补偿叠加。
+		// 软降权：积分保底、账号优先级、账号占比这些硬语义不受影响。
+		BalanceWindow string `json:"balance_window"`
+		// ReserveCredits 保留积分阈值：余额已知且 <= 该值的账号停止接单（仍在池中、
+		// 照常跑定时任务，充值后自动恢复）。上游余额耗尽会发提醒短信，设阈值即避免
+		// 被用到 0。未配置（键缺席）→ 默认 10；显式写 0 = 关闭；从未查到余额的账号不受影响。
+		// 指针类型用于区分「未配置」（nil → 默认 10）与「显式 0」（关闭）。
+		ReserveCredits *int64 `json:"reserve_credits"`
+		// ReserveCreditsByRealm 按域覆盖上面的阈值（issue #147）：键 "cn"/"global"，
+		// 值为该域阈值（0 = 该域关闭）。场景是国内版留 1000 分养号、国际版只留 350
+		// 分接低流量模型——两域共用一个数值时只能取更严的那个。未写的域用全局值。
+		ReserveCreditsByRealm map[string]int64 `json:"reserve_credits_by_realm"`
+		// AccountPriority / AccountShare 账号级路由偏好（issue #62）。键 = uid（面板账号
+		// 行的短 uid，悬停看完整值）。缺省/空表 = 全部未配置，选号行为与旧版完全一致。
+		//   account_priority: {"<uid>": 1} 小 = 先消耗。配了的号构成「先烧层」，层内号
+		//     可用时其余号不接单；层内号烧空/冷却/停牌后自动让位给下一层。
+		//   account_share: {"<uid>": 70, "<uid2>": 30} 同层内按归一化比例分流量
+		//     （70/30 与 7/3 同义，不必凑满 100）。**优先于 prefer_expiring**：配了占比
+		//     的号独占本层流量，到期优先只对没配占比的号生效。
+		// 非正值（priority ≤ 0 / share ≤ 0）由校验剔除，等价于未配置。
+		AccountPriority map[string]int     `json:"account_priority"`
+		AccountShare    map[string]float64 `json:"account_share"`
+		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
+		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
+		// tier 0（免费）不受限；tier 1（无观测）按目录倍率分档：≤ 下面的
+		// CreditFloorMaxRate 放行（让便宜新模型跑出第一笔账本），更高的仍拦。
+		// 签到回血越过 floor 自动恢复。默认 0 = 关闭；负值钳 0。
+		CreditFloor int64 `json:"credit_floor"`
+		// CreditFloorMaxRate 保底兜底允许的目录倍率上限（issue #30 / PR #2）。
+		// 0.2 = 便宜模型（x0.11 这类）在触底号上放行入账，x1.62 这类仍按收费拦。
+		// 0 = 严格模式（任何已知正倍率都拦）；负值钳 0。面板「积分保底」档位旁可改。
+		CreditFloorMaxRate float64 `json:"credit_floor_max_rate"`
+		// ModelFallback 模型降级路由表：key = 客户端请求的模型（裸名），
+		// value = 该模型被 6004 模型级限流时改用的等价模型。
+		// 例：{"deepseek-v4.1-flash": "deepseek-v4-flash"}。
+		//
+		// 语义：等价模型是同一底层能力、只是计价不同；便宜的那个被限流时改用
+		// 稍贵的继续服务（可用性优先），限流解除后自动回原模型（不写持久状态）。
+		// 只对 6004 生效；11102/11101/普通 429/5xx 都不降级。
+		// 缺省 nil = 不降级（对老配置零影响）。
+		ModelFallback map[string]string `json:"model_fallback"`
+	} `json:"pool"`
+
+	SessionSticky struct {
+		Enabled    bool   `json:"enabled"`     // 默认 true
+		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
+		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+	} `json:"session_sticky"`
+
+	// Jitter 在 schedule 里。下面几段缺省关闭，旧配置行为不变。
+	Admin struct {
+		Enabled      bool   `json:"enabled"`
+		AuditEnabled bool   `json:"audit_enabled"`
+		AuditFile    string `json:"audit_file"`
+	} `json:"admin"`
+	Metrics struct {
+		Enabled bool `json:"enabled"`
+	} `json:"metrics"`
+	Alerting struct {
+		Enabled             bool   `json:"enabled"`
+		WebhookURL          string `json:"webhook_url"`
+		Secret              string `json:"secret"`
+		IntervalSeconds     int    `json:"interval_seconds"`
+		TimeoutSeconds      int    `json:"timeout_seconds"`
+		StartupGraceSeconds int    `json:"startup_grace_seconds"`
+		MinHealthyCN        int    `json:"min_healthy_cn"`
+		MinHealthyGlobal    int    `json:"min_healthy_global"`
+		RecoverHealthy      int    `json:"recover_healthy"`
+		BreakerThreshold    int    `json:"breaker_threshold"`
+		ForTicks            int    `json:"for_ticks"`
+		ClearTicks          int    `json:"clear_ticks"`
+		SendResolve         bool   `json:"send_resolve"`
+	} `json:"alerting"`
+
+	// Watchdog 上游目录改版监控：定期对 /v1/models 结果取指纹，变了经告警 webhook 通知。
+	// 默认关闭——它只在「想第一时间知道上游改了目录」时有价值，开了才有轮询成本。
+	Watchdog struct {
+		Enabled         bool `json:"enabled"`
+		IntervalSeconds int  `json:"interval_seconds"`
+	} `json:"watchdog"`
+	Budget struct {
+		DailyCreditLimit float64 `json:"daily_credit_limit"` // 0 = 不限
+		// BurstCreditLimit 5 分钟窗口内累计 credit 达此值即拒绝（0 = 关闭）。
+		// issue #229：高倍率模型 140k 上下文一次 20+ 积分，日上限止血太慢。
+		BurstCreditLimit float64 `json:"burst_credit_limit"`
+		// CacheLowRate 连续 5 轮缓存命中率低于此百分比即冷却 60s（0 = 关闭）。
+		CacheLowRate float64 `json:"cache_low_rate"`
+	} `json:"budget"`
+
+	// 解析后
+	SoftRateDur            time.Duration `json:"-"`
+	SoftRateMaxDur         time.Duration `json:"-"`
+	BreakerCooldownDur     time.Duration `json:"-"`
+	BreakerCooldownMaxD    time.Duration `json:"-"`
+	DegradeCooldownDur     time.Duration `json:"-"`
+	DegradeCooldownMaxD    time.Duration `json:"-"`
+	SessionTTL             time.Duration `json:"-"`
+	SessionGCInterval      time.Duration `json:"-"`
+	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
+	ExpiringSoonDur        time.Duration `json:"-"`
+	// KeepaliveRefreshWindowDur 解析后的周期保活临期窗口；空回落 168h，<=0 报错。
+	KeepaliveRefreshWindowDur time.Duration `json:"-"`
+	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
+	CostExploreIntervalDur time.Duration `json:"-"`
+	// BalanceWindowDur 解析后的窗口用量调度窗口（issue #112）；0 = 关停。
+	BalanceWindowDur time.Duration `json:"-"`
+	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
+	ServerReadTimeoutDur time.Duration `json:"-"`
+	// HeadKeepaliveDur 解析后的首帧心跳间隔（缺省 1.5s，0 = 关闭）。
+	HeadKeepaliveDur time.Duration `json:"-"`
+	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
+	ShutdownTimeoutDur time.Duration `json:"-"`
+	// ReloadIntervalDur 解析后的账号目录轮询间隔（issue #199）；0 = 关闭轮询。
+	ReloadIntervalDur time.Duration `json:"-"`
+}
+
+// Default 默认配置。
+func Default() *Config {
+	c := &Config{
+		// 默认只绑回环：网关 + 面板 + 空/弱 api_key 同时暴露在公网是这份配置最危险的
+		// 组合。要对外先过反代（nginx/caddy），确需直连再显式改 0.0.0.0:7863。
+		Listen:    "127.0.0.1:7863",
+		APIKey:    "",
+		AuthDir:   "./auths",
+		StateFile: "./data/state.json",
+	}
+
+	// 数据库：缺省 SQLite（库文件落在 state_file 同目录，DSN 由 normalize 补全）。
+	c.Database.Driver = "sqlite"
+	c.Cooldown.SoftRate = "600s"
+	c.Cooldown.SoftRateMax = "2h"
+	c.Server.ReadTimeout = "300s"
+	c.Server.ShutdownTimeout = "30s"
+	c.Server.MaxPayloadBytes = 64 << 20
+	c.Upstream.RestrictionHoldSeconds = 1800
+	c.Panel.PackageDetailLimit = 5
+	c.Update.AutoTime = "04:00"
+	// 账号目录热重载（issue #199）：默认 10s 轮询、连续 2 次确认才删。
+	c.Accounts.ReloadInterval = "10s"
+	c.Accounts.ReloadDeleteConfirm = 2
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
+	c.Logging.PanelLogEnabled = true
+	c.Logging.PanelLogRetentionDays = 7
+	c.Logging.PanelLogMaxMB = 50
+	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
+	// 只有显式 false 才关闭来源记录。
+	c.Logging.RequestClientInfo = true
+	c.Schedule.CheckinHours = []int{9, 21}
+	c.Schedule.TravelHours = []int{9, 21}
+	c.Schedule.ActivityHours = []int{10}
+	c.Schedule.KeepaliveHours = []int{22}
+	// 周期保活临期窗口默认 7 天：排程保活只刷新一周内到期的凭证，其余账号不动。
+	c.Schedule.KeepaliveRefreshWindow = "168h"
+	c.Schedule.GrowthHours = []int{11}
+	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
+	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
+	c.Schedule.CheckinEnabled = true
+	c.Schedule.TravelEnabled = true
+	c.Schedule.ActivityEnabled = true
+	c.Schedule.KeepaliveEnabled = true
+	c.Schedule.GrowthEnabled = true
+	c.Schedule.BalanceRefreshEnabled = true
+	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.TaskSweepEnabled = true
+	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.WindowProbeEnabled = true
+	c.Upstream.TimeoutSeconds = 120
+	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
+	c.Upstream.HeaderTimeoutSeconds = 0
+	c.Upstream.IdleTimeoutSeconds = 0
+	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
+	// ChatBase/BillingBase 缺省空（回落内置默认）。
+	c.Global.Enabled = true
+	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.SanitizeBrandScope = "all"
+	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
+	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
+	c.Thinking.Enabled = true
+	c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
+	c.Thinking.ClientPriority = true
+	c.Thinking.OverrideScope = "level"
+	c.Pool.MaxInFlight = 3
+	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
+	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
+	// 的 0 没有合理语义，回退分档默认最稳）。
+	c.Pool.MaxInFlightGlobal = 2
+	c.Pool.BreakerThreshold = 3
+	c.Pool.BreakerCooldown = "30m"
+	c.Pool.BreakerCooldownMax = "6h"
+	c.Pool.DegradeThreshold = 5
+	c.Pool.DegradeCooldown = "10m"
+	c.Pool.DegradeCooldownMax = "2h"
+	c.Pool.IdleWeightPerHour = 0.5
+	c.Pool.IdleWeightMax = 5.0
+	c.Pool.PreferExpiring = true
+	// 快过期窗口默认 30 天。7 天太窄：奖励积分的批次到期日普遍排在 2～4 周后，
+	// 窗口内常常一个号都不命中，加权形同未开（实测三号池最早批次 22/25/27 天后，
+	// credits_expiring 全 0，选号退化成普通加权）。窗口内是相对紧迫度，放宽不会
+	// 让紧迫度失真，只是把「今天到期 vs 四周后到期」也纳入同一条曲线。
+	c.Pool.ExpiringSoon = "720h"
+	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
+	c.Pool.CostExploreInterval = "30m"
+	// 窗口用量调度默认 1h（issue #112：热点号降权，把流量摊给闲置号）；"0" 关停。
+	c.Pool.BalanceWindow = "1h"
+	c.SessionSticky.Enabled = true
+	c.SessionSticky.TTL = "30m"
+	c.SessionSticky.GCInterval = "5m"
+	c.Admin.AuditFile = "./data/admin_audit.log"
+	c.Alerting.IntervalSeconds = 30
+	c.Alerting.TimeoutSeconds = 5
+	c.Alerting.StartupGraceSeconds = 30
+	c.Alerting.MinHealthyCN = 1
+	c.Alerting.RecoverHealthy = 1
+	c.Alerting.ForTicks = 2
+	c.Alerting.ClearTicks = 2
+	c.Watchdog.IntervalSeconds = 3600 // 目录变化是低频事件，一小时一次足够
+	return c
+}
+
+// Load 从文件读，再用 WB2A_* env 覆盖。
+func Load(path string) (*Config, error) {
+	c := Default()
+	if path != "" {
+		// 目录检查：Docker bind mount 在宿主机文件缺失时会静默创建同名目录，
+		// 直接 ReadFile 会报 "Incorrect function" 之类晦涩错误，这里给出可操作提示。
+		if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+			return nil, fmt.Errorf("config %s 是目录而非文件——"+
+				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
+				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
+		}
+		// safefile：正文坏（掉电留下全 0 / 半截）时回退 config.json.bak，
+		// 两边都坏才报错——不再让「配置损坏」直接变成起不来。
+		raw, err := safefile.Read(path, nil)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		if _, err := ParseConfigInto(raw, c); err != nil {
+			return nil, err
+		}
+	}
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
+// 面板保存配置走这条路径：与 Load 完全同一套解析/校验逻辑，避免两处漂移。
+func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
+	if err := json.Unmarshal(raw, c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ParseConfig 基于默认值解析一段配置 JSON（等价于 Load 的文件分支，但不读环境变量）。
+func ParseConfig(raw []byte) (*Config, error) {
+	return ParseConfigInto(raw, Default())
+}
+
+func applyEnv(c *Config) {
+	if v := os.Getenv("WB2A_LISTEN"); v != "" {
+		c.Listen = v
+	}
+	if v := os.Getenv("WB2A_API_KEY"); v != "" {
+		c.APIKey = v
+	}
+	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
+		c.AuthDir = v
+	}
+	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
+		c.StateFile = v
+	}
+	if v := os.Getenv("WB2A_DB_DRIVER"); v != "" {
+		c.Database.Driver = v
+	}
+	if v := os.Getenv("WB2A_DB_DSN"); v != "" {
+		c.Database.DSN = v
+	}
+	if v := os.Getenv("WB2A_DNS"); v != "" {
+		c.DNSServers = splitCSV(v)
+	}
+	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
+		c.Cooldown.SoftRate = v
+	}
+	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
+		c.Cooldown.SoftRateMax = v
+	}
+	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.TimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_HEADER_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.HeaderTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_IDLE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.IdleTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
+		c.Upstream.UserAgent = v
+	}
+	if v := os.Getenv("WB2A_TLS_FINGERPRINT"); v != "" {
+		c.Upstream.TLSFingerprint = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
+		c.Upstream.ClientVersion = v
+	}
+	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
+		c.Upstream.CliVersion = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
+		c.Upstream.ClientName = v
+	}
+	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
+		c.Upstream.DeviceToken = v
+	}
+	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
+		c.Upstream.DeviceTokenFile = v
+	}
+	if v := os.Getenv("WB2A_DUMP_UPSTREAM"); v != "" {
+		c.Upstream.DumpDir = v
+	}
+	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.PassthroughIP = b
+		}
+	}
+	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.SanitizeBlacklistFingerprints = b
+		}
+	}
+	if v := os.Getenv("WB2A_SANITIZE_BRAND_SCOPE"); v != "" {
+		c.Features.SanitizeBrandScope = v
+	}
+	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
+		c.Prompt.Mode = v
+	}
+	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
+		c.Prompt.File = v
+	}
+	// 思考档位策略（thinking 节）。bool 解析失败视为不生效（与其它 env 同口径）。
+	if v := os.Getenv("WB2A_THINKING_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Thinking.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_THINKING_DEFAULT_EFFORT"); v != "" {
+		c.Thinking.DefaultEffort = v
+	}
+	if v := os.Getenv("WB2A_THINKING_CLIENT_PRIORITY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Thinking.ClientPriority = b
+		}
+	}
+	if v := os.Getenv("WB2A_THINKING_OVERRIDE_SCOPE"); v != "" {
+		c.Thinking.OverrideScope = v
+	}
+	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
+		c.Pool.ExpiringSoon = v
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_JITTER_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.JitterMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_ACCOUNT_SPREAD_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.AccountSpreadMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_ACCOUNT_SPREAD_MIN_GAP_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.AccountSpreadMinGapSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_BALANCE_REFRESH_JITTER_PERMILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.BalanceRefreshJitterPermill = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_TASK_SWEEP_JITTER_PERMILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.TaskSweepJitterPermill = n
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.AuditEnabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_FILE"); v != "" {
+		c.Admin.AuditFile = v
+	}
+	if v := os.Getenv("WB2A_METRICS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Metrics.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_BUDGET_DAILY_CREDIT_LIMIT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Budget.DailyCreditLimit = f
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Alerting.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_WEBHOOK_URL"); v != "" {
+		c.Alerting.WebhookURL = v
+	}
+	if v := os.Getenv("WB2A_PREFER_EXPIRING"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Pool.PreferExpiring = b
+		}
+	}
+}
+
+// EnvironmentManagedFields 列出被启动环境变量覆盖的配置字段路径（**值不回传**——
+// 面板只用这些名字把对应输入框禁用/提示，避免「改了也不生效」的无效编辑）。
+// 只报告「值合法、启动时确实会生效」的项：int/bool/float 解析不过的 env 视为不生效、不列出。
+// 移植上游 PR #104；字段表覆盖本 fork 全部 WB2A_* 覆盖项（含本 fork 扩展的
+// schedule/admin/metrics/budget/alerting 族）。
+func (c *Config) EnvironmentManagedFields() []string {
+	fields := []struct{ env, path, kind string }{
+		{"WB2A_LISTEN", "listen", ""}, {"WB2A_API_KEY", "api_key", ""},
+		{"WB2A_AUTH_DIR", "auth_dir", ""}, {"WB2A_STATE_FILE", "state_file", ""},
+		{"WB2A_DB_DRIVER", "database.driver", ""}, {"WB2A_DB_DSN", "database.dsn", ""},
+		{"WB2A_DNS", "dns_servers", ""},
+		{"WB2A_SOFT_RATE", "cooldown.soft_rate", ""}, {"WB2A_SOFT_RATE_MAX", "cooldown.soft_rate_max", ""},
+		{"WB2A_TIMEOUT_SECONDS", "upstream.timeout_seconds", "int"}, {"WB2A_HEADER_TIMEOUT_SECONDS", "upstream.header_timeout_seconds", "int"},
+		{"WB2A_IDLE_TIMEOUT_SECONDS", "upstream.idle_timeout_seconds", "int"}, {"WB2A_USER_AGENT", "upstream.user_agent", ""},
+		{"WB2A_TLS_FINGERPRINT", "upstream.tls_fingerprint", ""},
+		{"WB2A_CLIENT_VERSION", "upstream.client_version", ""}, {"WB2A_CLI_VERSION", "upstream.cli_version", ""},
+		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
+		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
+		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
+		{"WB2A_SANITIZE_BRAND_SCOPE", "features.sanitize_brand_scope", ""},
+		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
+		{"WB2A_THINKING_ENABLED", "thinking.enabled", "bool"},
+		{"WB2A_THINKING_DEFAULT_EFFORT", "thinking.default_effort", ""},
+		{"WB2A_THINKING_CLIENT_PRIORITY", "thinking.client_priority", "bool"},
+		{"WB2A_THINKING_OVERRIDE_SCOPE", "thinking.override_scope", ""},
+		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
+		{"WB2A_SCHEDULE_JITTER_MINUTES", "schedule.jitter_minutes", "int"},
+		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MINUTES", "schedule.account_spread_minutes", "int"},
+		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MIN_GAP_SECONDS", "schedule.account_spread_min_gap_seconds", "int"},
+		{"WB2A_ADMIN_ENABLED", "admin.enabled", "bool"}, {"WB2A_ADMIN_AUDIT_ENABLED", "admin.audit_enabled", "bool"},
+		{"WB2A_ADMIN_AUDIT_FILE", "admin.audit_file", ""},
+		{"WB2A_METRICS_ENABLED", "metrics.enabled", "bool"},
+		{"WB2A_BUDGET_DAILY_CREDIT_LIMIT", "budget.daily_credit_limit", "float"},
+		{"WB2A_ALERTING_ENABLED", "alerting.enabled", "bool"}, {"WB2A_ALERTING_WEBHOOK_URL", "alerting.webhook_url", ""},
+	}
+	var out []string
+	for _, field := range fields {
+		value := os.Getenv(field.env)
+		if value == "" {
+			continue
+		}
+		switch field.kind {
+		case "int":
+			if _, err := strconv.Atoi(value); err != nil {
+				continue
+			}
+		case "bool":
+			if _, err := strconv.ParseBool(value); err != nil {
+				continue
+			}
+		case "float":
+			if _, err := strconv.ParseFloat(value, 64); err != nil {
+				continue
+			}
+		}
+		out = append(out, field.path)
+	}
+	return out
+}
+
+// DatabaseSettings 把 config 的 database 段翻成 store 的连接配置。
+// normalize 已补齐 driver 与 DSN（SQLite 缺省落在 state_file 同目录），这里只做搬运。
+func (c *Config) DatabaseSettings() store.Config {
+	if c == nil {
+		return store.Config{Driver: store.DriverSQLite, DSN: store.DefaultSQLiteDSN}
+	}
+	return store.Config{Driver: c.Database.Driver, DSN: c.Database.DSN}
+}
+
+// splitCSV 逗号分隔 → 去空白、丢空项（WB2A_DNS 用）。
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func (c *Config) normalize() error {
+	var err error
+	if err = c.normalizeThinking(); err != nil {
+		return err
+	}
+	if c.Panel.PackageDetailLimit <= 0 {
+		c.Panel.PackageDetailLimit = 5
+	}
+	// 数据库：driver 缺省 sqlite；无法识别的 driver 直接报错（静默回落会让人
+	// 以为连上了 MySQL，实际一直在写本地库）。DSN 留空 = state_file 同目录的
+	// wb2api.db，与旧版 state.json 同一位置，运维心智不变。
+	c.Database.Driver = strings.ToLower(strings.TrimSpace(c.Database.Driver))
+	if c.Database.Driver == "" {
+		c.Database.Driver = store.DriverSQLite
+	}
+	if !store.ValidDriver(c.Database.Driver) {
+		return fmt.Errorf("database.driver: 不支持 %q（可选 sqlite / mysql / postgres）", c.Database.Driver)
+	}
+	c.Database.DSN = strings.TrimSpace(c.Database.DSN)
+	if c.Database.DSN == "" {
+		if c.Database.Driver == store.DriverSQLite {
+			dir := filepath.Dir(c.StateFile)
+			if dir == "" || dir == "." {
+				c.Database.DSN = store.DefaultSQLiteDSN
+			} else {
+				c.Database.DSN = filepath.Join(dir, store.DefaultSQLiteDSN)
+			}
+		}
+	}
+	if c.Watchdog.IntervalSeconds <= 0 {
+		c.Watchdog.IntervalSeconds = 3600
+	}
+	if c.Update.AutoTime == "" {
+		c.Update.AutoTime = "04:00"
+	}
+	if !isClockTime(c.Update.AutoTime) {
+		return fmt.Errorf("update.auto_time: %q 不是合法时间（HH:MM，按上海时间）", c.Update.AutoTime)
+	}
+	// PollIntervalSec 不做回落：0 = 缺省（前端 5s），负数 = 关闭自动刷新。
+	// 两者都是合法取值，normalize 必须原样保留（回落会把「关闭」变成「5 秒」）。
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
+		c.Logging.PanelLogEnabled = true
+		c.Logging.PanelLogRetentionDays = 7
+		c.Logging.PanelLogMaxMB = 50
+	}
+	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
+	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
+	if c.Server.ReadTimeout == "" {
+		c.Server.ReadTimeout = "300s"
+	}
+	if c.ServerReadTimeoutDur, err = time.ParseDuration(c.Server.ReadTimeout); err != nil {
+		return fmt.Errorf("server.read_timeout: %w", err)
+	}
+	if c.ServerReadTimeoutDur < 0 {
+		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 首帧心跳间隔：空回落 1.5s（等上游首帧期间补 SSE 注释帧，见 headkeepalive.go）；
+	// "0" 合法（关闭，回到零字节旧行为）；负值 fail fast。
+	if c.Server.HeadKeepalive == "" {
+		c.Server.HeadKeepalive = "1500ms"
+	}
+	if c.HeadKeepaliveDur, err = time.ParseDuration(c.Server.HeadKeepalive); err != nil {
+		return fmt.Errorf("server.head_keepalive: %q %w", c.Server.HeadKeepalive, err)
+	}
+	if c.HeadKeepaliveDur < 0 {
+		return fmt.Errorf("server.head_keepalive: 负时长 %q 无意义", c.Server.HeadKeepalive)
+	}
+	// 优雅关停窗口：空回落 30s（分钟级在途 SSE 远比旧固定 5s 常见）；"0" 合法
+	//（立即退）；负值 fail fast。
+	if c.Server.ShutdownTimeout == "" {
+		c.Server.ShutdownTimeout = "30s"
+	}
+	if c.ShutdownTimeoutDur, err = time.ParseDuration(c.Server.ShutdownTimeout); err != nil {
+		return fmt.Errorf("server.shutdown_timeout: %q %w", c.Server.ShutdownTimeout, err)
+	}
+	if c.ShutdownTimeoutDur < 0 {
+		return fmt.Errorf("server.shutdown_timeout: 负时长 %q 无意义", c.Server.ShutdownTimeout)
+	}
+	// 请求体安全上限（OOM 护栏，不是预拦截）：0 = 用默认；越界直接报错——静默钳
+	// 会让护栏悄悄换成另一个数，运维以为配上了其实没配上。
+	if c.Server.MaxPayloadBytes == 0 {
+		c.Server.MaxPayloadBytes = 64 << 20
+	}
+	if c.Server.MaxPayloadBytes < 8<<20 || c.Server.MaxPayloadBytes > 512<<20 {
+		return fmt.Errorf("server.max_payload_bytes: %d 超出允许范围 8–512 MiB", c.Server.MaxPayloadBytes)
+	}
+	// 11140 连坐暂停时长：0 = 关闭（只保留命中即停手），负值无意义。
+	if c.Upstream.RestrictionHoldSeconds < 0 {
+		return fmt.Errorf("upstream.restriction_hold_seconds: 负值 %d 无意义（0 = 关闭）", c.Upstream.RestrictionHoldSeconds)
+	}
+	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
+		return fmt.Errorf("cooldown.soft_rate: %w", err)
+	}
+	// 空值回落默认 2h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	if c.Cooldown.SoftRateMax == "" {
+		c.Cooldown.SoftRateMax = "2h"
+	}
+	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
+		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown: %w", err)
+	}
+	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
+	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown: %w", err)
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
+	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+		return fmt.Errorf("session_sticky.ttl: %w", err)
+	}
+	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
+		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
+	if c.Pool.ExpiringSoon != "" {
+		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
+			return fmt.Errorf("pool.expiring_soon: %w", err)
+		}
+	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0
+		c.Pool.ExpiringSoon = "0"
+	}
+	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
+	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停
+	//（"−5m" 无合理语义）。
+	if c.Pool.CostExploreInterval == "" {
+		c.Pool.CostExploreInterval = "30m"
+	}
+	if c.CostExploreIntervalDur, err = time.ParseDuration(c.Pool.CostExploreInterval); err != nil {
+		return fmt.Errorf("pool.cost_explore_interval: %w", err)
+	}
+	if c.CostExploreIntervalDur < 0 {
+		c.CostExploreIntervalDur = 0
+	}
+	// 账号目录热重载轮询（issue #199）。空值回落默认 10s；"0s" 是合法值（关闭），
+	// 负值钳 0 同关闭（"-5s" 无合理语义）。
+	if c.Accounts.ReloadInterval == "" {
+		c.Accounts.ReloadInterval = "10s"
+	}
+	if c.ReloadIntervalDur, err = time.ParseDuration(c.Accounts.ReloadInterval); err != nil {
+		return fmt.Errorf("accounts.reload_interval: %w", err)
+	}
+	if c.ReloadIntervalDur < 0 {
+		c.ReloadIntervalDur = 0
+	}
+	if c.Accounts.ReloadDeleteConfirm <= 0 {
+		c.Accounts.ReloadDeleteConfirm = 2
+	}
+	// 窗口用量调度窗口（issue #112）：空值回落默认 1h；"0" 合法（关停）；负值钳 0。
+	if c.Pool.BalanceWindow == "" {
+		c.Pool.BalanceWindow = "1h"
+	}
+	if c.BalanceWindowDur, err = time.ParseDuration(c.Pool.BalanceWindow); err != nil {
+		return fmt.Errorf("pool.balance_window: %w", err)
+	}
+	if c.BalanceWindowDur < 0 {
+		c.BalanceWindowDur = 0
+	}
+	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
+	if c.Pool.CreditFloor < 0 {
+		c.Pool.CreditFloor = 0
+	}
+	// 保底倍率上限：负值钳 0（= 严格模式，任何已知正倍率都拦）。
+	// 不设非零默认是有意的——这是钱相关开关，升级不该静默放宽既有防护。
+	if c.Pool.CreditFloorMaxRate < 0 {
+		c.Pool.CreditFloorMaxRate = 0
+	}
+	if c.Pool.BreakerThreshold <= 0 {
+		c.Pool.BreakerThreshold = 3
+	}
+	// 连败降权参数缺省归一（非法/未设置回落默认，与 breaker_threshold 同风格）。
+	if c.Pool.DegradeThreshold <= 0 {
+		c.Pool.DegradeThreshold = 5
+	}
+	if c.Pool.DegradeCooldown == "" {
+		c.Pool.DegradeCooldown = "10m"
+	}
+	if c.Pool.DegradeCooldownMax == "" {
+		c.Pool.DegradeCooldownMax = "2h"
+	}
+	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
+	if c.Pool.MaxInFlightGlobal <= 0 {
+		c.Pool.MaxInFlightGlobal = 2
+	}
+	if c.Pool.IdleWeightPerHour <= 0 {
+		c.Pool.IdleWeightPerHour = 0.5
+	}
+	if c.Pool.IdleWeightMax <= 0 {
+		c.Pool.IdleWeightMax = 5.0
+	}
+	// 保留积分：负值非法归零（0 = 关闭，是合法值，不能像 idle_weight 那样回落默认）。
+	// ponytail: nil → 默认 10；显式 0 = 关闭；负值归零。
+	switch {
+	case c.Pool.ReserveCredits == nil:
+		v := int64(10)
+		c.Pool.ReserveCredits = &v
+	case *c.Pool.ReserveCredits < 0:
+		*c.Pool.ReserveCredits = 0
+	}
+	// 保留积分按域覆盖（issue #147）：非法键剔除，负值归零（0 = 该域关闭）。
+	// 未写的域回落 reserve_credits。删除时不能边遍历边 delete 之外还改值——先收集再改。
+	for k, v := range c.Pool.ReserveCreditsByRealm {
+		if k != "cn" && k != "global" {
+			delete(c.Pool.ReserveCreditsByRealm, k)
+			continue
+		}
+		if v < 0 {
+			c.Pool.ReserveCreditsByRealm[k] = 0
+		}
+	}
+	// 账号优先级/占比（issue #62）：非正值视为「未配置」直接剔除——0 在这里不是有意义的
+	// 配置（不是"最低优先级"，也不是"零占比"），留着会让语义有两种解释。剔除后空表与
+	// 键缺席等价，选号行为不变。
+	for uid, pr := range c.Pool.AccountPriority {
+		if pr <= 0 {
+			delete(c.Pool.AccountPriority, uid)
+		}
+	}
+	for uid, sh := range c.Pool.AccountShare {
+		if sh <= 0 {
+			delete(c.Pool.AccountShare, uid)
+		}
+	}
+	if c.Upstream.TimeoutSeconds <= 0 {
+		c.Upstream.TimeoutSeconds = 120
+	}
+	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
+	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	if c.Upstream.HeaderTimeoutSeconds <= 0 {
+		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
+	}
+	if c.Upstream.IdleTimeoutSeconds <= 0 {
+		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+		c.Listen = ":" + c.Listen
+	}
+	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
+	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
+	if len(c.Schedule.CheckinHours) == 0 {
+		c.Schedule.CheckinHours = []int{9, 21}
+	}
+	if len(c.Schedule.TravelHours) == 0 {
+		c.Schedule.TravelHours = []int{9, 21}
+	}
+	if len(c.Schedule.ActivityHours) == 0 {
+		c.Schedule.ActivityHours = []int{10}
+	}
+	if len(c.Schedule.KeepaliveHours) == 0 {
+		c.Schedule.KeepaliveHours = []int{22}
+	}
+	// 周期保活临期窗口：空回落默认 168h（Default 已置，兜底显式 ""）；非法值
+	// fail fast（拼写错误静默吞掉等于窗口变 0 → 全量刷新，违背本字段意图）；
+	// <=0 无合理语义（0/负值想全量应直接删键），报错。
+	if c.Schedule.KeepaliveRefreshWindow == "" {
+		c.Schedule.KeepaliveRefreshWindow = "168h"
+	}
+	if c.KeepaliveRefreshWindowDur, err = time.ParseDuration(c.Schedule.KeepaliveRefreshWindow); err != nil {
+		return fmt.Errorf("schedule.keepalive_refresh_window: %w", err)
+	}
+	if c.KeepaliveRefreshWindowDur <= 0 {
+		return fmt.Errorf("schedule.keepalive_refresh_window: %q 必须为正时长（如 168h）", c.Schedule.KeepaliveRefreshWindow)
+	}
+	if len(c.Schedule.GrowthHours) == 0 {
+		c.Schedule.GrowthHours = []int{11}
+	}
+	// 排程轮次账号间并发：缺省/0 → 1（老 config 无此键，不能当非法值报错）。
+	if c.Schedule.GrowthConcurrency <= 0 {
+		c.Schedule.GrowthConcurrency = 1
+	}
+	if c.Schedule.GrowthConcurrency > 4 {
+		return fmt.Errorf("schedule.growth_concurrency: %d 非法（1-4，手动入口同为 4 上限）", c.Schedule.GrowthConcurrency)
+	}
+	if c.Schedule.JitterMinutes < 0 || c.Schedule.JitterMinutes > 1440 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 非法（0 = 关闭，上限 1440）", c.Schedule.JitterMinutes)
+	}
+	if c.Schedule.AccountSpreadMinutes < 0 || c.Schedule.AccountSpreadMinutes > 1440 {
+		return fmt.Errorf("schedule.account_spread_minutes: %d 非法（0 = 关闭，上限 1440）", c.Schedule.AccountSpreadMinutes)
+	}
+	if c.Schedule.AccountSpreadMinGapSeconds < 0 || c.Schedule.AccountSpreadMinGapSeconds > 3600 {
+		return fmt.Errorf("schedule.account_spread_min_gap_seconds: %d 非法（0 = 只做随机，上限 3600）", c.Schedule.AccountSpreadMinGapSeconds)
+	}
+	if c.Budget.DailyCreditLimit < 0 {
+		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 不限", c.Budget.DailyCreditLimit)
+	}
+	if c.Budget.BurstCreditLimit < 0 {
+		return fmt.Errorf("budget.burst_credit_limit: %v 不得为负；0 = 关闭", c.Budget.BurstCreditLimit)
+	}
+	if c.Budget.CacheLowRate < 0 || c.Budget.CacheLowRate > 100 {
+		return fmt.Errorf("budget.cache_low_rate: %v 须在 0-100 之间（百分比）；0 = 关闭", c.Budget.CacheLowRate)
+	}
+	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
+		return fmt.Errorf("admin.enabled=true 但 api_key 为空")
+	}
+	if c.Admin.AuditEnabled {
+		if !c.Admin.Enabled {
+			return fmt.Errorf("admin.audit_enabled=true 但 admin.enabled=false")
+		}
+		if strings.TrimSpace(c.Admin.AuditFile) == "" {
+			c.Admin.AuditFile = "./data/admin_audit.log"
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Features.SanitizeBrandScope)) {
+	case "", "all":
+		c.Features.SanitizeBrandScope = "all"
+	case "identity":
+		c.Features.SanitizeBrandScope = "identity"
+	default:
+		return fmt.Errorf("features.sanitize_brand_scope: %q 非法（all = 所有消息角色；identity = 仅 system/developer）", c.Features.SanitizeBrandScope)
+	}
+	if err := c.normalizeAlerting(); err != nil {
+		return err
+
+	}
+	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
+	if c.Schedule.BalanceRefreshEnabled {
+		if c.Schedule.BalanceRefreshMinutes <= 0 {
+			c.Schedule.BalanceRefreshMinutes = 5
+		}
+		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	if c.Schedule.TaskSweepEnabled {
+		if c.Schedule.TaskSweepMinutes <= 0 {
+			c.Schedule.TaskSweepMinutes = 15
+		}
+		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	// 抖动合法性（上限 50%）：非法值直接报错而非静默钳位——配置错误该在启动时暴露。
+	if c.Schedule.BalanceRefreshJitterPermill < 0 || c.Schedule.BalanceRefreshJitterPermill > 500 {
+		return fmt.Errorf("schedule.balance_refresh_jitter_permill: %d 非法（0 = 关闭，上限 500）", c.Schedule.BalanceRefreshJitterPermill)
+	}
+	if c.Schedule.TaskSweepJitterPermill < 0 || c.Schedule.TaskSweepJitterPermill > 500 {
+		return fmt.Errorf("schedule.task_sweep_jitter_permill: %d 非法（0 = 关闭，上限 500）", c.Schedule.TaskSweepJitterPermill)
+	}
+	if c.Schedule.MakeupCardsPerRound < 0 {
+		return fmt.Errorf("schedule.makeup_cards_per_round: %d 非法（0 = 不限，>0 = 每轮上限）", c.Schedule.MakeupCardsPerRound)
+	}
+	if err := c.validateScheduleHours(); err != nil {
+		return err
+	}
+	return c.normalizePrompt()
+}
+
+// normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
+//
+// mode 非法（非 passthrough/custom/append）启动报错，避免静默回落到某一分支；
+// custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
+// （两模式共用同一加载路径，PromptText 均非空）。
+// passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// normalizeThinking 校验并规范化 thinking 节（思考档位策略）。
+//
+// 空串回落默认；非法档位 / 作用域 fail fast——静默丢弃会让「面板填了 high」
+// 悄悄按 max 跑，用户无从判断策略是否生效。thinking.model_defaults 的 val 为
+// "" 或 "inherit" 表示「不覆盖」（等价于删除该键），用于面板「恢复全局默认」；
+// val 可以是 off（该模型在网关侧固定关闭思考），全局 default_effort 不允许 off。
+func (c *Config) normalizeThinking() error {
+	c.Thinking.DefaultEffort = strings.ToLower(strings.TrimSpace(c.Thinking.DefaultEffort))
+	if c.Thinking.DefaultEffort == "" {
+		c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
+	}
+	if c.Thinking.DefaultEffort == "off" || !upstream.IsEffortLevel(c.Thinking.DefaultEffort) {
+		return fmt.Errorf("thinking.default_effort: %q 不是合法档位（max 或 low/medium/high/xhigh 等）", c.Thinking.DefaultEffort)
+	}
+	scope := strings.ToLower(strings.TrimSpace(c.Thinking.OverrideScope))
+	if scope == "" {
+		scope = "level"
+	}
+	if scope != "level" && scope != "all" {
+		return fmt.Errorf("thinking.override_scope: %q 不是合法作用域（level = 只覆盖档位、保留关闭意图；all = 档位与开关一起覆盖）", c.Thinking.OverrideScope)
+	}
+	c.Thinking.OverrideScope = scope
+	out := make(map[string]string, len(c.Thinking.ModelDefaults))
+	for k, v := range c.Thinking.ModelDefaults {
+		key := strings.ToLower(strings.TrimSpace(k))
+		val := strings.ToLower(strings.TrimSpace(v))
+		if key == "" {
+			continue
+		}
+		if val == "" || val == "inherit" {
+			continue // 显式不覆盖：等价于删除该键
+		}
+		if !upstream.IsEffortLevel(val) {
+			return fmt.Errorf("thinking.model_defaults[%q]: %q 不是合法档位（max/xhigh/high/medium/low/minimal/off，或 inherit 表示不覆盖）", k, v)
+		}
+		out[key] = val
+	}
+	c.Thinking.ModelDefaults = out
+	return nil
+}
+
+func (c *Config) normalizePrompt() error {
+	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
+	case "", "passthrough":
+		c.Prompt.Mode = "passthrough"
+	case "custom":
+		c.Prompt.Mode = "custom"
+	case "append":
+		c.Prompt.Mode = "append"
+	default:
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
+	}
+	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
+		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
+		if err != nil {
+			return err
+		}
+		c.PromptText = text
+	}
+	return nil
+}
+
+// validateScheduleHours 校验排程小时落在 0-23。
+//
+// 为什么不用 `[-1]` 之类的哨兵值表意"禁用"：非法小时被静默吞掉时，用户以为关掉了签到，
+// 实际可能被当成另一个整点照常执行；这里直接快速失败，并在错误信息里指向正确的开关
+// （checkin_enabled / keepalive_enabled），避免用户靠猜哨兵值来配。
+func (c *Config) validateScheduleHours() error {
+	if err := checkHourRange("schedule.checkin_hours", "checkin_enabled", c.Schedule.CheckinHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.travel_hours", "travel_enabled", c.Schedule.TravelHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.activity_hours", "activity_enabled", c.Schedule.ActivityHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
+}
+
+func checkHourRange(field, switchKey string, hours []int) error {
+	for _, h := range hours {
+		if h < 0 || h > 23 {
+			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false", field, h, switchKey)
+		}
+	}
+	return nil
+}
+
+func isClockTime(value string) bool {
+	if len(value) != 5 || value[2] != ':' {
+		return false
+	}
+	for _, i := range []int{0, 1, 3, 4} {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	hour, errH := strconv.Atoi(value[:2])
+	minute, errM := strconv.Atoi(value[3:])
+	return errH == nil && errM == nil && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+}
+
+func (c *Config) normalizeAlerting() error {
+	a := &c.Alerting
+	if a.IntervalSeconds < 0 || a.TimeoutSeconds < 0 || a.StartupGraceSeconds < 0 ||
+		a.MinHealthyCN < 0 || a.MinHealthyGlobal < 0 || a.RecoverHealthy < 0 ||
+		a.BreakerThreshold < 0 || a.ForTicks < 0 || a.ClearTicks < 0 {
+		return fmt.Errorf("alerting: 数值不得为负")
+	}
+	if a.IntervalSeconds == 0 {
+		a.IntervalSeconds = 30
+	}
+	if a.TimeoutSeconds == 0 {
+		a.TimeoutSeconds = 5
+	}
+	if a.StartupGraceSeconds == 0 {
+		a.StartupGraceSeconds = 30
+	}
+	if a.ForTicks == 0 {
+		a.ForTicks = 2
+	}
+	if a.ClearTicks == 0 {
+		a.ClearTicks = 2
+	}
+	if a.RecoverHealthy == 0 {
+		a.RecoverHealthy = 1
+	}
+	if !a.Enabled {
+		return nil
+	}
+	raw := strings.TrimSpace(a.WebhookURL)
+	if raw == "" {
+		return fmt.Errorf("alerting.enabled=true 但 alerting.webhook_url 为空")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("alerting.webhook_url: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("alerting.webhook_url: 需要 http(s) 地址")
+	}
+	return nil
+}

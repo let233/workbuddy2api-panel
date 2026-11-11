@@ -1,0 +1,42 @@
+services:
+  wb2api:
+    # 默认使用上游预编译镜像：docker compose pull && docker compose up -d --no-build。
+    # latest 跟随 main；固定版本可用 :2026.11.1.905（镜像标签不带 v）。
+    image: ghcr.io/misakano7545/workbuddy2api-panel:latest
+    # 源码构建：注释 image，取消下面 build 段的注释，
+    # 再 git pull && docker compose up -d --build；两种方式二选一。
+    # build:
+    #   context: .
+    #   args:
+    #     APP_VERSION: ${APP_VERSION:-dev}
+    # 自建版本默认 dev；如需版本比较，在 .env 设置 APP_VERSION（例如 2026.11.3.820）。
+    container_name: workbuddy2api
+    restart: unless-stopped
+    # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
+    # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
+    #   1) 非 root · 让容器以你自己的 uid 运行（挂载目录本来就是你建的）：
+    #      PUID=$(id -u) PGID=$(id -g) docker compose up -d
+    #      或写进 .env 文件：PUID=1000 / PGID=1000
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #   3) user: "0:0" 以 root 运行（省事但容器逃逸面更大，自担）
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+      # 数据库（可选）：不设就是 SQLite，库文件在 ./data/wb2api.db
+      # - WB2A_DB_DRIVER=mysql
+      # - WB2A_DB_DSN=wb2api:pass@tcp(mysql:3306)/wb2api?charset=utf8mb4&parseTime=True
+      # 程序缺省只绑 127.0.0.1（宿主机部署更安全），容器内必须显式放开，
+      # 否则下面的 ports 映射进来的连接一律被拒。
+      - WB2A_LISTEN=0.0.0.0:7863
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      # 运行数据现在都在数据库里：默认 SQLite，库文件就是 ./data/wb2api.db（随本挂载持久化）。
+      # 想用 MySQL / PostgreSQL 就改 config.json 的 database 段，本挂载仍要留着放旧数据导入与日志。
+      - ./data:/app/data
+      # 注意：宿主机必须先有 config.json（cp config.example.json config.json）。
+      # 缺失时 Docker 会把挂载点创建成目录 → 容器启动失败（程序会自动生成配置，
+      # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
+      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      - ./config.json:/app/config.json

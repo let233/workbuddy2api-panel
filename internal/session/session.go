@@ -1,0 +1,649 @@
+// Package session 会话粘性路由：同一会话（conversationId / metadata 键）尽量绑定同一账号。
+//
+// 设计参考 antigravityProxyGo internal/session（fast-path RLock / 双段分配 / TTL / 持久化），
+// 但改为纯内存 + redisstore 异步镜像：
+//   - 命中走 RLock 快查（绝大多数请求已绑定）；
+//   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
+//   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
+//   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
+//   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
+package session
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/jsonscan"
+	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
+)
+
+// entry 单条会话绑定。
+type entry struct {
+	uid        string
+	lastActive time.Time
+}
+
+// Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
+// 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
+type Config struct {
+	TTL        time.Duration
+	GCInterval time.Duration
+	Store      redisstore.Store
+	Available  func() []string
+	// AvailableForModel 按请求模型返回"在该模型上可用"的账号（healthy 且未占满在途，
+	// 且未被该模型限流/限额）。nil 时回落 Available（无模型维度，行为与引入前一致）。
+	//
+	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
+	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
+	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
+	AvailableForModel func(model string) []string
+}
+
+// Router 会话粘性路由器。
+//
+// 热改字段（TTL / GC 间隔 / Store / 开关）全部走 atomic：面板保存配置时
+// ResolveForModel 正在别的 goroutine 里读它们，普通字段写就是数据竞争（-race
+// 可复现）。cfg 因此只保留「装配期注入、运行期只读」的 Available /
+// AvailableForModel 两个闭包——main 装配一次，不参与热改。
+type Router struct {
+	mu      sync.RWMutex
+	entries map[string]entry
+	cfg     Config // 仅 Available / AvailableForModel 参与运行期读
+
+	ttl        atomic.Int64                     // 会话 TTL（纳秒）
+	gcInterval atomic.Int64                     // 后台 GC 间隔（纳秒）
+	store      atomic.Pointer[redisstore.Store] // 镜像后端（upstash 热换）
+	enabled    atomic.Bool                      // 粘性开关（关掉 = Resolve 直接 false）
+
+	stop  chan struct{}
+	rearm chan struct{} // GC 间隔热改唤醒：新间隔立刻重设 timer，而不是等旧 ticker 到期
+}
+
+// New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
+// TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
+// 默认启用（引入开关前的行为逐字不变；main 随后按 session_sticky.enabled 调 SetEnabled）。
+func New(cfg Config) *Router {
+	store := cfg.Store
+	if store == nil {
+		store = redisstore.Noop{}
+	}
+	ttl := cfg.TTL
+	if ttl <= 0 {
+		ttl = defaultTTL
+	}
+	gc := cfg.GCInterval
+	if gc <= 0 {
+		gc = defaultGCInterval
+	}
+	r := &Router{
+		entries: map[string]entry{},
+		cfg:     cfg,
+		rearm:   make(chan struct{}, 1),
+	}
+	// 热改字段的真值来源只保留原子量：cfg 里那份当作装配期快照，并把 Store 清掉，
+	// 避免后来有人顺手读 r.cfg.Store 读到永不更新的旧后端。
+	r.cfg.Store = nil
+	r.store.Store(&store)
+	r.ttl.Store(int64(ttl))
+	r.gcInterval.Store(int64(gc))
+	r.enabled.Store(true)
+	return r
+}
+
+// StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
+//
+// stop channel 必须在启 goroutine 前捕获到**局部变量**：goroutine 在 select 里
+// 每轮重新求值 r.stop 是无锁读，而 StopGC 持写锁把它置 nil——既是数据竞争
+// （-race 可复现），又会在读到 nil 后让该 case 永久阻塞（nil channel 永不就绪），
+// 于是关停彻底失效：goroutine 再也不会退出，ticker 无限触发 gcOnce（goroutine
+// 泄漏 + 关停后仍持续 GC）。捕获局部变量后，close(stop) 与 select 观测的是同一个
+// channel，StopGC 一定能让 goroutine 退出。
+func (r *Router) StartGC() {
+	r.mu.Lock()
+	if r.stop != nil {
+		r.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	r.stop = stop
+	r.mu.Unlock()
+
+	go func() {
+		// 用可重置的 timer 而不是 ticker：Reconfigure 改间隔后必须**立刻**按新值
+		// 重设计时器。ticker 的间隔创建时就固定，改配置只能等重启才生效。
+		timer := time.NewTimer(r.gcEvery())
+		defer timer.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-r.rearm:
+				// 间隔已热改：跳过本轮到下面的统一重置。
+			case <-timer.C:
+				r.gcOnce(time.Now())
+			}
+			if !timer.Stop() {
+				// Stop 返回 false = 到期信号已被取走/待取：非阻塞排空，避免 Reset
+				// 之后立刻被旧信号触发（多跑一次 GC 无害，但会打乱新间隔）。
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(r.gcEvery())
+		}
+	}()
+}
+
+// StopGC 停止后台 GC（幂等）。
+func (r *Router) StopGC() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stop != nil {
+		close(r.stop)
+		r.stop = nil
+	}
+}
+
+// LoadFromStore 启动时从 redisstore 恢复绑定（内存覆盖本地，读操作仅此处发生）。
+// 已有本地绑定被保留——Redis 仅为恢复备份，本地一旦建立即为权威。
+func (r *Router) LoadFromStore() {
+	// 粘性关掉时不恢复绑定：恢复了没人读（Resolve 直接 false），还会让 /status 的
+	// Count 显示一堆幽灵绑定。
+	if !r.enabled.Load() {
+		return
+	}
+	binds := r.storeRef().LoadBinds()
+	if len(binds) == 0 {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	loaded := 0
+	for key, uid := range binds {
+		if _, exists := r.entries[key]; exists {
+			continue
+		}
+		r.entries[key] = entry{uid: uid, lastActive: now}
+		loaded++
+	}
+	r.mu.Unlock()
+	if loaded > 0 {
+		log.Printf("[session] 从 Redis 恢复 %d 条粘性会话绑定", loaded)
+	}
+}
+
+// Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
+// 无模型维度（等价于 ResolveForModel(key, "")），保留给不关心模型的调用方。
+func (r *Router) Resolve(key string) (string, bool) {
+	return r.ResolveForModel(key, "")
+}
+
+// ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
+// 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
+// 被该模型限流）走重新分配。
+//
+// 为什么必须带模型：绑定只记 uid，同一个会话可能换模型；账号被 6004 模型级限额后
+// 对其他模型仍可用（见 pool.healthyForModel 的 softRateModel 豁免）。若只按账号级
+// 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
+func (r *Router) ResolveForModel(key, model string) (string, bool) {
+	// 粘性关掉：调用方按「无粘性」处理（自己走普通选号）。只读一个原子量即返回。
+	if !r.enabled.Load() {
+		return "", false
+	}
+	now := time.Now()
+	available := r.availableSet(model)
+	ttl := r.ttlDur()
+
+	// ── Fast path: RLock 快查 ──────────────────────────────
+	r.mu.RLock()
+	e, found := r.entries[key]
+	r.mu.RUnlock()
+	if found && !expired(e, now, ttl) {
+		if available[e.uid] {
+			r.touch(key, e.uid, now)
+			return e.uid, true
+		}
+		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
+	}
+
+	// ── Slow path: 写锁 re-check 后分配 ────────────────────
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// re-check：并发同 key 可能已被其他 goroutine 分配好。
+	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, ttl) {
+		if available[e2.uid] {
+			r.entries[key] = entry{uid: e2.uid, lastActive: now}
+			return e2.uid, true
+		}
+		delete(r.entries, key) // 失效：清掉再分配
+	}
+
+	uids := r.availableSlice(model)
+	if len(uids) == 0 {
+		return "", false
+	}
+
+	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
+	bound := map[string]bool{}
+	for _, v := range r.entries {
+		bound[v.uid] = true
+	}
+	var idle []string
+	for _, u := range uids {
+		if !bound[u] {
+			idle = append(idle, u)
+		}
+	}
+	pool2 := idle
+	if len(pool2) == 0 {
+		pool2 = uids
+	}
+	uid := pool2[hashIndex(key, len(pool2))]
+
+	prev, existed := r.entries[key]
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	store := r.storeRef()
+	if existed && prev.uid != uid {
+		store.DelBind(key)
+	}
+	store.SetBind(key, uid, ttl)
+	return uid, true
+}
+
+// touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+// CAS 语义：写锁内先核对绑定仍是入参 uid 才滚动。快路径从 RUnlock 到加写锁的
+// 窗口里，同一会话 key 的失败路径 Unbind、成功路径 Bind（粘性跟随最终成功号）、
+// 慢路径重分配都可能已改写绑定——无条件回写会把刚解绑的失败号复活、把粘性跟
+// 随的成功号冲回旧号，且镜像进 Redis 后连重启都恢复成错误绑定。uid 不匹配时
+// 放弃本次 touch（以先落地的显式操作为准）。
+func (r *Router) touch(key, uid string, now time.Time) {
+	r.mu.Lock()
+	e, found := r.entries[key]
+	if !found || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.mu.Unlock()
+	r.storeRef().SetBind(key, uid, r.ttlDur())
+}
+
+// Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
+// 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
+// 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。
+func (r *Router) Bind(key, uid string) {
+	if key == "" || uid == "" {
+		return
+	}
+	// 粘性关掉时不建绑定：否则停用期间的请求成功路径会往里写，重新启用时带着一批
+	// 停用期的旧绑定复活（SetEnabled(false) 清空的语义会被悄悄破坏）。
+	if !r.enabled.Load() {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.mu.Unlock()
+	r.storeRef().SetBind(key, uid, r.ttlDur())
+}
+
+// Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
+func (r *Router) Unbind(key string) bool {
+	r.mu.Lock()
+	_, found := r.entries[key]
+	if found {
+		delete(r.entries, key)
+	}
+	r.mu.Unlock()
+	if found {
+		r.storeRef().DelBind(key)
+	}
+	return found
+}
+
+// Count 返回当前绑定数（供 /status 观测）。
+func (r *Router) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.entries)
+}
+
+// gcOnce 清理 TTL 过期的绑定，并镜像删除。
+func (r *Router) gcOnce(now time.Time) int {
+	ttl := r.ttlDur()
+	store := r.storeRef()
+	r.mu.Lock()
+	var expiredKeys []string
+	for key, e := range r.entries {
+		if now.Sub(e.lastActive) > ttl {
+			expiredKeys = append(expiredKeys, key)
+		}
+	}
+	for _, key := range expiredKeys {
+		delete(r.entries, key)
+	}
+	r.mu.Unlock()
+	for _, key := range expiredKeys {
+		store.DelBind(key)
+	}
+	return len(expiredKeys)
+}
+
+// availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
+func (r *Router) availableSet(model string) map[string]bool {
+	uids := r.availableSlice(model)
+	set := make(map[string]bool, len(uids))
+	for _, u := range uids {
+		set[u] = true
+	}
+	return set
+}
+
+// availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
+func (r *Router) availableSlice(model string) []string {
+	if r.cfg.AvailableForModel != nil {
+		return r.cfg.AvailableForModel(model)
+	}
+	if r.cfg.Available == nil {
+		return nil
+	}
+	return r.cfg.Available()
+}
+
+func expired(e entry, now time.Time, ttl time.Duration) bool {
+	return now.Sub(e.lastActive) > ttl
+}
+
+// hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。
+func hashIndex(key string, n int) int {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h % uint32(n))
+}
+
+// ExtractKey 从请求体提取会话键；按下列顺序依次尝试，找不到时回退到
+// 内容派生的稳定键（见 deriveKey），仍为空则返回空串（绝不失败）。
+//  1. metadata.conversation_id
+//  2. metadata.conversationId
+//  3. conversation_id
+//  4. conversationId
+//  5. prompt_cache_key（OpenAI 前缀缓存键，见下）
+//  6. 派生键：system 提示词 + 首条用户消息的哈希（客户端不发会话 id 时的回退，
+//     带 user_id 的请求不派生——见下方契约说明）
+//
+// 前 5 项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+// （P1-anti-monopoly 剔除）：user 维度粒度过粗——一个 user 的全部并行对话
+// 会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），且曾抢占顶层
+// conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换（与无标识
+// 客户端同路径），旧 user_id 绑定靠 TTL 自然过期，键消失不产生脏绑定。
+//
+// issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
+// 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
+// snake_case 优先级高于 camelCase（同值不同名命中同一对话时返回相同值，天然不混用）。
+//
+// 第 5 项 prompt_cache_key：pi-ai 驱动的客户端（dsh 等）把会话 ID 放在这个 OpenAI
+// 前缀缓存字段里（而非 conversation_id），网关在 upstream 侧本就认它（见
+// InjectPromptCacheKey 优先级 1：客户端自带则原值保留）。纳入识别后，这类客户端
+// 无需改配置即可命中粘性。置于显式会话键之后、派生键之前，绝不抢占 conversation
+// 维度的优先级。
+//
+// 派生键的 user_id 抑制（P1-anti-monopoly 契约在 fallback 路径的延伸）：body 携带
+// metadata.user_id 或顶层 user_id 时**不派生**。ExtractKey 有意剔除 user_id 作粘性键
+// （user 维度粒度过粗——一个 user 的全部并行对话会被钉到同一账号），若派生路径不设
+// 此闸，只发 user_id 的请求会借内容哈希重新获得粘性，使该契约在 fallback 路径失效
+// （上游 #169 同款回归修正）。这类客户端回落加权轮换。
+func ExtractKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	// 快路径：单遍扫描读显式会话键（线上这条占 chat 请求 CPU 的 ~10%——此前
+	// 为了读 1~2 个短字符串，要把整个 100~500KB body 解析成 map）。
+	// 未命中时只有派生键一条路，那需要读消息内容，回落整树解析。
+	if key, hasUser, ok := explicitSessionKey(body); ok {
+		if key != "" {
+			return key
+		}
+		if hasUser {
+			// user 维度标识存在 → 不派生（anti-monopoly 契约），不必再看消息内容。
+			return ""
+		}
+	}
+	bodyParses.Add(1)
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["conversation_id"]); v != "" {
+			return v
+		}
+		if v := strOrEmpty(meta["conversationId"]); v != "" {
+			return v
+		}
+	}
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	// 5. prompt_cache_key：OpenAI 系的会话级前缀缓存键，语义就是"同一会话复用同一
+	//    前缀"，与粘性诉求同源。放显式会话键之后、派生键之前，不抢占优先级。
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	// 派生回退闸：带 user 维度标识的请求不派生（契约见上）。
+	if hasUserIDKey(obj) {
+		return ""
+	}
+	return deriveKey(obj)
+}
+
+// explicitSessionKey 单遍扫描读 5 个显式会话键（顺序与 ExtractKey 一致：
+// metadata 优先、snake 优先于 camel，prompt_cache_key 最后）。
+// ok=false 表示扫描器走不通，调用方必须回落整树解析。
+// 顺带读出 user_id 是否存在——派生回退闸要它，省掉一次整树解析。
+func explicitSessionKey(body []byte) (key string, hasUser bool, ok bool) {
+	res := jsonscan.Lookup(body, jsonscan.Query{
+		Top:        []string{"conversation_id", "conversationId", "prompt_cache_key", "user_id"},
+		Nested:     "metadata",
+		NestedKeys: []string{"conversation_id", "conversationId", "user_id"},
+	})
+	if !res.Ok {
+		return "", false, false
+	}
+	hasUser = res.Get("user_id") != "" || res.GetNested("user_id") != ""
+	switch {
+	case res.GetNested("conversation_id") != "":
+		return res.GetNested("conversation_id"), hasUser, true
+	case res.GetNested("conversationId") != "":
+		return res.GetNested("conversationId"), hasUser, true
+	case res.Get("conversation_id") != "":
+		return res.Get("conversation_id"), hasUser, true
+	case res.Get("conversationId") != "":
+		return res.Get("conversationId"), hasUser, true
+	case res.Get("prompt_cache_key") != "":
+		return res.Get("prompt_cache_key"), hasUser, true
+	}
+	return "", hasUser, true
+}
+
+// hasUserIDKey 报告已解析 body 是否携带 user 维度标识（metadata.user_id 或顶层
+// user_id，非空字符串才算）。只用于派生回退闸（ExtractKey）；解析失败按无处理。
+func hasUserIDKey(obj map[string]any) bool {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if strOrEmpty(meta["user_id"]) != "" {
+			return true
+		}
+	}
+	return strOrEmpty(obj["user_id"]) != ""
+}
+
+// derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
+// 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
+const derivedKeyPrefix = "d-"
+
+// DeriveCacheKey 仅供 prompt_cache_key / X-Conversation-ID 的会话段使用：与
+// ExtractKey 的第 6 项同源（system + 首条 user 的哈希），但**不设 user_id 闸**。
+//
+// 为什么需要它：ExtractKey 对带 user_id 的请求返回空串，那是「不把 user 钉到某个账号」
+// 的契约（user 维度太粗）；但空串会让 prompt_cache_key 退化成**每账号一个常量槽**
+// （buildCacheKey(uid, "")），同一账号上所有对话互相覆盖前缀缓存——交错对话时每个
+// 切换点都是一次大前缀全 miss（实测上报：glm-5.3 120k 上下文周期性命中 0.2%）。
+// 缓存槽按对话隔离与账号绑定是两件事：本函数只影响前者，粘性绑定仍看 ExtractKey。
+func DeriveCacheKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	bodyParses.Add(1)
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	return deriveKey(obj)
+}
+
+// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+//
+// 为什么用「system + 首条 user」而不是全部消息：
+//   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
+//   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
+//   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
+//
+// 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
+func deriveKey(obj map[string]any) string {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return ""
+	}
+	systemText, firstUserText := "", ""
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		text := messageText(msg["content"])
+		switch strOrEmpty(msg["role"]) {
+		case "system", "developer":
+			if systemText == "" {
+				systemText = text
+			}
+		case "user":
+			if firstUserText == "" {
+				// 首条 user 用内容签名（ids.go contentSignature）而非纯文本提取：
+				// 纯图片轮（无 text part）在 messageText 下恒空串 → 派生键失效
+				//（首图会话的粘性盲区）；签名口径下图片 part 以 [type:摘要] 入键。
+				firstUserText = userContentSignature(msg["content"])
+			}
+		}
+		if firstUserText != "" && systemText != "" {
+			break // 都已拿到：停止遍历长历史
+		}
+	}
+	if firstUserText == "" {
+		return "" // 无用户消息：无从归属会话
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// userContentSignature 把已解析的 content（any）转回 RawMessage 后取**会话级稳定**
+// 签名，供 deriveKey（粘性键）专用。与 TurnKey 的 contentSignature（全文摘）不同：
+// 文本 part 照常拼接；非文本 part 只入 "[type]" 占位**不入内容摘要**——同一逻辑
+// 图片的 URL 逐轮变化（签名 URL/重编码 base64）是真实场景，内容摘要入键会让
+// 派生键随轮漂移、粘性名存实亡（fork 既有契约：image url changes must not
+// break derived key stability）。占位仍能区分"有无图片/图片数量"，纯图片首条
+// 消息（无 text part）由此可派生非空键（首图会话粘性盲区修复，对齐上游 G1
+// 的目标语义而保留 fork 的稳定性口径）。marshal 失败按无内容处理（不伪造）。
+func userContentSignature(content any) string {
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return ""
+	}
+	st := strings.TrimSpace(string(raw))
+	if st == "" || st == "null" {
+		return ""
+	}
+	if st[0] == '"' {
+		var str string
+		if json.Unmarshal(raw, &str) != nil {
+			return ""
+		}
+		return str
+	}
+	if st[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var b strings.Builder
+	hasNonText := false
+	for _, pr := range parts {
+		var p struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(pr, &p) != nil {
+			return ""
+		}
+		if p.Type == "" || p.Type == "text" {
+			b.WriteString(p.Text)
+			continue
+		}
+		hasNonText = true
+		b.WriteString("\n[" + p.Type + "]\n")
+	}
+	out := b.String()
+	if !hasNonText {
+		return out
+	}
+	return strings.TrimSpace(out)
+}
+
+// messageText 提取消息 content 的文本表示。
+// 兼容：字符串 / [{type:"text",text:"..."}] 数组（OpenAI 多模态）；其他类型取空。
+func messageText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var sb strings.Builder
+		for _, part := range v {
+			if p, ok := part.(map[string]any); ok {
+				sb.WriteString(strOrEmpty(p["text"]))
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}
+
+// strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
+func strOrEmpty(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+// bodyParses 本包对请求体做整树 JSON 解析的次数（观测/回归用）。
+// ExtractKey / ResolveConversationID 在有显式会话键时必须 0 次——那时它们只需
+// 读一两个短字符串，整树解析 100~500KB 的 body 是纯浪费（线上占 chat CPU ~19%）。
+var bodyParses atomic.Int64
+
+// ParseCount 返回本包累计的整树解析次数（供测试与面板观测）。
+func ParseCount() int64 { return bodyParses.Load() }
+
+// ResetParseCount 归零计数（供测试）。
+func ResetParseCount() { bodyParses.Store(0) }

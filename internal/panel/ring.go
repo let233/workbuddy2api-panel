@@ -1,0 +1,249 @@
+// ring.go 固定容量的结构化日志环形缓冲（并发安全，实现 io.Writer）。
+// main 把 log 包输出与 chat 表格日志经 MultiWriter 镜像进来，面板
+// /panel/api/logs 读取快照；每个频道独立限额，任务日志可原子落盘。
+//
+// 每行入环时按前缀规则归类频道（chat=对话请求表格行 / task=任务动作 /
+// sys=系统与其它），面板日志视图按频道筛选——对话流量大时任务结果不被冲掉。
+package panel
+
+import (
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/store"
+)
+
+// 日志频道。
+const (
+	ChChat = "chat"
+	ChTask = "task"
+	ChSys  = "sys"
+)
+
+// LogEntry 单条日志（时间戳取写入时刻；log 包行的行首日期时间已被剥离）。
+//
+// Seq 是环形缓冲内的**单调序号**（随写入递增，淘汰不回退；初值取启动时刻的
+// 毫秒数，使跨进程重启也保持单调）。增量拉取
+// 必须用它做游标，不能用 TS：
+//   - time.Now() 的精度不足以保证唯一。Windows 上实测相邻 Write 落在同一
+//     ~15.6ms 时钟刻度内，TS 完全相同（一次 Write 的多行、以及背靠背的多次
+//     Write 都是）；Linux 上纳秒精度好些但同样不保证。
+//   - 用 TS 做游标时，客户端只能拿到毫秒（JS Date）或全精度（原始串）两种形态；
+//     无论哪种，「同一 TS 的多条」都无法部分推进——要么重复返回，要么整批漏掉。
+//
+// 序号没有这个问题：`Seq > since_seq` 精确表达「这一批里的哪些还没给你」。
+type LogEntry struct {
+	TS   time.Time `json:"ts"`
+	Seq  uint64    `json:"seq"`
+	Ch   string    `json:"ch"`
+	Text string    `json:"text"`
+}
+
+// taskPrefixes 任务动作日志的行首标识（scheduler 与 panel 的既有口径）。
+var taskPrefixes = []string{
+	"streak-bonus ", "travel ", "lottery ",
+	"checkin ", "activity ", "keepalive ", "balance ", "user-resource ",
+	"panel: 任务", "panel: 一键", "panel: checkin", "panel: 手动",
+	"panel: 队列", "panel: task ", "panel: 接受任务", "panel: 定时成长",
+}
+
+// tsPrefixRe log 包默认 flags（日期 时间）产生的行首时间戳。
+var tsPrefixRe = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} `)
+
+// classifyLine 按行首特征归类频道。
+func classifyLine(line string) string {
+	if strings.HasPrefix(line, "| #") { // chat 表格日志（server/logging.go logChatRow）
+		return ChChat
+	}
+	for _, p := range taskPrefixes {
+		if strings.HasPrefix(line, p) {
+			return ChTask
+		}
+	}
+	return ChSys
+}
+
+// Ring 日志环形缓冲。
+type Ring struct {
+	mu           sync.Mutex
+	entries      []LogEntry
+	seq          uint64
+	cap          int
+	db           *store.Store
+	archiveError string
+	// store 全频道按自然日落库（见 logstore.go）。nil = 未启用（纯内存）。
+	store *LogStore
+}
+
+// SetLogStore 挂上落库存储，并用它回填最近日志。
+//
+// 回填来源特意取 store 而不是 taskArchive：那张表只有任务频道、只留 500 条、
+// 跨天即丢，重启后「昨天的 chat 行」它给不了。store 可用即由它接管，taskArchive
+// 退化为未连接数据库（NewLogStore 返回 nil）时的兜底（见 main 的装配）。
+func (r *Ring) SetLogStore(store *LogStore) error {
+	r.mu.Lock()
+	r.store = store
+	// 回填期间不能持锁调用 store 的读（store 内部也有锁，且要 Flush），先取数据。
+	r.mu.Unlock()
+	if store == nil {
+		return nil
+	}
+	back := store.Backfill(0)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, entry := range back {
+		entry.Text = boundedLogText(entry.Text)
+		r.appendLocked(entry)
+	}
+	sort.SliceStable(r.entries, func(i, j int) bool { return r.entries[i].TS.Before(r.entries[j].TS) })
+	return nil
+}
+
+// CurrentLogStore 当前挂着的落库存储（nil = 未启用，退化为任务归档/纯内存）。
+// 热切换面板日志落库时用它判断「要不要新建」。
+func (r *Ring) CurrentLogStore() *LogStore {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.store
+}
+
+// NewRing 构建每频道容量为 capacity 的日志环（非正值回退 500）。
+//
+// seq 的起点取**当前时间戳的毫秒数**，不是 0：序号要在进程重启后仍然单调，
+// 否则浏览器里残留的旧游标（重启前 seq 可能已到几万）会大于新进程的序号，
+// `?since_seq=` 一直返回空，「运行日志」页空白最长要到游标老化（5 分钟）才恢复。
+// 用时间做纪元后，重启前的游标必然小于重启后写入的任何序号。
+func NewRing(capacity int) *Ring {
+	if capacity <= 0 {
+		capacity = 500
+	}
+	return &Ring{cap: capacity, seq: uint64(time.Now().UnixMilli())}
+}
+
+// SetTaskArchive 恢复并持久化任务频道的最近日志（数据库 task_logs 表）。
+// 表空是正常首启。在连接 log 输出之前调用；db 为 nil 时退化为纯内存。
+// 移植上游 PR #104（原先是 task-logs.json）。
+func (r *Ring) SetTaskArchive(db *store.Store) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.db = db
+	if db == nil {
+		return nil
+	}
+	var rows []taskLogRow
+	if err := db.DB().Where("ch = ?", ChTask).Order("id DESC").Limit(r.cap).Find(&rows).Error; err != nil {
+		r.archiveError = err.Error()
+		return fmt.Errorf("read task log archive: %w", err)
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		entry := rows[i].entry()
+		if entry.Text == "" {
+			continue
+		}
+		entry.Text = boundedLogText(entry.Text)
+		r.appendLocked(entry)
+	}
+	sort.SliceStable(r.entries, func(i, j int) bool { return r.entries[i].TS.Before(r.entries[j].TS) })
+	r.archiveError = ""
+	return nil
+}
+
+// ArchiveError 供面板反馈写盘故障，日志写失败不阻塞/破坏模型请求。
+func (r *Ring) ArchiveError() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.archiveError
+}
+
+// boundedLogText 超长行截断到 4096 个字符（含恢复路径：防历史文件拖垮面板）。
+func boundedLogText(text string) string {
+	const maxRunes = 4096
+	if len(text) <= maxRunes {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return text
+}
+
+// appendLocked 入环并按**同频道**计数淘汰最旧行（频道互不挤占）。
+func (r *Ring) appendLocked(entry LogEntry) {
+	// 序号在锁内递增：即使 TS 相同（同一时钟刻度内的多次写入），每行也唯一。
+	r.seq++
+	entry.Seq = r.seq
+	r.entries = append(r.entries, entry)
+	count, first := 0, -1
+	for i, e := range r.entries {
+		if e.Ch != entry.Ch {
+			continue
+		}
+		count++
+		if first == -1 {
+			first = i
+		}
+	}
+	if count > r.cap {
+		r.entries = append(r.entries[:first], r.entries[first+1:]...)
+	}
+}
+
+// persistTasksLocked 把任务频道整体写入 task_logs（同旧整文件覆写语义；失败只记 archiveError）。
+func (r *Ring) persistTasksLocked() {
+	if r.db == nil {
+		return
+	}
+	tasks := make([]taskLogRow, 0, r.cap)
+	for _, entry := range r.entries {
+		if entry.Ch == ChTask {
+			tasks = append(tasks, rowOfEntry(entry))
+		}
+	}
+	if err := store.ReplaceAll(r.db, tasks); err != nil {
+		r.archiveError = err.Error()
+	} else {
+		r.archiveError = ""
+	}
+}
+
+// Write 按 \n 切分入环（实现 io.Writer）。频道互不淘汰，任务结果独立保存。
+func (r *Ring) Write(p []byte) (int, error) {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	taskChanged := false
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\r\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		text := boundedLogText(tsPrefixRe.ReplaceAllString(line, ""))
+		channel := classifyLine(text)
+		entry := LogEntry{TS: now, Ch: channel, Text: text}
+		r.appendLocked(entry)
+		// 落盘在**锁内**做：与既有 persistTasksLocked 同款取舍——同一把锁保证
+		// 「入环顺序 = 文件顺序」，swap 出去写会让两条并发日志在文件里倒序，
+		// 事故复盘时按时间读就错位了。
+		if r.store != nil {
+			r.store.Append(entry)
+		}
+		taskChanged = taskChanged || channel == ChTask
+	}
+	if taskChanged {
+		r.persistTasksLocked()
+	}
+	return len(p), nil
+}
+
+// Snapshot 按写入顺序返回缓冲内全部条目（拷贝，调用方可安全持有）。
+func (r *Ring) Snapshot() []LogEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]LogEntry, len(r.entries))
+	copy(out, r.entries)
+	return out
+}

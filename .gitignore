@@ -1,0 +1,65 @@
+# Auth & secrets
+auths/
+data/
+*.key
+*.pem
+*.env
+.env
+.env.*
+
+# Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
+/login
+/credit
+/wb2api
+/signin_bin
+
+# Config with secrets (use config.example.json)
+config.json
+API_KEY.txt
+
+# Build artifacts
+*.tmp
+__pycache__/
+
+# Backups (contains auth tokens)
+backups/
+
+# IDE
+.idea/
+.vscode/
+LOOP.md
+PLAN.md
+SPEC.md
+docs/
+
+# 设计/计划文档（但 README.md 必须进版本库）
+*.md
+!README.md
+!AGENTS.md
+# AGENTS 之外唯一要进库的 md：装进 CI Hermes 的技能（AutoBot 写 PR 正文时读它）
+!.github/autobot-skills/**/*.md
+
+# Windows binaries
+/wb2api.exe
+/login.exe
+/credit.exe
+
+# 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
+/cmd/desktopverify*/
+# 抓包取证脚本与原始报文（issue #51 等）；结论写进 issue，不进仓库
+/capture/
+*.zip
+server.exe
+
+# 编译产物（16MB 误提交过一次，20261021）
+/server
+/app.toml
+
+# Local build artifacts (local-45/build.sh 的产物，不进仓库)
+/local-45/dist/
+
+# 数据库（默认 SQLite 落在 data/ 下，已随 data/ 忽略；这里兜住自定义 DSN 与外键/回滚日志）
+*.db
+*.db-shm
+*.db-wal
+*.imported
