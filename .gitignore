@@ -36,8 +36,11 @@ docs/
 *.md
 !README.md
 !AGENTS.md
-# AGENTS 之外唯一要进库的 md：装进 CI Hermes 的技能（AutoBot 写 PR 正文时读它）
+# AGENTS 之外要进库的 md：
+# 1) 装进 CI Hermes 的技能（AutoBot 写 PR 正文时读它）
 !.github/autobot-skills/**/*.md
+# 2) 被 go:embed 打进二进制的提示词（漏了它本地能编、CI 与 Docker 全红）
+!internal/prompt/defaultprompt.md
 
 # Windows binaries
 /wb2api.exe
