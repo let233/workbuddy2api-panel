@@ -324,6 +324,7 @@ input[type="checkbox"], input[type="radio"] { width: 15px; height: 15px; accent-
   box-shadow: var(--shadow);
   animation: pop-in 0.16s var(--ease);
 }
+.modal:focus { outline: none; }
 .modal.wide { width: min(980px, 100%); }
 .modal.narrow { width: min(440px, 100%); }
 .modal > header {

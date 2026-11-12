@@ -2,6 +2,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -256,6 +257,23 @@ export function Tabs<T extends string>({
 
 // ---------- 弹层 ----------
 
+// 弹层可以叠着开（例如初始密码提示压在页面弹层上），滚动锁定必须计数，
+// 否则关掉其中一个就把 body 解锁，底下的页面会跟着滚。
+let bodyLockCount = 0
+let bodyLockOriginal = ''
+function lockBodyScroll() {
+  if (bodyLockCount === 0) {
+    bodyLockOriginal = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+  }
+  bodyLockCount += 1
+}
+function unlockBodyScroll() {
+  if (bodyLockCount === 0) return
+  bodyLockCount -= 1
+  if (bodyLockCount === 0) document.body.style.overflow = bodyLockOriginal
+}
+
 export function Modal({
   open,
   title,
@@ -264,7 +282,7 @@ export function Modal({
   footer,
   wide = false,
   narrow = false,
-  labelId = 'modal-title',
+  titleId: titleIdProp,
 }: {
   open: boolean
   title?: ReactNode
@@ -273,31 +291,47 @@ export function Modal({
   footer?: ReactNode
   wide?: boolean
   narrow?: boolean
-  labelId?: string
+  titleId?: string
 }) {
   const panelRef = useRef<HTMLDivElement>(null)
+  const autoId = useId()
+  const titleId = titleIdProp ?? 'modal-' + autoId.replace(/:/g, '')
+  // onClose 是调用方每次渲染都会新建的函数，不能进下面的依赖数组：
+  // 否则每敲一个字符（受控输入 setState → 重渲染 → onClose 换身份）就会重跑一次
+  // 副作用，把焦点的“30ms 后自动聚焦”重新排一遍，于是焦点被抢到 ✕ 上。
+  const closeRef = useRef(onClose)
+  useEffect(() => {
+    closeRef.current = onClose
+  })
 
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation()
-        onClose()
+        closeRef.current()
       }
     }
     document.addEventListener('keydown', onKey)
-    const prev = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
+    lockBodyScroll()
+    // 只在“打开”这一瞬间聚焦一次，且优先落在表单控件上；
+    // 没有表单控件时聚焦面板本身（tabIndex=-1），绝不退化成聚焦关闭按钮。
     const t = window.setTimeout(() => {
-      const el = panelRef.current?.querySelector<HTMLElement>('input, select, textarea, button')
-      el?.focus()
+      const panel = panelRef.current
+      if (!panel || panel.contains(document.activeElement)) return
+      const field =
+        panel.querySelector<HTMLElement>(
+          'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([disabled])',
+        ) ??
+        panel.querySelector<HTMLElement>('select:not([disabled]), textarea:not([disabled])')
+      ;(field ?? panel).focus({ preventScroll: true })
     }, 30)
     return () => {
       document.removeEventListener('keydown', onKey)
-      document.body.style.overflow = prev
+      unlockBodyScroll()
       window.clearTimeout(t)
     }
-  }, [open, onClose])
+  }, [open])
 
   if (!open) return null
   return createPortal(
@@ -312,11 +346,12 @@ export function Modal({
         className={'modal' + (wide ? ' wide' : '') + (narrow ? ' narrow' : '')}
         role="dialog"
         aria-modal="true"
-        aria-labelledby={title ? labelId : undefined}
+        aria-labelledby={title ? titleId : undefined}
+        tabIndex={-1}
       >
         {title !== undefined && (
           <header>
-            <h2 id={labelId} className="h">
+            <h2 id={titleId} className="h">
               {title}
             </h2>
             <button type="button" className="btn ghost icon" onClick={onClose} aria-label="关闭">

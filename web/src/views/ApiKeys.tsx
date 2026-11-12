@@ -962,7 +962,7 @@ export default function ApiKeys() {
         open={form !== null}
         title={form?.id ? '编辑 API Key' : '新建 API Key'}
         onClose={() => setForm(null)}
-        labelId="apikey-form-title"
+        titleId="apikey-form-title"
         wide
         footer={
           <>
@@ -1122,7 +1122,7 @@ export default function ApiKeys() {
         open={tplForm !== null}
         title={tplForm?.id ? '编辑模板' : '新建模板'}
         onClose={() => setTplForm(null)}
-        labelId="apikey-tpl-title"
+        titleId="apikey-tpl-title"
         wide
         footer={
           <>
@@ -1220,7 +1220,7 @@ export default function ApiKeys() {
         open={created !== null}
         title="Key 已创建"
         onClose={() => setCreated(null)}
-        labelId="apikey-created-title"
+        titleId="apikey-created-title"
         footer={
           <button type="button" className="btn primary" onClick={() => setCreated(null)}>
             我已保存

@@ -151,6 +151,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [menu, setMenu] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
   const [pwOpen, setPwOpen] = useState(false)
+  // 初始密码提示只做“每次打开页面提示一次”：关掉后本次会话不再弹，
+  // 刷新页面组件重新挂载 → 状态归零 → 再次提示。故意不写 localStorage。
+  const [pwDeferred, setPwDeferred] = useState(false)
 
   // 路由变化时收起抽屉与菜单
   useEffect(() => {
@@ -346,15 +349,19 @@ export function AppShell({ children }: { children: ReactNode }) {
       </div>
 
       <PasswordModal
-        open={pwOpen || session.mustChange}
+        open={pwOpen || (session.mustChange && !pwDeferred)}
         forced={session.mustChange}
-        onClose={() => setPwOpen(false)}
+        onClose={() => {
+          setPwOpen(false)
+          if (session.mustChange) setPwDeferred(true)
+        }}
       />
     </div>
   )
 }
 
-// 密码修改弹层：初始密码未改时强制弹出（forced），改完才能继续用。
+// 密码修改弹层：初始密码未改时自动弹出（forced），但允许关闭，
+// 关闭后本次会话不再打扰，刷新页面会再次提示。账号菜单里也能随时重开。
 function PasswordModal({ open, forced, onClose }: { open: boolean; forced: boolean; onClose: () => void }) {
   const { changePassword } = useSession()
   const [oldPw, setOldPw] = useState('')
@@ -396,18 +403,14 @@ function PasswordModal({ open, forced, onClose }: { open: boolean; forced: boole
   return (
     <Modal
       open={open}
-      title={forced ? '请先修改初始密码' : '修改密码'}
-      onClose={() => {
-        if (!forced) onClose()
-      }}
+      title={forced ? '建议修改初始密码' : '修改密码'}
+      onClose={onClose}
       narrow
       footer={
         <>
-          {!forced && (
-            <button type="button" className="btn ghost" onClick={onClose} disabled={busy}>
-              取消
-            </button>
-          )}
+          <button type="button" className="btn ghost" onClick={onClose} disabled={busy}>
+            {forced ? '稍后修改' : '取消'}
+          </button>
           <button type="button" className="btn primary" onClick={submit} disabled={busy}>
             {busy ? '提交中…' : '确认修改'}
           </button>
@@ -415,7 +418,11 @@ function PasswordModal({ open, forced, onClose }: { open: boolean; forced: boole
       }
     >
       <div className="stack">
-        {forced && <p className="small warn-text">当前账号还在使用初始密码，修改后才能继续使用面板。</p>}
+        {forced && (
+          <p className="small warn-text">
+            当前账号仍在使用初始密码，建议立即修改。可以稍后再改，刷新页面时会再次提示。
+          </p>
+        )}
         <Field label="当前密码" htmlFor="pw-old">
           <input id="pw-old" className="input" type="password" value={oldPw} autoComplete="current-password" onChange={(e) => setOldPw(e.target.value)} />
         </Field>
