@@ -13,11 +13,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------- 配置校验
@@ -184,6 +186,86 @@ func TestConfigureSwitchesChannelHot(t *testing.T) {
 	m.Configure(Settings{AutoEnabled: true, AutoTime: "04:00", Mirror: "ghfast.top"})
 	if got := m.Status(); got.Mirror != "https://ghfast.top/" {
 		t.Fatalf("非法镜像覆盖了生效值：%+v", got)
+	}
+}
+
+// TLS 握手预算不能是 Go 默认的 10s：现场报的是 net/http: TLS handshake timeout，
+// 跨境链路被干扰时握手常在 10~20s 才完成。这里钉住「比默认宽」这个事实，避免有人
+// 顺手把它删回零值（零值 = 用回 10s 默认，报障会原地复发）。
+func TestTransportTLSHandshakeBudget(t *testing.T) {
+	m := New("dev", "o/r", "", Settings{ProxyFromEnv: false})
+	if got := m.transport().TLSHandshakeTimeout; got != tlsHandshakeBudget {
+		t.Fatalf("TLSHandshakeTimeout=%s want %s", got, tlsHandshakeBudget)
+	}
+	if tlsHandshakeBudget <= 10*time.Second {
+		t.Fatalf("握手预算 %s 不得小于等于 Go 默认 10s", tlsHandshakeBudget)
+	}
+	if metadataRequestTimeout <= tlsHandshakeBudget {
+		t.Fatalf("元数据整体超时 %s 必须大于握手预算 %s，否则放宽的握手预算会被 Client.Timeout 吃掉",
+			metadataRequestTimeout, tlsHandshakeBudget)
+	}
+}
+
+// 跳过证书校验是应急开关：默认必须关、必须能关回去、且绝不能污染
+// http.DefaultTransport（全进程共用，改了会连上游对话一起变不安全）。
+func TestTransportInsecureTLSOptIn(t *testing.T) {
+	m := New("dev", "o/r", "", Settings{ProxyFromEnv: false})
+	if tr := m.transport(); tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("默认配置不得跳过证书校验")
+	}
+	if m.Status().InsecureTLS {
+		t.Fatal("默认 status.insecure_tls 应为 false")
+	}
+
+	m.Configure(Settings{ProxyFromEnv: false, InsecureTLS: true})
+	tr := m.transport()
+	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("insecure_tls=true 时未跳过证书校验")
+	}
+	if !m.Status().InsecureTLS {
+		t.Fatal("status.insecure_tls 未随设置生效（面板要看得见）")
+	}
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base.TLSClientConfig != nil && base.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("跳过证书校验污染了 http.DefaultTransport")
+	}
+
+	m.Configure(Settings{ProxyFromEnv: false})
+	if tr := m.transport(); tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("关闭后仍跳过证书校验")
+	}
+	if m.Status().InsecureTLS {
+		t.Fatal("关闭后 status.insecure_tls 仍为 true")
+	}
+}
+
+// 端到端：自签证书的「GitHub」默认必须查不动（归因 tls），开了 insecure_tls
+// 才能查到。这条用例把「开关真的作用在请求路径上」和失败归因绑在一起看——
+// 只测 transport 字段的话，fetchReleases 哪天绕过 httpClient 也不会红。
+func TestFetchReleasesInsecureTLSWithSelfSignedCert(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "[]")
+	}))
+	defer srv.Close()
+
+	m := New("dev", "o/r", "", Settings{ProxyFromEnv: false})
+	m.apiBaseURL = srv.URL
+
+	if _, err := m.fetchReleases(context.Background()); err == nil {
+		t.Fatal("自签证书在默认配置下必须失败")
+	}
+	if kind := m.Status().LastErrorKind; kind != kindTLS {
+		t.Fatalf("自签证书应归因 %s，实际 %q", kindTLS, kind)
+	}
+
+	// 应急开关：同一条请求必须能通。
+	m.Configure(Settings{ProxyFromEnv: false, InsecureTLS: true})
+	releases, err := m.fetchReleases(context.Background())
+	if err != nil {
+		t.Fatalf("insecure_tls=true 后仍失败: %v", err)
+	}
+	if len(releases) != 0 {
+		t.Fatalf("releases=%v want 空", releases)
 	}
 }
 
