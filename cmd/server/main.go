@@ -501,6 +501,7 @@ func main() {
 		Version:          appVersion,
 		Updater:          updateManager,
 		PollIntervalSec:  cfg.Panel.PollIntervalSec,
+		PublicDir:        cfg.Panel.PublicDir,
 		Live:             live,
 		ConfigPath:       *cfgPath,
 		LoadConfig: func() (any, error) {

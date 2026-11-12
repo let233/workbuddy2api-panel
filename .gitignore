@@ -41,6 +41,8 @@ docs/
 !.github/autobot-skills/**/*.md
 # 2) 被 go:embed 打进二进制的提示词（漏了它本地能编、CI 与 Docker 全红）
 !internal/prompt/defaultprompt.md
+# 3) 前端开发约定（给改 web/ 的人看，必须进库）
+!web/CONVENTIONS.md
 
 # Windows binaries
 /wb2api.exe
@@ -60,6 +62,13 @@ server.exe
 
 # Local build artifacts (local-45/build.sh 的产物，不进仓库)
 /local-45/dist/
+
+# 前端（React + Vite，见 web/）：依赖与构建产物都不入库。
+# public/ 是 vite build 的输出目录，由 Go 侧映射成 /panel/ 静态资源；
+# Docker 与 CI 都会现构建，仓库里只保留源码。
+web/node_modules/
+web/.vite/
+/public/
 
 # 数据库（默认 SQLite 落在 data/ 下，已随 data/ 忽略；这里兜住自定义 DSN 与外键/回滚日志）
 *.db

@@ -1,71 +1,40 @@
 // index.go 面板静态资源与安全响应头。
 //
-// 资源经 go:embed 打进二进制（随服务部署，无外部构建步骤）：
-//   - index.html  页面骨架
-//   - theme.js    首屏主题预热（<head> 同步加载，早于样式表）
-//   - app.js      全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
+// 前端是独立的 React 应用（web/，Vite 构建），产物输出到仓库根的 public/。运行时
+// 这里把 public/ 整个目录映射到 /panel/ 下——**不再 go:embed**。取舍：
+//   - 换前端只需替换 public/，二进制不动（容器里重新挂载即可，不必重建镜像）；
+//   - 构建产物带内容 hash、体积大，打进二进制只会让二进制虚胖、每次改动都触发
+//     全量重新编译；
+//   - 代价是部署必须带上前端产物：目录里没有 index.html 时这里回一个可读的
+//     说明页（提示先构建），而不是空白 404。
 //
-// 安全头对"面板页面与全部 /panel/api/* 响应"统一生效：CSP 限制脚本只能来自本服务，
-// 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露 Referer 出去。
+// 安全头对「面板页面、静态资源与全部 /panel/api/* 响应」统一生效（见 ServeHTTP）：
+// CSP 限制脚本只能来自本服务，禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，
+// 并声明不泄露 Referer 出去。
 package panel
 
 import (
-	"crypto/sha256"
-	_ "embed"
-	"encoding/hex"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
-//go:embed index.html
-var indexHTMLRaw []byte
-
-//go:embed theme.js
-var themeJS []byte
-
-//go:embed app.js
-var appJS []byte
-
-// 内容指纹（issue #33）：把脚本 URL 绑到脚本内容上。
-//
-// 为什么需要：面板原先靠 `Cache-Control: no-store` 保证不拿到旧脚本，那是对
-// 浏览器的一维约定；中间任何一层（反代缓存、浏览器扩展、企业网关的静态资源
-// 缓存、离线缓存）只要回放了一次旧 app.js，新 HTML 配旧 JS 就会因 DOM 结构
-// 漂移而中途抛异常，后半段的 let/const 不再执行——表现为「账号列表能刷新，
-// 积分构成/用量初始化失败」（#33 报告者受控复现的正是这一形态）。
-// 加性防御：no-store 原样保留，URL 另带内容指纹，跨版本时 URL 必然不同，
-// 旧条目即使被回放也命不中新页面要的那个 key。
-//
-// 取 sha256 前 8 字节（16 个十六进制字符）：够用（碰撞概率对「两版面板脚本」
-// 这种量级毫无意义），又不至于把 URL 撑长。指纹在服务进程启动时算一次
-// （init），进程内恒定，无需清理策略，也不依赖构建注入。
-func fingerprint(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:8])
-}
-
-// indexHTML 是把 <script src="theme.js"> / <script src="app.js"> 换成带指纹
-// URL 之后的页面字节。原始 index.html 里的引用保持无查询串形态（源码可读、
-// diff 干净），指纹只在运行时注入。
-var indexHTML = func() []byte {
-	s := strings.ReplaceAll(string(indexHTMLRaw), `src="theme.js"`, `src="theme.js?v=`+fingerprint(themeJS)+`"`)
-	s = strings.ReplaceAll(s, `src="app.js"`, `src="app.js?v=`+fingerprint(appJS)+`"`)
-	return []byte(s)
-}()
-
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
-//   - script-src 'self'         只跑同源脚本（app.js）；页面无内联事件处理器/内联脚本
+//   - script-src 'self'         只跑同源脚本（Vite 产物 /assets/*.js）
 //   - style-src 'self' 'unsafe-inline'
-//     style 的内联是设计取舍：页面有少量 style="..." 属性（进度条宽度、表格列宽），
+//     style 的内联是设计取舍：React 组件会给进度条宽度、图表尺寸写 style="..." 属性，
 //     允许内联样式不会导致脚本执行；仍禁止外部样式域与 @import 外链。
 //   - connect-src 'self'        前端 fetch 只能打本服务
-//   - img-src 'self' data:      图标/内联图
+//   - img-src 'self' data:      图标/内联图（QR 码是 data: SVG）
+//   - font-src 'self' data:     万一将来引入 self-host 字体，不必再改 CSP
 //   - form-action 'none'        页面无表单提交目标（配置页是 JS 提交）
 //   - frame-ancestors 'none'    禁止被任何站点 iframe 嵌套（点击劫持）
 //   - base-uri 'none'          禁止注入 <base> 改写相对路径
 const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-	"connect-src 'self'; img-src 'self' data:; form-action 'none'; " +
+	"connect-src 'self'; img-src 'self' data:; font-src 'self' data:; form-action 'none'; " +
 	"frame-ancestors 'none'; base-uri 'none'"
 
 // setSecurityHeaders 写入面板统一安全响应头（页面与 API 都要，API 也含 JSON 数据）。
@@ -78,32 +47,61 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
-// index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
-func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+// staticDir 前端产物目录的绝对路径（Config.PublicDir，缺省 ./public）。
+func (p *Panel) staticDir() string {
+	dir := p.cfg.PublicDir
+	if dir == "" {
+		dir = "public"
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
 }
 
-// themeScript 输出首屏主题预热脚本。
+// missingIndexHint 产物缺失时的说明页。刻意是 200 + 纯文本：面板打不开时运维第一
+// 反应是「服务坏了」，这里直接把真实原因和修法写在页面上。
+func missingIndexHint(dir string) string {
+	return "前端产物未找到：" + filepath.Join(dir, "index.html") + "\n\n" +
+		"面板前端已改为独立的 React 应用（web/），需要先构建再启动：\n" +
+		"  npm --prefix web install\n" +
+		"  npm --prefix web run build   # 产物输出到 public/\n\n" +
+		"Docker 镜像已包含构建阶段，无需手动构建；\n" +
+		"若自定义了目录，请检查 config.json 的 panel.public_dir。\n"
+}
+
+// staticHandler 把 public/ 映射到 /panel/。
 //
-// 它必须被 <head> 以同步外链方式加载（CSP 禁内联）：晚于样式表就回到「刷新先闪深色」，
-// 因为用户的明暗偏好只存在浏览器 localStorage 里，服务端无从得知。
-func (p *Panel) themeScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(themeJS)
-}
-
-// appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
-func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+// 缓存策略按 Vite 的产物约定：
+//   - index.html（引用带 hash 的资源）必须 no-store，否则新页面配旧资源；
+//   - /assets/* 文件名含内容 hash，可以 immutable 长缓存；
+//   - 其余（favicon 等）用 no-cache 走 304 校验。
+//
+// SPA 用 hash 路由（#/accounts），没有路径路由，所以不需要 history fallback：
+// 未知路径就是真的不存在，交给 FileServer 回 404。
+func (p *Panel) staticHandler() http.Handler {
+	dir := p.staticDir()
+	files := http.StripPrefix("/panel", http.FileServer(http.Dir(dir)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rel := strings.TrimPrefix(r.URL.Path, "/panel")
+		switch {
+		case rel == "" || rel == "/" || rel == "/index.html":
+			w.Header().Set("Cache-Control", "no-store")
+		case strings.HasPrefix(rel, "/assets/"):
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		default:
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		// 入口页不存在 = 没构建过前端：给说明页，别让 FileServer 回 404 纯文本。
+		if rel == "" || rel == "/" || rel == "/index.html" {
+			if st, err := os.Stat(filepath.Join(dir, "index.html")); err != nil || st.IsDir() {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, missingIndexHint(dir))
+				return
+			}
+		}
+		files.ServeHTTP(w, r)
+	})
 }

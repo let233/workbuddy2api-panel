@@ -18,7 +18,7 @@ import (
 // 注意 Ring 的 TS 是**写入时刻**（不是日志行里的时间戳），所以增量判据用
 // 「写入时刻晚于 since」——多条日志同一批写入时时间戳相同，此时 since 取的是
 // 上一批最后一条的 ts，同批的条目靠「>」判定会被漏掉。
-// 这正是前端用「已见到的最大 ts + 同一批兜底」策略的原因（见 app.js 的 logSinceTs）。
+// 这正是前端用「已见到的最大 ts + 同一批兜底」策略的原因（见 web/ 里的 logSinceTs）。
 // 本测试用「分批写入 + 显式 sleep」构造可区分的时间戳。
 func TestLogsHandlerSinceIncremental(t *testing.T) {
 	p := New(Config{Version: "test"})

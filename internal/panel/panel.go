@@ -3,7 +3,9 @@
 // 签到/保活，以及运行日志环形缓冲（镜像 log 包与 chat 表格日志）。
 //
 // 设计约束：
-//   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
+//   - 前端是 web/ 下的 React（Vite）工程，构建产物落到仓库根 public/，运行时由
+//     index.go 的 staticHandler 直接把该目录映射到 /panel/。前端不进二进制：
+//     换界面只替换 public/，不用重新编译 Go；
 //   - 鉴权是账号密码登录（internal/panelauth，会话 Cookie），与网关的客户端 Key
 //     完全分离：面板 API 只认会话，网关只认 Key。HTML/CSS/JS 本身无秘密，可匿名加载；
 //   - 不改写既有池语义：所有运维操作落到 pool 已有入口（Revive/Disable/Remove...），
@@ -64,6 +66,11 @@ type Config struct {
 	// 时，把间隔调大（乃至关闭）能显著降低浏览器与服务端的负担。透出到
 	// /panel/api/overview 由前端读取。
 	PollIntervalSec int
+
+	// PublicDir 前端构建产物目录（web/ 经 vite build 输出到 public/）。空 = 当前
+	// 工作目录下的 public。运行时整个目录被映射到 /panel/（见 index.go），不再
+	// go:embed——换前端只替换目录，二进制不动。缺失时面板回一个说明页提示先构建。
+	PublicDir string
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -281,9 +288,9 @@ func New(cfg Config) *Panel {
 func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
-	p.mux.HandleFunc("GET /panel/{$}", p.index)
-	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
-	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	// 前端静态资源：public/ 整目录映射到 /panel/（React 产物）。
+	// 注册子树模式后 ServeMux 会自动把 /panel 重定向到 /panel/。
+	p.mux.Handle("GET /panel/", p.staticHandler())
 	// 登录/会话（默认拒绝的白名单里放行，见 publicPanelPaths）。
 	p.mux.HandleFunc("GET /panel/api/auth/session", p.authSession)
 	p.mux.HandleFunc("POST /panel/api/auth/login", p.authLogin)
@@ -379,12 +386,21 @@ func (p *Panel) routes() {
 // publicPanelPaths 免登录的精确路径：静态页面与脚本本身不含秘密，登录相关接口
 // 自己校验凭据（登录前当然没有会话）。其余 /panel/api/* 一律要会话。
 var publicPanelPaths = map[string]struct{}{
-	"/panel/":                 {},
-	"/panel/theme.js":         {},
-	"/panel/app.js":           {},
 	"/panel/api/auth/session": {},
 	"/panel/api/auth/login":   {},
 	"/panel/api/auth/logout":  {},
+}
+
+// requireSession 判断该路径是否要求面板会话。
+//
+// 方向刻意是「/panel/api/* 默认要会话」：页面与静态资源（/panel/、/panel/assets/*）
+// 本身不含秘密，登录页也要先能加载脚本；API 里只有登录相关几条免会话。这样新增
+// 一条 API 忘记登记，失效方向是 401（看得见），而不是静默公开。
+func requireSession(path string) bool {
+	if _, ok := publicPanelPaths[path]; ok {
+		return false
+	}
+	return strings.HasPrefix(path, "/panel/api/")
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -397,18 +413,15 @@ var publicPanelPaths = map[string]struct{}{
 // 会话过期都是下一条请求立即生效，不用等任何轮询周期。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	if _, ok := publicPanelPaths[r.URL.Path]; ok {
+	if !requireSession(r.URL.Path) {
 		p.mux.ServeHTTP(w, r)
 		return
 	}
+	// 走到这里一定是要会话的 /panel/api/*：页面与静态资源已在上面放行，
+	// 由前端自己探 /auth/session 决定显示登录层。所以这里只可能是 API 401。
 	if p.cfg.Users != nil {
 		if _, ok := p.sessionUser(r); !ok {
-			if strings.HasPrefix(r.URL.Path, "/panel/api/") {
-				writeErr(w, http.StatusUnauthorized, "login_required")
-				return
-			}
-			// 页面请求：跳回面板首页（那里会弹出登录层），而不是给一段 401 文本。
-			http.Redirect(w, r, "/panel/", http.StatusFound)
+			writeErr(w, http.StatusUnauthorized, "login_required")
 			return
 		}
 	}

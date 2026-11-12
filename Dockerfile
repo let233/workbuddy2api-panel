@@ -1,3 +1,18 @@
+# ---------- 前端构建（React + Vite） ----------
+# 前端产物不再打进 Go 二进制：Go 侧运行时把 public/ 目录映射成 /panel/ 静态资源
+# （internal/panel/index.go）。所以镜像里需要这一阶段，输出 public/ 供运行镜像复制。
+FROM node:22-alpine AS web
+WORKDIR /src/web
+# 先只拷依赖清单：源码改动不会让 npm ci 这层缓存失效
+COPY web/package.json web/package-lock.json ./
+# npmmirror：境内构建直连 registry.npmjs.org 经常卡住；境外可用 --build-arg 覆盖。
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+RUN npm ci --no-audit --no-fund --registry=${NPM_REGISTRY}
+COPY web/ ./
+# vite 的 outDir 是 ../public，产物落在 /src/public
+RUN npm run build
+
+# ---------- 后端构建 ----------
 FROM golang:1.26.10-alpine AS build
 # Go module 代理：默认官方源（境外/CI 不多绕一跳）；境内或镜像环境用
 # --build-arg 覆盖，容器内直连 proxy.golang.org 在境内会长时间卡住：
@@ -34,6 +49,8 @@ COPY --from=build /out/wb2api /app/wb2api
 COPY --from=build /out/signin_bin /app/signin_bin
 COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
+# 前端产物：/app/public 由 Go 侧映射到 /panel/（默认 panel.public_dir = ./public）
+COPY --from=web /src/public /app/public
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh

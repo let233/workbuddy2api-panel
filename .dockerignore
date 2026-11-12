@@ -12,6 +12,11 @@ scripts/__pycache__/
 /signin_bin
 # 真实配置不进镜像（镜像默认用 config.example.json，生产以挂载卷覆盖）
 config.json
+# 前端依赖与产物不进构建上下文：产物由上面的 web 阶段现构建，
+# node_modules 有几十万文件，拷进上下文会让 docker build 慢上几十秒
+web/node_modules/
+web/dist/
+public/
 PLAN.md
 SPEC.md
 LOOP.md

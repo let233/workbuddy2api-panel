@@ -1,0 +1,60 @@
+/* tokens.css 设计令牌：沿用原面板的明暗配色，补齐间距/圆角/字号/层级刻度。
+ * 全部组件只吃变量，不写死颜色——换肤只需要覆盖 [data-theme] 下的变量。 */
+:root {
+  --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
+  --line: #262c3a; --line-soft: #1e232e;
+  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
+  --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91, 124, 250, 0.13);
+  --ok: #3ddc97; --ok-soft: rgba(61, 220, 151, 0.12);
+  --warn: #f5b544; --warn-soft: rgba(245, 181, 68, 0.12);
+  --bad: #f0655f; --bad-soft: rgba(240, 101, 95, 0.12);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  --overlay: rgba(6, 8, 12, 0.62);
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* auto 模式的首帧：data-theme 还没被 JS 写上去时跟随系统（与下方 light 块保持同步）。
+ * 没有这段，浅色系统用户会先看到一帧深色再翻成浅色。 */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
+    --line: #e2e5ec; --line-soft: #eceef3;
+    --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
+    --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61, 95, 224, 0.09);
+    --ok: #0f9d63; --ok-soft: rgba(15, 157, 99, 0.1);
+    --warn: #b47611; --warn-soft: rgba(180, 118, 17, 0.11);
+    --bad: #cf3b34; --bad-soft: rgba(207, 59, 52, 0.09);
+    --shadow: 0 1px 2px rgba(16, 20, 32, 0.06), 0 8px 24px -14px rgba(16, 20, 32, 0.14);
+    --overlay: rgba(16, 20, 32, 0.4);
+  }
+}
+
+[data-theme="light"] {
+  --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
+  --line: #e2e5ec; --line-soft: #eceef3;
+  --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
+  --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61, 95, 224, 0.09);
+  --ok: #0f9d63; --ok-soft: rgba(15, 157, 99, 0.1);
+  --warn: #b47611; --warn-soft: rgba(180, 118, 17, 0.11);
+  --bad: #cf3b34; --bad-soft: rgba(207, 59, 52, 0.09);
+  --shadow: 0 1px 2px rgba(16, 20, 32, 0.06), 0 8px 24px -14px rgba(16, 20, 32, 0.14);
+  --overlay: rgba(16, 20, 32, 0.4);
+}
+
+:root {
+  /* 间距：4 的倍数，组件内部只用这套 */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px;
+  --sp-6: 24px; --sp-7: 32px; --sp-8: 40px;
+  /* 圆角 */
+  --r-1: 6px; --r-2: 9px; --r-3: 12px; --r-4: 16px; --r-pill: 999px;
+  /* 字号 */
+  --fs-1: 11px; --fs-2: 12px; --fs-3: 13px; --fs-4: 14px; --fs-5: 16px;
+  --fs-6: 20px; --fs-7: 26px; --fs-8: 34px;
+  /* 布局常量 */
+  --nav-w: 232px; --topbar-h: 56px;
+  /* 触摸目标最小高度（移动端可达性） */
+  --hit: 44px;
+  --z-nav: 40; --z-drawer: 60; --z-modal: 80; --z-toast: 100;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+}

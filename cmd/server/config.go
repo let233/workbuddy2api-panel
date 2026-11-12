@@ -51,6 +51,11 @@ type Config struct {
 		// 负值 = 关闭自动刷新（只在手动操作时更新）。账号多、或只是开着面板
 		// 当监控用时，调大间隔能显著降低浏览器与服务端负担。
 		PollIntervalSec int `json:"poll_interval_sec"`
+		// PublicDir 前端构建产物目录（web/ 用 vite build 输出到 public/）。
+		// 空 = 可执行文件的当前工作目录下的 public。二进制不再内嵌前端：换前端
+		// 只替换这个目录，不用重新编译。目录里没有 index.html 时面板会显示一段
+		// 「请先构建前端」的说明页。
+		PublicDir string `json:"public_dir"`
 	} `json:"panel"`
 
 	Update struct {
