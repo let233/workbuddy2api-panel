@@ -121,8 +121,13 @@ func TestContainerInstallReplacesInPlaceAndExecs(t *testing.T) {
 
 	m := New("2026.10.22.1823", "example/project", "", Settings{})
 	m.container = true
+	// 现场固定成「容器 + 可写目录」：CI 的 runner 自己被 systemd 托管
+	// （INVOCATION_ID 非空），不钉住这一位，判断就随构建机环境漂移。
+	m.supervised = false
 	m.executable = target
 	m.execDirWritable = true
+	// New 时算过的状态是「这台机器上跑测试二进制」的快照，改了上面几项要重算。
+	m.refreshInstallStatusLocked()
 	m.client.Transport = testReleaseTransport(t, archive, "2026.10.23.1859")
 
 	executed := make(chan []string, 1)

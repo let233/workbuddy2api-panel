@@ -150,6 +150,11 @@ type Manager struct {
 
 	// container 是否运行在容器里（New 时探测一次，之后不变）。
 	container bool
+	// supervised 是否由服务管理器托管（systemd/s6/launchd/SCM），同样是 New 时
+	// 探测一次的快照。做成字段而不是每次都问环境：判断要能被测试固定住——CI 的
+	// runner 自己就跑在 systemd 下（INVOCATION_ID 非空），每次现问会让
+	// 「能不能原地更新」的用例随构建机环境漂移。
+	supervised bool
 	// execDirWritable 程序目录能否写入（容器内更新要 rename 二进制到这个目录）。
 	execDirWritable bool
 	// reexec 进程内 exec 的实现，默认 reexecSelf；测试可替换以观察调用。
@@ -204,6 +209,7 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		now:        time.Now,
 		settings:   settings,
 		container:  isContainer(),
+		supervised: processSupervised(),
 		reexec:     reexecSelf,
 		status: Status{
 			CurrentVersion: version,

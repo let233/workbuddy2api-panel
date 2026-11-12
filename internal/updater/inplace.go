@@ -78,7 +78,7 @@ func dirWritable(dir string) bool {
 
 // installSupportLocked 是 installSupport 的当前进程快照（调用方可以持锁）。
 func (m *Manager) installSupportLocked() (bool, string) {
-	return installSupport(m.version, runtime.GOOS, runtime.GOARCH, m.executable, m.container, m.execDirWritable, processSupervised())
+	return installSupport(m.version, runtime.GOOS, runtime.GOARCH, m.executable, m.container, m.execDirWritable, m.supervised)
 }
 
 // refreshInstallStatusLocked 重算「能不能装、装法是什么、不能的原因」（调用方须持 m.mu）。
