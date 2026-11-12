@@ -829,6 +829,7 @@ func updateSettingsFrom(u *Config) updater.Settings {
 		Proxy:        u.Update.Proxy,
 		ProxyFromEnv: fromEnv,
 		Mirror:       u.Update.Mirror,
+		InsecureTLS:  u.Update.InsecureTLS,
 	}
 }
 

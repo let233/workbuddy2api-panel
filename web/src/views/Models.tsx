@@ -14,6 +14,7 @@ import {
   Empty,
   KV,
   Segmented,
+  Select,
   Skeleton,
   Stat,
   StatsGrid,
@@ -425,24 +426,22 @@ export default function Models() {
         const value = m.gateway_effort_wanted || m.default_effort || ''
         const off = Boolean(m.can_disable_thinking)
         return (
-          <select
-            className="select sm"
-            aria-label={'设置 ' + m.name + ' 的网关档位'}
+          <Select
+            className="xs"
+            ariaLabel={'设置 ' + m.name + ' 的网关档位'}
             value={value}
             disabled={!m.gateway_policy_enabled || busy === 'effort:' + m.id}
             title={m.gateway_policy_enabled ? '写入 config thinking.model_defaults，下一次出站即生效' : '思考档位策略未开启，先在 Config 打开'}
-            onChange={(e) => {
-              if (e.target.value !== value) setEffort(m, e.target.value)
+            menuMaxHeight={240}
+            options={[
+              ...(value === '' ? [{ value: '', label: '跟随全局' }] : []),
+              ...supports.map((s) => ({ value: s, label: EFFORT_LABEL[s] ?? s })),
+              ...(off ? [{ value: 'off', label: EFFORT_LABEL.off }] : []),
+            ]}
+            onChange={(v) => {
+              if (v !== value) setEffort(m, v)
             }}
-          >
-            {value === '' ? <option value="">跟随全局</option> : null}
-            {supports.map((s) => (
-              <option key={s} value={s}>
-                {EFFORT_LABEL[s] ?? s}
-              </option>
-            ))}
-            {off ? <option value="off">{EFFORT_LABEL.off}</option> : null}
-          </select>
+          />
         )
       },
     },
@@ -633,64 +632,47 @@ export default function Models() {
                 { value: 'global', label: 'global' },
               ]}
             />
-            <select
-              className="select sm"
-              aria-label="按能力筛选"
+            <Select
+              className="xs"
+              ariaLabel="按能力筛选"
               value={cap}
-              onChange={(e) => setCap(e.target.value as CapFilter)}
-            >
-              {CAP_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select sm"
-              aria-label="按档位筛选"
+              onChange={(v) => setCap(v as CapFilter)}
+              options={CAP_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+              menuMaxHeight={260}
+            />
+            <Select
+              className="xs"
+              ariaLabel="按档位筛选"
               value={effortFilter}
-              onChange={(e) => setEffortFilter(e.target.value as EffortFilter)}
-            >
-              {EFFORT_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select sm"
-              aria-label="按优惠筛选"
+              onChange={(v) => setEffortFilter(v as EffortFilter)}
+              options={EFFORT_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+              menuMaxHeight={260}
+            />
+            <Select
+              className="xs"
+              ariaLabel="按优惠筛选"
               value={promo}
-              onChange={(e) => setPromo(e.target.value as PromoFilter)}
-            >
-              {PROMO_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select sm"
-              aria-label="按可见性筛选"
+              onChange={(v) => setPromo(v as PromoFilter)}
+              options={PROMO_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+            />
+            <Select
+              className="xs"
+              ariaLabel="按可见性筛选"
               value={vis}
-              onChange={(e) => setVis(e.target.value as VisFilter)}
-            >
-              <option value="all">全部可见性</option>
-              <option value="shown">可见</option>
-              <option value="hidden">隐藏</option>
-            </select>
-            <select
-              className="select sm"
-              aria-label="排序方式"
+              onChange={(v) => setVis(v as VisFilter)}
+              options={[
+                { value: 'all', label: '全部可见性' },
+                { value: 'shown', label: '可见' },
+                { value: 'hidden', label: '隐藏' },
+              ]}
+            />
+            <Select
+              className="xs"
+              ariaLabel="排序方式"
               value={sort}
-              onChange={(e) => setSort(e.target.value as SortKey)}
-            >
-              {SORT_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+              onChange={(v) => setSort(v as SortKey)}
+              options={SORT_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+            />
             <button
               type="button"
               className="btn ghost sm"

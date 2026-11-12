@@ -26,6 +26,7 @@ type UpdateStatus = {
   container?: boolean
   install_blocked?: string
   install_mode?: string
+  insecure_tls?: boolean
 }
 
 type Overview = {
@@ -91,7 +92,7 @@ const ERROR_KIND_LABEL: Record<string, string> = {
 const ERROR_ADVICE: Record<string, string> = {
   dns: '检查容器 DNS（可用 dns_servers）与出站策略。',
   connect: '出站被拦或网络不可达；可配「更新代理」或「镜像前缀」绕行。',
-  tls: '常见于中间设备劫持或系统 CA 过期；先试镜像。',
+  tls: '握手一直超时说明链路被拦，换代理或镜像（关证书校验救不了）；证书不被信任可临时开「跳过证书校验」。',
   'header-timeout': '出站到 release-assets 很可能被拦（api.github.com 往往仍通）；配代理或镜像即可。',
   'body-stall': '链路抖动或镜像限速；换镜像或配代理。',
   checksum: '下载内容被中间层改写；换回直连或换可信镜像（不要放宽校验）。',
@@ -148,6 +149,14 @@ const UPDATE_FIELDS: UpdateField[] = [
     label: '沿用环境变量代理',
     kind: 'switch',
     hint: '关闭后完全不读 HTTP_PROXY / HTTPS_PROXY，只认上面的「更新代理」',
+  },
+  {
+    path: 'update.insecure_tls',
+    label: '跳过证书校验（应急）',
+    kind: 'switch',
+    hint:
+      '只对「证书不被信任」（自签 / 系统 CA 过期）有效；TLS 握手超时开它没用，那要走代理或镜像。' +
+      '开启期间元数据与下载都不再校验，SHA-256 校验随之失效（摘要来自同一条通道），仅限链路可信的内网部署临时使用',
   },
 ]
 
@@ -318,7 +327,8 @@ export default function About() {
   const channelText = up
     ? (CHANNEL_LABEL[up.channel] ?? up.channel ?? '未知通道') +
       (up.proxy_host ? ' · 代理 ' + up.proxy_host : '') +
-      (up.mirror ? ' · 镜像 ' + up.mirror : '')
+      (up.mirror ? ' · 镜像 ' + up.mirror : '') +
+      (up.insecure_tls ? ' · 不校验证书（应急）' : '')
     : '—'
 
   const updateItems = up

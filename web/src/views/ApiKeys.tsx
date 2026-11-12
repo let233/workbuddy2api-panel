@@ -20,6 +20,7 @@ import {
   Field,
   Modal,
   Segmented,
+  Select,
   Skeleton,
   Stat,
   StatsGrid,
@@ -985,22 +986,18 @@ export default function ApiKeys() {
                   : '套用会覆盖可用模型 / 额度 / 提示词，并按模板天数设置到期'
               }
             >
-              <select
-                className="select"
-                aria-label="套用分组模板"
+              <Select
+                ariaLabel="套用分组模板"
                 value={form.template_id}
-                onChange={(e) => applyTemplate(e.target.value)}
-              >
-                <option value="">不套用模板</option>
-                {templates.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.name}
-                  </option>
-                ))}
-                {form.template_id && !templates.some((t) => t.id === form.template_id) ? (
-                  <option value={form.template_id}>（模板已删除）</option>
-                ) : null}
-              </select>
+                onChange={applyTemplate}
+                options={[
+                  { value: '', label: '不套用模板' },
+                  ...templates.map((t) => ({ value: t.id, label: t.name })),
+                  ...(form.template_id && !templates.some((t) => t.id === form.template_id)
+                    ? [{ value: form.template_id, label: '（模板已删除）' }]
+                    : []),
+                ]}
+              />
             </Field>
 
             <div className="formgrid">
@@ -1064,18 +1061,13 @@ export default function ApiKeys() {
 
             <div className="formgrid">
               <Field label="提示词模式" htmlFor="ak-mode">
-                <select
+                <Select
                   id="ak-mode"
-                  className="select"
+                  ariaLabel="提示词模式"
                   value={form.prompt_mode}
-                  onChange={(e) => setForm({ ...form, prompt_mode: e.target.value })}
-                >
-                  {MODE_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(v) => setForm({ ...form, prompt_mode: v })}
+                  options={MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+                />
               </Field>
               <Field label="状态" hint={form.enabled ? '启用的 Key 可立即调用' : '停用后调用会被拒绝'}>
                 <div className="row gap2 v-center">
@@ -1168,18 +1160,13 @@ export default function ApiKeys() {
                 />
               </Field>
               <Field label="提示词模式" htmlFor="tpl-mode">
-                <select
+                <Select
                   id="tpl-mode"
-                  className="select"
+                  ariaLabel="提示词模式"
                   value={tplForm.prompt_mode}
-                  onChange={(e) => setTplForm({ ...tplForm, prompt_mode: e.target.value })}
-                >
-                  {MODE_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(v) => setTplForm({ ...tplForm, prompt_mode: v })}
+                  options={MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+                />
               </Field>
             </div>
 

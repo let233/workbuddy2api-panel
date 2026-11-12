@@ -116,7 +116,9 @@ func validateMirror(raw string) error {
 // transport 按当前设置构造 Transport。
 //
 // 与 http.DefaultTransport 的关系：克隆它（保留连接池/超时/H2 等既有行为），
-// 只替换 Proxy 字段。三条线索的优先级：
+// 只替换 Proxy 与 TLS 两处——克隆也保证了「跳过证书校验」不会污染
+// http.DefaultTransport（那是全进程共用的，改它会连上游对话一起变不安全）。
+// 代理的三条线索，优先级：
 //  1. 显式 proxy 配了就只用它；
 //  2. 没配 proxy 且 proxy_from_env=false → 显式 direct（Proxy=nil）；
 //  3. 其余情况保持 ProxyFromEnvironment（与 issue #198 描述的既有行为一致）。
@@ -136,6 +138,18 @@ func (m *Manager) transport() *http.Transport {
 	case !s.ProxyFromEnv:
 		// 显式忽略环境变量：容器里被别处塞了 HTTP_PROXY、但更新要走直连时用。
 		tr.Proxy = nil
+	}
+	// 握手预算放宽（默认 10s，见 updater.go 里的现场说明）：跨境链路被干扰时
+	// 握手常在 10~20s 才成功，固定 10s 会让「差一点就成」变成 TLS handshake timeout。
+	tr.TLSHandshakeTimeout = tlsHandshakeBudget
+	if s.InsecureTLS {
+		// 应急：更新通道跳过证书校验。默认关，代价见 Settings.InsecureTLS 注释。
+		cfg := &tls.Config{InsecureSkipVerify: true}
+		if tr.TLSClientConfig != nil {
+			cfg = tr.TLSClientConfig.Clone()
+			cfg.InsecureSkipVerify = true
+		}
+		tr.TLSClientConfig = cfg //nolint:gosec // 由 update.insecure_tls 显式开启的应急通道
 	}
 	return tr
 }
@@ -325,7 +339,10 @@ func adviceFor(kind string) string {
 	case kindConnect:
 		return "TCP 连不上：出站被拦或网络不可达；可配置 update.proxy 或 update.mirror 绕行"
 	case kindTLS:
-		return "TLS 握手/证书失败：常见于中间设备劫持或系统 CA 过期；先试 update.mirror"
+		// 两类现场要分开说：握手超时是链路被拦（关证书校验救不了），
+		// 证书不认才是「校验这一关」的事（可用 insecure_tls 应急）。
+		return "TLS 握手/证书失败：握手一直超时=链路被拦，换 update.proxy / update.mirror；" +
+			"证书不被信任（自签/CA 过期）可临时开 update.insecure_tls"
 	case kindHeaderTime:
 		return "等响应头超时：出站到 release-assets 很可能被拦（api.github.com 往往仍通）；请配置 update.proxy 或 update.mirror"
 	case kindBodyStall:

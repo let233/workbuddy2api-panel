@@ -12,6 +12,7 @@ import {
   KV,
   Modal,
   Pager,
+  Select,
   Skeleton,
   Stat,
   StatsGrid,
@@ -462,83 +463,62 @@ export default function Events() {
           }
         >
           <div className="filters">
-            <select
-              className="select"
+            <Select
+              ariaLabel="状态筛选"
               value={status}
-              onChange={(e) => {
-                setStatus(e.target.value as StatusFilter)
+              onChange={(v) => {
+                setStatus(v as StatusFilter)
                 setPage(1)
               }}
-              aria-label="状态筛选"
-            >
-              {STATUS_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select"
+              options={STATUS_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+            />
+            <Select
+              ariaLabel="账号筛选"
               value={account}
-              onChange={(e) => {
-                setAccount(e.target.value)
+              onChange={(v) => {
+                setAccount(v)
                 setPage(1)
               }}
-              aria-label="账号筛选"
-            >
-              <option value="all">全部账号 ({num(accountOptions.length)})</option>
-              {accountOptions.map((a) => (
-                <option key={a} value={a}>
-                  {a}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select"
+              menuMaxHeight={320}
+              placeholder="全部账号"
+              options={[
+                { value: 'all', label: '全部账号 (' + num(accountOptions.length) + ')' },
+                ...accountOptions.map((a) => ({ value: a, label: a })),
+              ]}
+            />
+            <Select
+              ariaLabel="模型筛选"
               value={model}
-              onChange={(e) => {
-                setModel(e.target.value)
+              onChange={(v) => {
+                setModel(v)
                 setPage(1)
               }}
-              aria-label="模型筛选"
-            >
-              <option value="all">全部模型 ({num(modelOptions.length)})</option>
-              {modelOptions.map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select"
+              menuMaxHeight={320}
+              placeholder="全部模型"
+              options={[
+                { value: 'all', label: '全部模型 (' + num(modelOptions.length) + ')' },
+                ...modelOptions.map((v) => ({ value: v, label: v })),
+              ]}
+            />
+            <Select
+              ariaLabel="时间范围"
               value={range}
-              onChange={(e) => {
-                setRange(e.target.value as RangeKey)
+              onChange={(v) => {
+                setRange(v as RangeKey)
                 setPage(1)
               }}
-              aria-label="时间范围"
-            >
-              {RANGES.map((r) => (
-                <option key={r.value} value={r.value}>
-                  {r.label}
-                </option>
-              ))}
-            </select>
-            <select
-              className="select"
-              value={limit}
-              onChange={(e) => {
-                setLimit(Number(e.target.value))
+              options={RANGES.map((r) => ({ value: r.value, label: r.label }))}
+            />
+            <Select
+              ariaLabel="抓取条数"
+              value={String(limit)}
+              onChange={(v) => {
+                setLimit(Number(v))
                 setPage(1)
               }}
-              aria-label="抓取条数"
-            >
-              {LIMITS.map((n) => (
-                <option key={n} value={n}>
-                  抓取 {n} 条
-                </option>
-              ))}
-            </select>
+              menuMaxHeight={220}
+              options={LIMITS.map((n) => ({ value: String(n), label: '抓取 ' + n + ' 条' }))}
+            />
             <input
               className="input"
               placeholder="关键字（请求 ID / 路径 / IP / UA）"

@@ -8,7 +8,7 @@ import { useSession } from '../lib/session'
 import { useTheme, type ThemeMode } from '../lib/theme'
 import { useQuery } from '../lib/hooks'
 import { api } from '../lib/api'
-import { Field, Modal } from './ui'
+import { Field, Modal, Select } from './ui'
 
 // ---------- 图标 ----------
 
@@ -261,18 +261,15 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
 
           <div className="row gap1 v-center ml-auto">
-            <select
-              className="select xs hide-sm"
-              aria-label="自动刷新频率"
-              value={interval}
-              onChange={(e) => setInterval(Number(e.target.value))}
-            >
-              {AUTO_OPTIONS.map((o) => (
-                <option key={o.ms} value={o.ms}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+            <Select
+              className="xs hide-sm"
+              ariaLabel="自动刷新频率"
+              value={String(interval)}
+              onChange={(v) => setInterval(Number(v))}
+              menuMaxHeight={220}
+              title="自动刷新频率"
+              options={AUTO_OPTIONS.map((o) => ({ value: String(o.ms), label: o.label }))}
+            />
 
             <button type="button" className="btn ghost icon" aria-label="刷新数据" title="刷新" onClick={refresh}>
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">

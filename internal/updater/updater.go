@@ -30,6 +30,28 @@ const (
 	cleanupArg     = "--wb2api-cleanup"
 )
 
+// 更新通道的 TLS 时间预算。
+//
+// 现场（用户报障）：面板显示
+//
+//	查询 GitHub Release 失败: Get "https://api.github.com/...": net/http: TLS handshake timeout
+//
+// 这是**握手**没走完，不是证书不认——两者的处置完全不同，别混：
+//   - 握手超时 = 链路被干扰/太慢（证书校验还没轮到），只能等更久或换出口；
+//   - 证书不认 = x509: ... unknown authority 之类，链路是通的，可用
+//     Settings.InsecureTLS 应急跳过校验。
+const (
+	// tlsHandshakeBudget 握手预算。Go 的 http.Transport 默认 10s，本机正常
+	// 链路实测一次握手只需 200~350ms，所以 10s 对健康链路绰绰有余；但跨境链路
+	// 被干扰时握手要经历多轮重传，10s 常常是「差一点就成」。放宽到 20s 不需要
+	// 任何配置、也不改变信任模型（不会让被彻底阻断的链路变成能通，只是慢 10s）。
+	tlsHandshakeBudget = 20 * time.Second
+	// metadataRequestTimeout 元数据请求的整体超时。必须明显大于握手预算：
+	// http.Client.Timeout 是整条请求的硬上限，若仍是 30s，握手吃掉 20s 后只剩
+	// 10s 等响应头，等于把放宽的预算又吃回去。
+	metadataRequestTimeout = 45 * time.Second
+)
+
 // 更新流程的时间参数集中在这里，测试可注入短值。
 var (
 	// exeReleaseBudget 删「刚跑完的 exe」的重试预算（见 removeFileRetrying）。
@@ -81,6 +103,18 @@ type Settings struct {
 	// Mirror 资产下载镜像前缀（如 https://ghfast.top/）。空 = 直连。
 	// **只作用于资产下载**：Release 元数据永远直连 api.github.com，摘要校验不变。
 	Mirror string
+	// InsecureTLS 跳过更新通道的 TLS 证书校验（应急开关，默认关）。
+	//
+	// 只解决「握手成功但证书不认」这一类（自签证书、内网中间设备签发、系统 CA
+	// 过期），报错形如 x509: certificate signed by unknown authority。**不解决**
+	// net/http: TLS handshake timeout——那一步握手根本没完成，轮不到校验证书；
+	// 握手超时看 tlsHandshakeBudget 与 update.proxy / update.mirror。
+	//
+	// 代价必须说清楚：Release 元数据（tag/digest/size）与资产走的是同一条通道，
+	// 关掉证书校验等于把「应该拿到什么」也交给链路——中间人可以同时伪造版本号、
+	// 摘要和压缩包，Install 的 SHA-256 校验再也拦不住任何东西。所以默认关，
+	// 只给「证书是自签但链路可信」的部署临时用；能换 CA / 换镜像就不要开它。
+	InsecureTLS bool
 }
 
 // Status is safe to expose through the authenticated panel API.
@@ -114,6 +148,9 @@ type Status struct {
 	// InstallMode 生效的安装方式：helper（替换后由 helper 拉起新进程）/
 	// in-place（容器内进程内替换 + exec 自身）。
 	InstallMode string `json:"install_mode,omitempty"`
+	// InsecureTLS 更新通道当前是否跳过证书校验。面板要看得见：这是个把更新
+	// 完整性交给链路的开关，开过之后不该靠记忆。
+	InsecureTLS bool `json:"insecure_tls,omitempty"`
 }
 
 type release struct {
@@ -218,6 +255,9 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		},
 	}
 	m.applyChannelStatusLocked()
+	if settings.InsecureTLS {
+		logInsecureTLS()
+	}
 	_, m.status.CurrentKnown = parseVersion(m.version)
 	// 能不能原地换二进制取决于「程序目录写不写得了」，这个只能试一次才知道
 	// （容器里属主/ACL/只读挂载混在一起，看权限位没用）。
@@ -288,16 +328,32 @@ func (m *Manager) Configure(settings Settings) {
 	}
 	m.mu.Lock()
 	prevChannel := m.status.Channel
+	prevInsecure := m.settings.InsecureTLS
 	m.settings = settings
 	m.status.AutoEnabled = settings.AutoEnabled
 	m.status.AutoTime = settings.AutoTime
 	m.applyChannelStatusLocked()
 	newChannel := m.status.Channel
 	m.mu.Unlock()
+	// 证书校验被关掉/恢复都要留痕：这是安全姿态的变更，不能只在配置里静默存在。
+	if settings.InsecureTLS && !prevInsecure {
+		logInsecureTLS()
+	} else if !settings.InsecureTLS && prevInsecure {
+		log.Printf("[updater] update.insecure_tls 已关闭：更新通道恢复证书校验")
+	}
 	// 通道变了要留一行：下次自动安装失败时，先确认是不是刚换了出口。
 	if prevChannel != newChannel {
 		log.Printf("[updater] 下载通道切换：%s → %s", prevChannel, newChannel)
 	}
+}
+
+// logInsecureTLS 在「跳过证书校验」生效时留一条 WARN：这不是普通开关，
+// 它把更新内容的真实性一起交给了链路。入口（New / Configure）都走这一处，
+// 保证每次生效都有日志可查、文案一致。
+func logInsecureTLS() {
+	log.Printf("WARN: [updater] update.insecure_tls 已开启：更新通道不再校验 TLS 证书。" +
+		"摘要校验与元数据走的是同一条通道，因此中间人可同时伪造版本号、摘要与压缩包；" +
+		"仅限证书自签且链路可信时临时使用")
 }
 
 // applyChannelStatusLocked 把当前生效通道写进 status（调用方须持 m.mu）。
@@ -311,6 +367,7 @@ func (m *Manager) applyChannelStatusLocked() {
 			proxyHost = u.Host
 		}
 	}
+	m.status.InsecureTLS = s.InsecureTLS
 	switch {
 	case mirror != "" && proxyHost != "":
 		m.status.Channel = "mirror+proxy"
@@ -401,8 +458,8 @@ func (m *Manager) fetchReleases(ctx context.Context) ([]release, error) {
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 		req.Header.Set("User-Agent", "workbuddy2api-panel-updater")
-		// 按当前设置构造客户端（代理可热生效，见 channel.go）。
-		resp, err := m.httpClient(30 * time.Second).Do(req)
+		// 按当前设置构造客户端（代理/TLS 可热生效，见 channel.go）。
+		resp, err := m.httpClient(metadataRequestTimeout).Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("查询 GitHub Release 失败: %w", m.classifyInto(err))
 		}

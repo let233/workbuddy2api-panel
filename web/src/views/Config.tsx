@@ -4,7 +4,7 @@ import { useQuery } from '../lib/hooks'
 import { useRefresh } from '../lib/refresh'
 import { useToast } from '../lib/toast'
 import { bytes, num } from '../lib/format'
-import { Badge, Box, Empty, Field, KV, Segmented, Skeleton, Switch } from '../components/ui'
+import { Badge, Box, Empty, Field, KV, Select, Segmented, Skeleton, Switch } from '../components/ui'
 
 type ConfigResp = {
   ok: boolean
@@ -388,18 +388,14 @@ export default function Config() {
       )
     } else if (f.kind === 'select') {
       control = (
-        <select
-          className="select"
+        <Select
+          ariaLabel={f.label}
           value={typeof v === 'string' ? v : ''}
           disabled={managed}
-          onChange={(e) => write(f.path, e.target.value)}
-        >
-          {(f.options ?? []).map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
+          onChange={(next) => write(f.path, next)}
+          menuMaxHeight={280}
+          options={(f.options ?? []).map((o) => ({ value: o.value, label: o.label }))}
+        />
       )
     } else if (f.kind === 'number' || f.kind === 'float') {
       control = (

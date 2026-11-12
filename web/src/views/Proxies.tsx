@@ -22,6 +22,7 @@ import {
   Modal,
   Pager,
   Segmented,
+  Select,
   Skeleton,
   Stat,
   StatsGrid,
@@ -693,38 +694,38 @@ export default function Proxies() {
           ) : (
             <div className="stack">
               <Field label="cn 域" hint={'当前：' + realmDesc('cn')}>
-                <select
-                  className="select"
-                  aria-label="cn 域默认出口"
+                <Select
+                  ariaLabel="cn 域默认出口"
                   value={realmValue('cn')}
                   disabled={busy === 'realm:cn'}
-                  onChange={(e) => saveRealm('cn', e.target.value)}
-                >
-                  <option value="random">随机池（默认）</option>
-                  <option value="direct">直连（不走代理）</option>
-                  {proxies.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {(p.name || hostOf(p.url)) + ' · ' + (STATUS[p.status]?.text ?? p.status)}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(v) => saveRealm('cn', v)}
+                  menuMaxHeight={280}
+                  options={[
+                    { value: 'random', label: '随机池（默认）' },
+                    { value: 'direct', label: '直连（不走代理）' },
+                    ...proxies.map((p) => ({
+                      value: p.id,
+                      label: (p.name || hostOf(p.url)) + ' · ' + (STATUS[p.status]?.text ?? p.status),
+                    })),
+                  ]}
+                />
               </Field>
               <Field label="global 域" hint={'当前：' + realmDesc('global')}>
-                <select
-                  className="select"
-                  aria-label="global 域默认出口"
+                <Select
+                  ariaLabel="global 域默认出口"
                   value={realmValue('global')}
                   disabled={busy === 'realm:global'}
-                  onChange={(e) => saveRealm('global', e.target.value)}
-                >
-                  <option value="random">随机池（默认）</option>
-                  <option value="direct">直连（不走代理）</option>
-                  {proxies.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {(p.name || hostOf(p.url)) + ' · ' + (STATUS[p.status]?.text ?? p.status)}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(v) => saveRealm('global', v)}
+                  menuMaxHeight={280}
+                  options={[
+                    { value: 'random', label: '随机池（默认）' },
+                    { value: 'direct', label: '直连（不走代理）' },
+                    ...proxies.map((p) => ({
+                      value: p.id,
+                      label: (p.name || hostOf(p.url)) + ' · ' + (STATUS[p.status]?.text ?? p.status),
+                    })),
+                  ]}
+                />
               </Field>
               <div className="muted tiny">
                 账号级绑定：{Object.keys(bindings).length} 个账号已单独指定，优先于这里的默认出口。

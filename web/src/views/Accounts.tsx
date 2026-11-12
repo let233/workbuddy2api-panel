@@ -4,7 +4,7 @@ import { ApiError, api, errorText } from '../lib/api'
 import { useBusy, useDebounced, useQuery, useSelection } from '../lib/hooks'
 import { useRefresh } from '../lib/refresh'
 import { useToast } from '../lib/toast'
-import { ago, clock, credits, cstDate, duration, num, shortTime } from '../lib/format'
+import { ago, clock, credits, cstDate, duration, isZeroTime, num, shortTime } from '../lib/format'
 import {
   Badge,
   Bar,
@@ -13,14 +13,17 @@ import {
   CopyText,
   Field,
   KV,
+  Menu,
   Modal,
   Pager,
   Pre,
   Segmented,
+  Select,
   Skeleton,
   Stat,
   StatsGrid,
   Tabs,
+  type MenuItem,
   type Tone,
 } from '../components/ui'
 import { DataTable, type Column } from '../components/DataTable'
@@ -482,6 +485,24 @@ export default function Accounts() {
       try {
         const r = await api.post<ProbeResp>('/accounts/' + encodeURIComponent(uid) + '/probe_ban')
         setProbe(r)
+      } catch (e) {
+        toast.err(errorText(e))
+      }
+    })
+  }
+
+  // 行内探测：详情弹层里是就地显示结果，列表行没有位置放结果面板，
+  // 所以把结论文本直接弹成 toast（verdict 六态映射见 VERDICT）。
+  const doProbeRow = (uid: string) => {
+    void run('probe:' + uid, async () => {
+      try {
+        const r = await api.post<ProbeResp>('/accounts/' + encodeURIComponent(uid) + '/probe_ban')
+        const v = VERDICT[r.verdict || '']
+        const text = '探测结果：' + (v ? v.text : '未知结果（' + (r.verdict || '') + '）') + (r.detail ? ' · ' + r.detail : '')
+        if (v?.tone === 'ok') toast.ok(text)
+        else if (v?.tone === 'bad') toast.err(text)
+        else toast.warn(text)
+        q.reload()
       } catch (e) {
         toast.err(errorText(e))
       }
@@ -1105,7 +1126,10 @@ export default function Accounts() {
       width: '132px',
       sortValue: (s) => msOf(s.credits_earliest_expiry),
       render: (s) => {
-        if (!s.credits_earliest_expiry) return <span className="muted">—</span>
+        // 零值时间（0001-01-01T00:00:00Z）与空串同义：都没有待到期批次。
+        // 只判空串的话零值会被算成「很久以前」，列表显示「已过期」，与真实状态相反。
+        if (!s.credits_earliest_expiry || isZeroTime(s.credits_earliest_expiry))
+          return <span className="muted">—</span>
         const days = Math.floor((msOf(s.credits_earliest_expiry) - Date.now()) / 86400000)
         return (
           <span>
@@ -1140,35 +1164,113 @@ export default function Accounts() {
     {
       key: 'act',
       title: '操作',
-      width: '76px',
       align: 'right',
       className: 'c-acts',
-      render: (s) => (
-        <span className="row gap1" style={{ justifyContent: 'flex-end' }}>
-          {s.enterprise || s.api_key ? null : (
+      render: (s) => {
+        // 详细弹层里的动作全部提到行内：日常操作（签到/余额/暂停恢复）直接摆按钮，
+        // 低频且带风险的动作（探测/禁用/解冻/删除/备注/代理）收进「更多」菜单。
+        const noCheckin = !!s.enterprise || !!s.api_key
+        const done = !!s.checkin_done
+        const items: MenuItem[] = [
+          { label: '探测封禁', onSelect: () => doProbeRow(s.uid), disabled: !!busy },
+          { label: '备注 / 分组', onSelect: () => openRemarks(s) },
+          { label: '代理绑定', onSelect: () => openDetail(s), sep: true },
+        ]
+        if (s.disabled) {
+          items.push({
+            label: '解冻',
+            onSelect: () => doAct(s.uid, 'revive', '已解冻，恢复可用'),
+            disabled: !!busy,
+            sep: true,
+          })
+        } else {
+          items.push({
+            label: '禁用',
+            onSelect: () => setConfirm({ kind: 'disable', uids: [s.uid], name: acctName(s) }),
+            disabled: !!busy,
+            sep: true,
+          })
+        }
+        items.push({
+          label: '删除',
+          danger: true,
+          onSelect: () => setConfirm({ kind: 'remove', uids: [s.uid], name: acctName(s) }),
+          disabled: !!busy,
+        })
+        return (
+          <span className="row gap1 act-row" style={{ justifyContent: 'flex-end' }}>
+            {noCheckin ? (
+              <span className="tiny muted" title="企业版 / API Key 账号没有签到体系">
+                不可签
+              </span>
+            ) : done ? (
+              <button className="btn sm ok" disabled title="今天已经签到过了（UTC+8 零点重置）">
+                已签
+              </button>
+            ) : (
+              <button
+                className="btn sm ghost"
+                disabled={!!busy}
+                title="立即签到"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  doCheckin(s.uid)
+                }}
+              >
+                签到
+              </button>
+            )}
             <button
               className="btn sm ghost"
               disabled={!!busy}
-              title="签到"
+              title="刷新积分余额"
               onClick={(e) => {
                 e.stopPropagation()
-                doCheckin(s.uid)
+                doBalance(s.uid)
               }}
             >
-              签到
+              余额
             </button>
-          )}
-          <button
-            className="btn sm"
-            onClick={(e) => {
-              e.stopPropagation()
-              openDetail(s)
-            }}
-          >
-            详情
-          </button>
-        </span>
-      ),
+            {s.paused ? (
+              <button
+                className="btn sm ghost"
+                disabled={!!busy}
+                title="恢复参与选号"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  doAct(s.uid, 'resume', '已恢复参与选号')
+                }}
+              >
+                恢复
+              </button>
+            ) : (
+              <button
+                className="btn sm ghost"
+                disabled={!!busy || !!s.disabled}
+                title="暂停参与选号"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  doAct(s.uid, 'pause', '已暂停，选号会跳过它')
+                }}
+              >
+                暂停
+              </button>
+            )}
+            <span onClick={(e) => e.stopPropagation()}>
+              <Menu items={items} ariaLabel={'更多操作：' + acctName(s)} title="更多操作" />
+            </span>
+            <button
+              className="btn sm"
+              onClick={(e) => {
+                e.stopPropagation()
+                openDetail(s)
+              }}
+            >
+              详情
+            </button>
+          </span>
+        )
+      },
     },
   ]
 
@@ -1235,50 +1337,40 @@ export default function Accounts() {
         </div>
 
         <div className="filters">
-          <select
-            className="select"
-            aria-label="域"
+          <Select
+            ariaLabel="域"
             value={realm}
-            onChange={(e) => {
-              setRealm(e.target.value as 'all' | 'cn' | 'global')
+            onChange={(v) => {
+              setRealm(v as 'all' | 'cn' | 'global')
               setPage(1)
             }}
-          >
-            <option value="all">全部域 · {num(counts.all)}</option>
-            <option value="cn">CN 域 · {num(counts.cn)}</option>
-            <option value="global">Global 域 · {num(counts.global)}</option>
-          </select>
-          <select
-            className="select"
-            aria-label="分组"
+            options={[
+              { value: 'all', label: '全部域 · ' + num(counts.all) },
+              { value: 'cn', label: 'CN 域 · ' + num(counts.cn) },
+              { value: 'global', label: 'Global 域 · ' + num(counts.global) },
+            ]}
+          />
+          <Select
+            ariaLabel="分组"
             value={group}
-            onChange={(e) => {
-              setGroup(e.target.value)
+            onChange={(v) => {
+              setGroup(v)
               setPage(1)
             }}
-          >
-            <option value="">全部分组</option>
-            {(data.groups ?? []).map((g) => (
-              <option key={g.name} value={g.name}>
-                {g.name} · {g.count}
-              </option>
-            ))}
-          </select>
-          <select
-            className="select"
-            aria-label="状态"
+            options={[
+              { value: '', label: '全部分组' },
+              ...(data.groups ?? []).map((g) => ({ value: g.name, label: g.name + ' · ' + g.count })),
+            ]}
+          />
+          <Select
+            ariaLabel="状态"
             value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value as Filter)
+            onChange={(v) => {
+              setStatusFilter(v as Filter)
               setPage(1)
             }}
-          >
-            {FILTERS.map((f) => (
-              <option key={f.value} value={f.value}>
-                {f.label}
-              </option>
-            ))}
-          </select>
+            options={FILTERS.map((f) => ({ value: f.value, label: f.label }))}
+          />
           <input
             className="input"
             placeholder="搜索昵称 / UID"
@@ -1289,21 +1381,17 @@ export default function Accounts() {
               setPage(1)
             }}
           />
-          <select
-            className="select"
-            aria-label="每页条数"
-            value={size}
-            onChange={(e) => {
-              setSize(Number(e.target.value))
+          <Select
+            className="xs"
+            ariaLabel="每页条数"
+            value={String(size)}
+            onChange={(v) => {
+              setSize(Number(v))
               setPage(1)
             }}
-          >
-            {[10, 20, 50, 100].map((n) => (
-              <option key={n} value={n}>
-                {n} 条/页
-              </option>
-            ))}
-          </select>
+            menuMaxHeight={220}
+            options={[10, 20, 50, 100].map((n) => ({ value: String(n), label: n + ' 条/页' }))}
+          />
         </div>
 
         {sel.size > 0 ? (
@@ -1434,15 +1522,24 @@ export default function Accounts() {
                 { k: '积分 / 总额度', v: credits(detail.credits) + ' / ' + credits(detail.credits_total), mono: true },
                 {
                   k: '最近到期',
-                  v: detail.credits_earliest_expiry
-                    ? cstDate(detail.credits_earliest_expiry) + ' · 剩 ' + credits(detail.credits_earliest_remaining)
-                    : '—',
+                  v:
+                    detail.credits_earliest_expiry && !isZeroTime(detail.credits_earliest_expiry)
+                      ? cstDate(detail.credits_earliest_expiry) + ' · 剩 ' + credits(detail.credits_earliest_remaining)
+                      : '—',
                 },
                 {
                   k: '最后成功',
                   v: detail.last_success ? shortTime(detail.last_success) + ' · ' + ago(detail.last_success) : '—',
                 },
-                { k: '最后错误', v: detail.last_err || '—' },
+                {
+                  k: '最后错误',
+                  // last_err 是 RFC3339 字符串；零值（0001-01-01）在 isZeroTime 里判掉，
+                  // 否则会原样显示成「0001-01-01T00:00:00Z」。
+                  v:
+                    detail.last_err && !isZeroTime(detail.last_err)
+                      ? shortTime(detail.last_err) + ' · ' + ago(detail.last_err)
+                      : '—',
+                },
                 { k: '成功 / 失败', v: num(detail.success_count) + ' / ' + num(detail.err_total), mono: true },
                 { k: '代理', v: proxyText(detail.uid) },
                 ...(detail.disabled ? [{ k: '禁用原因', v: detail.disabled_reason || '未记录' }] : []),
@@ -1526,20 +1623,16 @@ export default function Accounts() {
                   <div className="stack">
                     <Segmented value={proxyMode} options={PROXY_OPTIONS} onChange={setProxyMode} ariaLabel="代理模式" />
                     {proxyMode === 'fixed' ? (
-                      <select
-                        className="select"
-                        aria-label="选择代理节点"
+                      <Select
+                        ariaLabel="选择代理节点"
                         value={proxyId}
-                        onChange={(e) => setProxyId(e.target.value)}
-                      >
-                        <option value="">选择节点…</option>
-                        {proxies.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name}
-                            {p.enabled === false ? '（停用）' : ''}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={setProxyId}
+                        placeholder="选择节点…"
+                        options={proxies.map((p) => ({
+                          value: p.id,
+                          label: p.name + (p.enabled === false ? '（停用）' : ''),
+                        }))}
+                      />
                     ) : null}
                     <button
                       className="btn sm"

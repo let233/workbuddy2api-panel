@@ -75,6 +75,15 @@ type Config struct {
 		// 只作用于**资产下载**：Release 元数据（tag/digest/size）永远直连
 		// api.github.com，校验口径不变，镜像无法投毒。空 = 直连。
 		Mirror string `json:"mirror"`
+		// InsecureTLS 更新通道跳过 TLS 证书校验（应急开关，缺省 false）。
+		//
+		// 只对「证书不被信任」有效（自签 / 内网中间设备签发 / 系统 CA 过期，报错
+		// 形如 x509: certificate signed by unknown authority）；对
+		// net/http: TLS handshake timeout 无效——那是握手没完成，改走 proxy / mirror。
+		//
+		// 打开后 Release 元数据与资产走同一条不校验的通道，SHA-256 校验随之失效
+		// （摘要也来自这条通道），只适合链路可信、证书自签的部署临时使用。
+		InsecureTLS bool `json:"insecure_tls"`
 	} `json:"update"`
 
 	Accounts struct {

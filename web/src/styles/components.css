@@ -213,6 +213,67 @@
 .select.xs, .input.xs { min-height: 28px; font-size: var(--fs-2); padding: 3px var(--sp-2); }
 .select.xs { padding-right: 24px; background-position: calc(100% - 13px) 12px, calc(100% - 8px) 12px; }
 
+/* 自绘下拉（Select 组件）：原生 <select> 的箭头背景图在这里不需要了，
+   改用 flex + 内联箭头，方便放计数、状态点这类结构化标签。 */
+.select.dd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: auto;
+  max-width: 100%;
+  padding-right: var(--sp-2);
+  background-image: none;
+  text-align: left;
+  cursor: pointer;
+}
+.select.dd.xs { padding-right: 6px; }
+.select.dd .dd-lbl {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.select.dd .dd-arrow {
+  flex: none;
+  width: 10px;
+  height: 6px;
+  color: var(--ink-3);
+  transition: transform 0.15s var(--ease);
+}
+.select.dd.open .dd-arrow { transform: rotate(180deg); }
+.select.dd[aria-disabled='true'] { opacity: 0.55; cursor: not-allowed; }
+
+.dd-menu {
+  position: fixed;
+  z-index: 90;
+  padding: 4px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  box-shadow: var(--shadow);
+  animation: fade-in 0.1s var(--ease);
+}
+.dd-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 7px var(--sp-2);
+  border-radius: var(--r-1);
+  font-size: var(--fs-3);
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+}
+.dd-opt.act { background: var(--surface-2); }
+.dd-opt.on { color: var(--accent); font-weight: 600; }
+.dd-opt.dis { opacity: 0.45; cursor: not-allowed; }
+.dd-opt .dd-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-opt .dd-check { flex: none; width: 12px; height: 10px; }
+
 /* 开关 */
 .switch {
   position: relative;
@@ -551,3 +612,7 @@ input[type="checkbox"], input[type="radio"] { width: 15px; height: 15px; accent-
 /* ---------- box 头部补充 ---------- */
 .box > header .sub { color: var(--ink-3); font-size: var(--fs-2); margin-top: 2px; }
 .box > .body.flush { padding: 0; }
+.dd-menu.menu { min-width: 168px; }
+.dd-opt.danger { color: var(--bad); }
+.dd-opt.danger.act { background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.dd-sep { height: 1px; margin: 4px 2px; background: var(--line); }
