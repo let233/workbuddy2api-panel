@@ -4,7 +4,7 @@ import { useDebounced, useLocalStorage, useQuery } from '../lib/hooks'
 import { useRefresh } from '../lib/refresh'
 import { useToast } from '../lib/toast'
 import { clock, cstDate, credits as fmtCredits, num, pct, tok } from '../lib/format'
-import { Badge, Box, Empty, Segmented, Skeleton, Stat, StatsGrid, Switch } from '../components/ui'
+import { Badge, Box, Empty, Select, Segmented, Skeleton, Stat, StatsGrid, Switch } from '../components/ui'
 import { DataTable, type Column } from '../components/DataTable'
 
 // ---------- 运行日志 ----------
@@ -650,34 +650,19 @@ export default function Logs() {
               ariaLabel="结果筛选"
             />
           </div>
-          <select
-            className="select"
+          <Select
+            ariaLabel="时间范围"
             value={rangeKey}
-            onChange={(e) => {
-              setRangeKey(e.target.value)
-            }}
-            aria-label="时间范围"
-          >
-            {REQ_RANGES.map((r) => (
-              <option key={r.value} value={r.value}>
-                {r.label}
-              </option>
-            ))}
-          </select>
-          <select
-            className="select"
+            onChange={setRangeKey}
+            options={REQ_RANGES.map((r) => ({ value: r.value, label: r.label }))}
+          />
+          <Select
+            ariaLabel="取回条数"
             value={String(limit)}
-            onChange={(e) => {
-              setLimit(Number(e.target.value))
-            }}
-            aria-label="取回条数"
-          >
-            {PAGE_SIZES.map((n) => (
-              <option key={n} value={String(n)}>
-                {n} 条
-              </option>
-            ))}
-          </select>
+            onChange={(v) => setLimit(Number(v))}
+            menuMaxHeight={220}
+            options={PAGE_SIZES.map((n) => ({ value: String(n), label: n + ' 条' }))}
+          />
           <input
             className="input"
             placeholder="关键字：账号/模型/IP/请求 ID"
@@ -785,20 +770,14 @@ export default function Logs() {
         sub={logSub}
         actions={
           <div className="row">
-            <select
-              className="select xs"
+            <Select
+              className="xs"
+              ariaLabel="导出天数"
               value={String(exportDays)}
-              onChange={(e) => {
-                setExportDays(Number(e.target.value))
-              }}
-              aria-label="导出天数"
-            >
-              {EXPORT_DAYS.map((d) => (
-                <option key={d} value={String(d)}>
-                  近 {d} 天
-                </option>
-              ))}
-            </select>
+              onChange={(v) => setExportDays(Number(v))}
+              menuMaxHeight={240}
+              options={EXPORT_DAYS.map((d) => ({ value: String(d), label: '近 ' + d + ' 天' }))}
+            />
             <button className="btn sm" onClick={exportZip} disabled={exporting}>
               {exporting ? '导出中…' : '导出 ZIP'}
             </button>
@@ -915,20 +894,14 @@ export default function Logs() {
         sub="余额变动记录，来源为后端的积分快照历史"
         flush
         actions={
-          <select
-            className="select xs"
+          <Select
+            className="xs"
+            ariaLabel="积分记录条数"
             value={String(creditLimit)}
-            onChange={(e) => {
-              setCreditLimit(Number(e.target.value))
-            }}
-            aria-label="积分记录条数"
-          >
-            {PAGE_SIZES.map((n) => (
-              <option key={n} value={String(n)}>
-                {n} 条
-              </option>
-            ))}
-          </select>
+            onChange={(v) => setCreditLimit(Number(v))}
+            menuMaxHeight={220}
+            options={PAGE_SIZES.map((n) => ({ value: String(n), label: n + ' 条' }))}
+          />
         }
       >
         {creditQ.error ? (

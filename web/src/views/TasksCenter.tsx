@@ -14,6 +14,7 @@ import {
   Field,
   KV,
   Modal,
+  Select,
   Skeleton,
   Stat,
   StatsGrid,
@@ -581,17 +582,14 @@ export default function TasksCenter() {
         </div>
         <div className="acts">
           <div className="row-wrap">
-            <select
-              className="select xs"
-              value={concurrency}
-              onChange={(e) => setConcurrency(Number(e.target.value))}
-              aria-label="队列并发"
-            >
-              <option value={1}>并发 1</option>
-              <option value={2}>并发 2</option>
-              <option value={3}>并发 3</option>
-              <option value={4}>并发 4</option>
-            </select>
+            <Select
+              className="xs"
+              ariaLabel="队列并发"
+              value={String(concurrency)}
+              onChange={(v) => setConcurrency(Number(v))}
+              menuMaxHeight={200}
+              options={[1, 2, 3, 4].map((n) => ({ value: String(n), label: '并发 ' + n }))}
+            />
             <button className="btn sm" onClick={() => setVouchersOpen(true)}>
               查询券码
             </button>

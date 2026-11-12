@@ -4,7 +4,7 @@ import { useBusy, useQuery } from '../lib/hooks'
 import { useRefresh } from '../lib/refresh'
 import { useToast } from '../lib/toast'
 import { bytes, credits as fmtCredits, num, pct, shortTime, tok } from '../lib/format'
-import { Badge, Box, Empty, Pager, Segmented, Skeleton, Stat, StatsGrid, Tabs } from '../components/ui'
+import { Badge, Box, Empty, Pager, Select, Segmented, Skeleton, Stat, StatsGrid, Tabs } from '../components/ui'
 import { DataTable, type Column } from '../components/DataTable'
 import { BarChart, LineChart, StackBar } from '../components/charts'
 
@@ -748,21 +748,17 @@ export default function Usage() {
               <label className="tiny muted" htmlFor="usage-sort">
                 排序
               </label>
-              <select
+              <Select
                 id="usage-sort"
-                className="select xs"
+                className="xs"
+                ariaLabel="排序"
                 value={sortKey}
-                onChange={(e) => {
-                  setSortKey(e.target.value as SortKey)
+                onChange={(v) => {
+                  setSortKey(v as SortKey)
                   setPageDim(1)
                 }}
-              >
-                {SORT_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+                options={SORT_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+              />
             </div>
             <BarChart
               items={topItems}

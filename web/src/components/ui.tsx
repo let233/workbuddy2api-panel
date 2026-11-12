@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
@@ -255,6 +256,416 @@ export function Tabs<T extends string>({
   )
 }
 
+// ---------- 下拉选择 ----------
+
+export type SelectOption = { value: string; label: ReactNode; disabled?: boolean }
+
+// 同一时刻只允许一个自绘下拉/菜单展开：两个菜单叠着开既互相遮挡，Esc 又只关掉其中一个。
+// 用模块级自定义事件互斥，省得为每个调用点包一层 Provider。
+const DD_OPEN_EVENT = 'wb2api:ddopen'
+
+// Select 是自绘下拉，替代 <select>：原生下拉在两处不能接受——
+// ① 弹层里的 <select> 在移动端会弹系统滚轮，盖住页面且无法跟随主题；
+// ② 原生 <option> 不能放结构与样式（计数、状态点、分组标题都做不了）。
+// 交互按 WAI-ARIA combobox 走：焦点始终留在按钮上，用 aria-activedescendant 指当前项；
+// 菜单 portal 到 body 用 fixed 定位，避免被 .box / .tbl-wrap 的 overflow 裁掉。
+export function Select({
+  value,
+  options,
+  onChange,
+  ariaLabel,
+  id,
+  className = '',
+  disabled = false,
+  placeholder = '请选择',
+  title,
+  menuMaxHeight = 300,
+}: {
+  value: string
+  options: SelectOption[]
+  onChange: (v: string) => void
+  ariaLabel?: string
+  id?: string
+  className?: string
+  disabled?: boolean
+  placeholder?: string
+  title?: string
+  menuMaxHeight?: number
+}) {
+  const [open, setOpen] = useState(false)
+  const [active, setActive] = useState(0)
+  const [rect, setRect] = useState<{ left: number; top: number; width: number; up: boolean; maxH: number } | null>(null)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const autoId = useId().replace(/:/g, '')
+  const listId = 'dd-list-' + autoId
+  const curIdx = options.findIndex((o) => o.value === value)
+  const current = curIdx >= 0 ? options[curIdx] : undefined
+
+  const place = useCallback(() => {
+    const b = btnRef.current
+    if (!b) return
+    const r = b.getBoundingClientRect()
+    const gap = 4
+    const below = window.innerHeight - r.bottom - gap - 8
+    const above = r.top - gap - 8
+    const up = below < Math.min(menuMaxHeight, 180) && above > below
+    const maxH = Math.max(120, Math.min(menuMaxHeight, up ? above : below))
+    const width = Math.max(r.width, 180)
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8))
+    // 上翻时把菜单底边贴在按钮上方（靠 translateY(-100%) 上移），否则从按钮下方展开
+    setRect({ left, top: up ? r.top - gap : r.bottom + gap, width, up, maxH })
+  }, [menuMaxHeight])
+
+  useEffect(() => {
+    if (!open) return
+    place()
+    setActive(curIdx >= 0 ? curIdx : 0)
+    const onDocDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (btnRef.current?.contains(t) || menuRef.current?.contains(t)) return
+      setOpen(false)
+    }
+    // 滚动容器里也要跟着按钮走，否则 fixed 菜单会和按钮脱开
+    const onReposition = () => place()
+    document.addEventListener('mousedown', onDocDown)
+    window.addEventListener('resize', onReposition)
+    window.addEventListener('scroll', onReposition, true)
+    // 捕获阶段拦 Esc：弹层里的下拉只该关菜单，不该把整层 Modal 关掉
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      e.preventDefault()
+      setOpen(false)
+      btnRef.current?.focus()
+    }
+    document.addEventListener('keydown', onEsc, true)
+    // 打开时广播一次，其它实例（监听常驻）收到就收起
+    document.dispatchEvent(new CustomEvent<string>(DD_OPEN_EVENT, { detail: autoId }))
+    return () => {
+      document.removeEventListener('mousedown', onDocDown)
+      window.removeEventListener('resize', onReposition)
+      window.removeEventListener('scroll', onReposition, true)
+      document.removeEventListener('keydown', onEsc, true)
+    }
+    // curIdx 只在打开那一刻用来定初始高亮，故意不放进依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, place])
+
+  // 互斥监听必须常驻——关闭状态下不注册就收不到「别人打开了」的广播
+  useEffect(() => {
+    const onOtherOpen = (e: Event) => {
+      if ((e as CustomEvent<string>).detail !== autoId) setOpen(false)
+    }
+    document.addEventListener(DD_OPEN_EVENT, onOtherOpen)
+    return () => document.removeEventListener(DD_OPEN_EVENT, onOtherOpen)
+  }, [autoId])
+
+  // 打开后把高亮项滚进可视区
+  useEffect(() => {
+    if (!open) return
+    const el = menuRef.current?.querySelector<HTMLElement>('[data-idx="' + active + '"]')
+    el?.scrollIntoView({ block: 'nearest' })
+  }, [open, active])
+
+  const step = (delta: number) => {
+    if (!options.length) return
+    let i = active
+    for (let n = 0; n < options.length; n++) {
+      i = (i + delta + options.length) % options.length
+      if (!options[i].disabled) break
+    }
+    setActive(i)
+  }
+
+  const commit = (idx: number) => {
+    const o = options[idx]
+    if (!o || o.disabled) return
+    onChange(o.value)
+    setOpen(false)
+    btnRef.current?.focus()
+  }
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    switch (e.key) {
+      case 'ArrowDown':
+      case 'ArrowUp':
+        e.preventDefault()
+        if (!open) setOpen(true)
+        else step(e.key === 'ArrowDown' ? 1 : -1)
+        return
+      case 'Home':
+        if (open) {
+          e.preventDefault()
+          setActive(0)
+        }
+        return
+      case 'End':
+        if (open) {
+          e.preventDefault()
+          setActive(options.length - 1)
+        }
+        return
+      case 'Enter':
+      case ' ':
+        e.preventDefault()
+        if (!open) setOpen(true)
+        else commit(active)
+        return
+      case 'Tab':
+        if (open) setOpen(false)
+        return
+      default:
+        // 首字母跳转：长列表（几百个账号/模型）靠键盘找比滚动快
+        if (open && e.key.length === 1) {
+          const ch = e.key.toLowerCase()
+          const at = options.findIndex(
+            (o, i) => i > active && !o.disabled && String(o.value).toLowerCase().startsWith(ch),
+          )
+          if (at >= 0) setActive(at)
+        }
+    }
+  }
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        id={id}
+        className={'select dd' + (open ? ' open' : '') + (className ? ' ' + className : '')}
+        role="combobox"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listId : undefined}
+        aria-activedescendant={open ? listId + '-' + active : undefined}
+        aria-disabled={disabled || undefined}
+        disabled={disabled}
+        title={title}
+        onClick={() => !disabled && setOpen((v) => !v)}
+        onKeyDown={onKeyDown}
+      >
+        <span className="dd-lbl">{current ? current.label : placeholder}</span>
+        <svg className="dd-arrow" viewBox="0 0 10 6" aria-hidden="true">
+          <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && rect
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className={'dd-menu' + (rect.up ? ' up' : '')}
+              role="listbox"
+              id={listId}
+              aria-label={ariaLabel}
+              style={{
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                maxHeight: rect.maxH,
+                transform: rect.up ? 'translateY(-100%)' : undefined,
+              }}
+            >
+              {options.map((o, i) => (
+                <div
+                  key={o.value + '#' + i}
+                  data-idx={i}
+                  id={listId + '-' + i}
+                  role="option"
+                  aria-selected={o.value === value}
+                  aria-disabled={o.disabled || undefined}
+                  className={
+                    'dd-opt' + (o.value === value ? ' on' : '') + (i === active ? ' act' : '') + (o.disabled ? ' dis' : '')
+                  }
+                  onMouseEnter={() => !o.disabled && setActive(i)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => commit(i)}
+                >
+                  <span className="dd-lbl">{o.label}</span>
+                  {o.value === value && (
+                    <svg className="dd-check" viewBox="0 0 12 10" aria-hidden="true">
+                      <path d="M1 5l3.5 3.5L11 1.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  )}
+                </div>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  )
+}
+
+// Menu 是行内「更多操作」菜单：同一套 portal + fixed 定位逻辑，避免表格
+// .tbl-wrap 的 overflow 把下拉裁掉。用途是把详情弹层里的动作直接搬到列表行内。
+export type MenuItem = {
+  label: ReactNode
+  onSelect: () => void
+  disabled?: boolean
+  danger?: boolean
+  /** 在这一项之前画一条分隔线 */
+  sep?: boolean
+}
+
+export function Menu({
+  items,
+  ariaLabel = '更多操作',
+  title,
+  className = '',
+  align = 'right',
+  trigger,
+}: {
+  items: MenuItem[]
+  ariaLabel?: string
+  title?: string
+  className?: string
+  align?: 'left' | 'right'
+  trigger?: ReactNode
+}) {
+  const [open, setOpen] = useState(false)
+  const [rect, setRect] = useState<{ left: number; top: number; up: boolean; maxH: number } | null>(null)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement | null>(null)
+  const autoId = 'menu' + useId().replace(/:/g, '')
+
+  const place = useCallback(() => {
+    const b = btnRef.current
+    if (!b) return
+    const r = b.getBoundingClientRect()
+    const mw = menuRef.current?.offsetWidth ?? 176
+    const gap = 4
+    const below = window.innerHeight - r.bottom - gap - 8
+    const above = r.top - gap - 8
+    const up = below < 140 && above > below
+    const left =
+      align === 'right'
+        ? Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8))
+        : Math.max(8, Math.min(r.left, window.innerWidth - mw - 8))
+    setRect({ left, top: up ? r.top - gap : r.bottom + gap, up, maxH: Math.max(120, Math.min(280, up ? above : below)) })
+  }, [align])
+
+  useEffect(() => {
+    if (!open) return
+    place()
+    const onDocDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (btnRef.current?.contains(t) || menuRef.current?.contains(t)) return
+      setOpen(false)
+    }
+    const onReposition = () => place()
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      e.preventDefault()
+      setOpen(false)
+      btnRef.current?.focus()
+    }
+    document.addEventListener('mousedown', onDocDown)
+    window.addEventListener('resize', onReposition)
+    window.addEventListener('scroll', onReposition, true)
+    document.addEventListener('keydown', onEsc, true)
+    // 与 Select 共用一套互斥：一次只展开一个菜单
+    document.dispatchEvent(new CustomEvent<string>(DD_OPEN_EVENT, { detail: autoId }))
+    return () => {
+      document.removeEventListener('mousedown', onDocDown)
+      window.removeEventListener('resize', onReposition)
+      window.removeEventListener('scroll', onReposition, true)
+      document.removeEventListener('keydown', onEsc, true)
+    }
+  }, [open, place])
+
+  useEffect(() => {
+    const onOtherOpen = (e: Event) => {
+      if ((e as CustomEvent<string>).detail !== autoId) setOpen(false)
+    }
+    document.addEventListener(DD_OPEN_EVENT, onOtherOpen)
+    return () => document.removeEventListener(DD_OPEN_EVENT, onOtherOpen)
+  }, [autoId])
+
+  // 首次 place 时菜单还没挂载，只能按兜底宽度估；挂载后拿到真实宽度立刻重摆，
+  // 否则右对齐会按 176px 估宽、菜单右侧溢出视口几个像素。
+  const setMenuEl = useCallback(
+    (el: HTMLDivElement | null) => {
+      menuRef.current = el
+      if (el) place()
+    },
+    [place],
+  )
+
+  const pick = (it: MenuItem) => {
+    if (it.disabled) return
+    setOpen(false)
+    it.onSelect()
+  }
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      setOpen(true)
+    }
+  }
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        className={'btn sm ghost' + (className ? ' ' + className : '')}
+        aria-label={ariaLabel}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={title || ariaLabel}
+        onClick={() => setOpen((v) => !v)}
+        onKeyDown={onKeyDown}
+        disabled={items.length === 0}
+      >
+        {trigger ?? (
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" fill="currentColor">
+            <circle cx="3" cy="8" r="1.4" />
+            <circle cx="8" cy="8" r="1.4" />
+            <circle cx="13" cy="8" r="1.4" />
+          </svg>
+        )}
+      </button>
+      {open && rect
+        ? createPortal(
+            <div
+              ref={setMenuEl}
+              className="dd-menu menu"
+              role="menu"
+              aria-label={ariaLabel}
+              style={{
+                left: rect.left,
+                top: rect.top,
+                maxHeight: rect.maxH,
+                transform: rect.up ? 'translateY(-100%)' : undefined,
+              }}
+            >
+              {items.map((it, i) => (
+                <div key={i} role="none">
+                  {it.sep ? <div className="dd-sep" role="separator" /> : null}
+                  <div
+                    role="menuitem"
+                    tabIndex={-1}
+                    aria-disabled={it.disabled || undefined}
+                    className={'dd-opt' + (it.disabled ? ' dis' : '') + (it.danger ? ' danger' : '')}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => pick(it)}
+                  >
+                    <span className="dd-lbl">{it.label}</span>
+                  </div>
+                </div>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  )
+}
+
 // ---------- 弹层 ----------
 
 // 弹层可以叠着开（例如初始密码提示压在页面弹层上），滚动锁定必须计数，
@@ -488,18 +899,14 @@ export function Pager({
           共 {total} 条 · 第 {page}/{pages} 页
         </span>
         {onPageSize && (
-          <select
-            className="select xs"
-            aria-label="每页条数"
-            value={pageSize}
-            onChange={(e) => onPageSize(Number(e.target.value))}
-          >
-            {[10, 20, 50, 100].map((n) => (
-              <option key={n} value={n}>
-                {n} / 页
-              </option>
-            ))}
-          </select>
+          <Select
+            className="xs"
+            ariaLabel="每页条数"
+            value={String(pageSize)}
+            onChange={(v) => onPageSize(Number(v))}
+            menuMaxHeight={220}
+            options={[10, 20, 50, 100].map((n) => ({ value: String(n), label: n + ' / 页' }))}
+          />
         )}
       </div>
       <div className="pages">
