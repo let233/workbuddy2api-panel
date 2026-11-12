@@ -4,7 +4,7 @@ import { useQuery } from '../lib/hooks'
 import { useRefresh } from '../lib/refresh'
 import { useToast } from '../lib/toast'
 import { bytes, num } from '../lib/format'
-import { Badge, Box, Empty, Field, KV, Skeleton, Switch } from '../components/ui'
+import { Badge, Box, Empty, Field, KV, Segmented, Skeleton, Switch } from '../components/ui'
 
 type ConfigResp = {
   ok: boolean
@@ -31,11 +31,15 @@ type FieldDef = {
   max?: number
   step?: number
   placeholder?: string
+  /** 分域字段：cn = 国内版，global = 国际版；不写即共享配置，任何分域视图下都显示 */
+  realm?: 'cn' | 'global'
 }
 
 type Group = {
   title: string
   sub?: string
+  /** 组末补充说明 */
+  note?: string
   fields: FieldDef[]
 }
 
@@ -148,11 +152,12 @@ const GROUPS: Group[] = [
       { path: 'upstream.dump_max_bytes', label: '单次抓包上限（字节）', kind: 'number' },
       { path: 'upstream.restriction_hold_seconds', label: '限制全池暂停（秒）', kind: 'number', hint: '0 = 关闭' },
       { path: 'dns_servers', label: 'DNS 服务器', kind: 'list', placeholder: '1.1.1.1, 8.8.8.8', hint: '逗号分隔，留空用系统默认' },
-      { path: 'global.chat_base', label: 'global 对话地址', kind: 'text', hint: '空 = 内置默认' },
-      { path: 'global.billing_base', label: 'global 计费地址', kind: 'text', hint: '空 = 内置默认' },
-      { path: 'cn.chat_base', label: 'cn 对话地址', kind: 'text', hint: '空 = 内置默认' },
-      { path: 'cn.billing_base', label: 'cn 计费地址', kind: 'text', hint: '空 = 内置默认' },
+      { path: 'global.chat_base', label: '国际版对话地址', kind: 'text', realm: 'global', hint: '按账号 domain 选官方主机；空 = 内置默认' },
+      { path: 'global.billing_base', label: '国际版计费地址', kind: 'text', realm: 'global', hint: '同国际版对话地址口径；空 = 内置默认' },
+      { path: 'cn.chat_base', label: '国内版对话地址', kind: 'text', realm: 'cn', hint: '覆盖国内版对话 / 模型目录上游域名；空 = 内置默认' },
+      { path: 'cn.billing_base', label: '国内版计费地址', kind: 'text', realm: 'cn', hint: '覆盖国内版积分 / 成长任务上游域名；空 = 内置默认' },
     ],
+    note: '模型级分域在「模型」页用 cn: / global: 前缀的白名单 / 黑名单实现，这里只配域名 base。',
   },
   {
     title: '自动更新',
@@ -162,6 +167,7 @@ const GROUPS: Group[] = [
       { path: 'update.auto_time', label: '每日检查时间', kind: 'text', placeholder: '04:30', hint: 'HH:MM，上海时区' },
       { path: 'update.mirror', label: '资产镜像前缀', kind: 'text', placeholder: 'https://ghproxy.example.com/', hint: '空 = 直连 GitHub' },
       { path: 'update.proxy', label: '更新代理', kind: 'text', placeholder: 'socks5://127.0.0.1:1080', hint: '支持 http/https/socks5，空 = 不使用代理' },
+      { path: 'update.proxy_from_env', label: '读取出站环境变量代理', kind: 'switch', hint: '关闭后完全不读 HTTP_PROXY / HTTPS_PROXY' },
     ],
   },
   {
@@ -273,6 +279,27 @@ function parseList(text: string): string[] {
     .filter((s) => s !== '')
 }
 
+// Go 时长：30m / 2h / 600s / 1h30m。留空表示「不修改」，交给保存逻辑跳过，不当错误。
+const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/
+
+function durationOk(v: unknown): boolean {
+  if (typeof v !== 'string') return true
+  const s = v.trim()
+  if (s === '') return true
+  return DURATION_RE.test(s)
+}
+
+const FIELD_MAP = new Map<string, FieldDef>()
+for (const g of GROUPS) for (const fd of g.fields) FIELD_MAP.set(fd.path, fd)
+
+type Realm = 'all' | 'cn' | 'global'
+
+const REALM_OPTIONS: { value: Realm; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'cn', label: '国内版' },
+  { value: 'global', label: '国际版' },
+]
+
 export default function Config() {
   const { tick } = useRefresh()
   const toast = useToast()
@@ -280,6 +307,8 @@ export default function Config() {
   const [edits, setEdits] = useState<Record<string, unknown>>({})
   const [saving, setSaving] = useState(false)
   const [restartFields, setRestartFields] = useState<string[]>([])
+  // 分域视图开关：只影响显示哪些分域字段，共享配置始终显示；保存仍提交整份改动
+  const [realm, setRealm] = useState<Realm>('all')
 
   const envManaged = useMemo(() => new Set(q.data?.environment_managed_fields ?? []), [q.data])
   const cfg = q.data?.config
@@ -299,6 +328,18 @@ export default function Config() {
 
   const save = () => {
     if (!dirty) return
+    const badDurations = dirtyPaths.filter((p) => {
+      const fd = FIELD_MAP.get(p)
+      return fd?.kind === 'duration' && !durationOk(edits[p])
+    })
+    if (badDurations.length > 0) {
+      toast.err(
+        '时长格式不对：' +
+          badDurations.map((p) => FIELD_MAP.get(p)?.label ?? p).join('、') +
+          '（应写成 30m / 2h / 600s / 1h30m）',
+      )
+      return
+    }
     const body: Record<string, unknown> = {}
     let skipped = 0
     for (const path of dirtyPaths) {
@@ -417,8 +458,13 @@ export default function Config() {
         />
       )
     }
+    const badDuration = f.kind === 'duration' && !durationOk(v)
     const field = (
-      <Field label={managed ? `${f.label}（托管）` : f.label} hint={hint}>
+      <Field
+        label={managed ? f.label + '（托管）' : f.label}
+        hint={hint}
+        error={badDuration ? '格式应为 Go 时长：30m / 2h / 600s / 1h30m' : undefined}
+      >
         {control}
       </Field>
     )
@@ -443,6 +489,16 @@ export default function Config() {
             重新读取
           </button>
         </div>
+      </div>
+
+      <div className="toolbar">
+        <span className="small muted">分域视图</span>
+        <div className="segmented-scroll">
+          <Segmented<Realm> value={realm} options={REALM_OPTIONS} onChange={setRealm} ariaLabel="配置分域" />
+        </div>
+        <span className="tiny muted">
+          切换只决定显示哪些分域字段（域名 base 等），共享配置始终显示；保存仍提交全部改动。
+        </span>
       </div>
 
       {q.error ? (
@@ -490,11 +546,16 @@ export default function Config() {
         )
       ) : (
         <>
-          {GROUPS.map((g) => (
-            <Box key={g.title} title={g.title} sub={g.sub}>
-              <div className="formgrid">{g.fields.map(renderField)}</div>
-            </Box>
-          ))}
+          {GROUPS.map((g) => {
+            const fields = g.fields.filter((fd) => realm === 'all' || !fd.realm || fd.realm === realm)
+            if (fields.length === 0) return null
+            return (
+              <Box key={g.title} title={g.title} sub={g.sub}>
+                <div className="formgrid">{fields.map(renderField)}</div>
+                {g.note ? <p className="tiny muted">{g.note}</p> : null}
+              </Box>
+            )
+          })}
 
           <Box title="只读项" sub="以下配置只能改配置文件，部分需重启生效">
             <KV

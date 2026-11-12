@@ -1,6 +1,6 @@
 // Accounts.tsx 账号池：指标概览、分页筛选、批量动作、导入导出与详情弹层。
-import { useMemo, useState } from 'react'
-import { api, errorText } from '../lib/api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ApiError, api, errorText } from '../lib/api'
 import { useBusy, useDebounced, useQuery, useSelection } from '../lib/hooks'
 import { useRefresh } from '../lib/refresh'
 import { useToast } from '../lib/toast'
@@ -20,6 +20,7 @@ import {
   Skeleton,
   Stat,
   StatsGrid,
+  Tabs,
   type Tone,
 } from '../components/ui'
 import { DataTable, type Column } from '../components/DataTable'
@@ -78,6 +79,7 @@ type OverviewResp = {
   disabled?: number
   paused?: number
   credits_sum?: number
+  sticky_sessions?: number
 }
 
 type ProxyView = { id: string; name: string; enabled?: boolean; status?: string; latency_ms?: number }
@@ -87,9 +89,85 @@ type ProxySnap = { proxies?: ProxyView[]; bindings?: Record<string, Binding> }
 type ProbeResp = { verdict?: string; detail?: string; advice?: string }
 type BalanceResp = { ok?: boolean; credits?: number; credits_total?: number }
 
+type CheckinResp = {
+  ok?: boolean
+  realm?: string
+  skipped?: boolean
+  skip_reason?: string
+  checkin_done?: boolean
+  checkin_message?: string
+  checkin_error?: string
+  enterprise?: boolean
+  api_key?: boolean
+}
+
+type LoginStart = { url?: string; state?: string; realm?: string; site?: string }
+type LoginPoll = {
+  done?: boolean
+  fatal?: boolean
+  message?: string
+  uid?: string
+  nickname?: string
+  realm?: string
+  credits?: number
+  credits_total?: number
+  balance_error?: string
+  checkin_message?: string
+}
+
+type RosterItem = {
+  uid: string
+  nickname?: string
+  realm?: string
+  group?: string
+  paused?: boolean
+  disabled?: boolean
+  enterprise?: boolean
+  api_key?: boolean
+}
+type RosterResp = { accounts?: RosterItem[]; total?: number }
+
 type Filter = 'all' | 'healthy' | 'cooling' | 'disabled' | 'paused'
 type ProxyMode = 'random' | 'direct' | 'fixed'
 type SimpleAct = 'pause' | 'resume' | 'revive' | 'disable'
+type AddTab = 'login' | 'import' | 'apikey'
+type Site = 'cn' | 'workbuddy'
+type AllActKind = 'checkin_all' | 'travel_all' | 'activity_all' | 'keepalive_all' | 'balance_all'
+
+type ConfirmState =
+  | { kind: 'remove' | 'disable' | 'revive' | 'group'; uids: string[]; name: string; group?: string }
+  | { kind: 'all'; act: AllActKind; name: string }
+  | { kind: 'export'; href: string; name: string; count: number }
+
+function confirmTitle(c: ConfirmState | null): string {
+  if (!c) return ''
+  if (c.kind === 'remove') return '删除账号'
+  if (c.kind === 'disable') return '禁用账号'
+  if (c.kind === 'revive') return '解冻账号'
+  if (c.kind === 'group') return '更新分组'
+  if (c.kind === 'export') return '导出账号 JSON'
+  return c.name
+}
+
+function confirmMessage(c: ConfirmState | null): string {
+  if (!c) return ''
+  if (c.kind === 'export') return '将导出 ' + c.count + ' 个账号，文件里是明文 accessToken / refreshToken，请妥善保管。'
+  if (c.kind === 'all') return ALL_ACT_HINT[c.act]
+  if (c.kind === 'remove') return '将从账号目录删除 ' + c.name + '，并尽量清掉对应授权文件。此操作不可撤销。'
+  if (c.kind === 'disable') return '将禁用 ' + c.name + '，它们不再参与选号；随时可以解冻。'
+  if (c.kind === 'revive') return '将解冻 ' + c.name + '，恢复参与选号。'
+  return '将把 ' + c.name + ' 的分组改为「' + (c.group || '未分组') + '」。'
+}
+
+function confirmAction(c: ConfirmState | null): string {
+  if (!c) return '确认'
+  if (c.kind === 'all') return '开始'
+  if (c.kind === 'export') return '下载'
+  if (c.kind === 'remove') return '删除'
+  if (c.kind === 'disable') return '禁用'
+  if (c.kind === 'revive') return '解冻'
+  return '保存'
+}
 
 const FILTERS: { value: Filter; label: string }[] = [
   { value: 'all', label: '全部状态' },
@@ -104,6 +182,33 @@ const PROXY_OPTIONS: { value: ProxyMode; label: string }[] = [
   { value: 'direct', label: '直连' },
   { value: 'fixed', label: '固定节点' },
 ]
+
+const ADD_TABS: { value: AddTab; label: string }[] = [
+  { value: 'login', label: '浏览器登录' },
+  { value: 'import', label: '导入 JSON' },
+  { value: 'apikey', label: 'API Key' },
+]
+
+const SITE_OPTIONS = [
+  { value: 'cn' as Site, label: '国内版 CN' },
+  { value: 'workbuddy' as Site, label: '国际版 Global' },
+]
+
+const ALL_ACTS: { act: AllActKind; label: string }[] = [
+  { act: 'checkin_all', label: '全部签到' },
+  { act: 'travel_all', label: '旅行巡检' },
+  { act: 'activity_all', label: '活跃上报' },
+  { act: 'keepalive_all', label: '全部保活' },
+  { act: 'balance_all', label: '全部刷新余额' },
+]
+
+const ALL_ACT_HINT: Record<AllActKind, string> = {
+  checkin_all: '对全部国内版账号逐个签到，后台异步执行，耗时较长。',
+  travel_all: '对全部账号做一次旅行巡检（校对注册地区），后台异步执行。',
+  activity_all: '对全部账号做一次活跃上报，后台异步执行。',
+  keepalive_all: '对全部账号做一次保活续期，后台异步执行。',
+  balance_all: '从上游重新拉取全部账号的积分余额，会同步昵称与解冻状态，可能耗时几十秒。',
+}
 
 const VERDICT: Record<string, { tone: Tone; text: string }> = {
   lifted: { tone: 'ok', text: '上游已解封，可以点「解冻」恢复使用' },
@@ -156,6 +261,47 @@ function stamp(): string {
   )
 }
 
+/** 签到结果文案，对齐旧面板 checkinResultNote 的口径。 */
+function checkinNote(r: CheckinResp): { tone: 'ok' | 'warn' | 'bad'; text: string } {
+  if (r.skipped) return { tone: 'warn', text: r.skip_reason || '该账号不适用签到' }
+  if (!r.checkin_done) {
+    return { tone: 'warn', text: '签到未完成：' + (r.checkin_error || r.checkin_message || '请稍后重试') }
+  }
+  return { tone: 'ok', text: '签到已完成' + (r.checkin_message ? '：' + r.checkin_message : '') }
+}
+
+/** 备注只存本机 localStorage，键是 uid 前 8 位（与旧面板同一份数据）。 */
+const LS_REMARKS = 'wb2api.remarks.v1'
+
+function remarkKey(uid: string): string {
+  return uid.slice(0, 8)
+}
+
+function readRemarks(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(LS_REMARKS)
+    if (!raw) return {}
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === 'string' && v) out[k] = v
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writeRemarks(m: Record<string, string>): boolean {
+  try {
+    localStorage.setItem(LS_REMARKS, JSON.stringify(m))
+    return true
+  } catch {
+    return false
+  }
+}
+
 type ImportResult = {
   ok?: boolean
   dry_run?: boolean
@@ -200,17 +346,39 @@ export default function Accounts() {
   const [proxyMode, setProxyMode] = useState<ProxyMode>('random')
   const [proxyId, setProxyId] = useState('')
 
-  const [confirm, setConfirm] = useState<{ kind: 'remove' | 'disable'; uids: string[]; name: string } | null>(
-    null,
-  )
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null)
 
-  const [importOpen, setImportOpen] = useState(false)
+  // 添加账号弹层：授权链接 / 导入 JSON / API Key
+  const [addOpen, setAddOpen] = useState(false)
+  const [addTab, setAddTab] = useState<AddTab>('login')
+  const [site, setSite] = useState<Site>('cn')
+  const [login, setLogin] = useState<LoginStart | null>(null)
+  const [loginErr, setLoginErr] = useState('')
+  const [loginNote, setLoginNote] = useState('')
+  const [loginDone, setLoginDone] = useState('')
+  const [keyToken, setKeyToken] = useState('')
+  const [keyNick, setKeyNick] = useState('')
+  const [keyUid, setKeyUid] = useState('')
+
   const [paste, setPaste] = useState('')
   const [importFile, setImportFile] = useState<File | null>(null)
   const [fileKey, setFileKey] = useState(0)
   const [preview, setPreview] = useState<ImportResult | null>(null)
   const [job, setJob] = useState<ImportProgress | null>(null)
   const [importErr, setImportErr] = useState('')
+
+  // 备注（本机 localStorage）与分组（服务端字段）
+  const [remarks, setRemarks] = useState<Record<string, string>>(() => readRemarks())
+  const [remarkOpen, setRemarkOpen] = useState(false)
+  const [rmText, setRmText] = useState<Record<string, string>>({})
+  const [gpText, setGpText] = useState<Record<string, string>>({})
+  const [bulkGroup, setBulkGroup] = useState('')
+  const [rmKw, setRmKw] = useState('')
+
+  const loginTimer = useRef<number | null>(null)
+  const loginStateRef = useRef('')
+  const loginFails = useRef(0)
+  const loginStartAt = useRef(0)
 
   const q = useQuery<AccountsResp>(
     (signal) =>
@@ -233,6 +401,13 @@ export default function Accounts() {
   const px = useQuery<ProxySnap>((signal) => api.get('/proxies', undefined, signal), [tick], {
     poll: 30000,
   })
+  const roster = useQuery<RosterResp>((signal) => api.get('/accounts/roster', undefined, signal), [tick])
+
+  useEffect(() => {
+    return () => {
+      if (loginTimer.current !== null) window.clearInterval(loginTimer.current)
+    }
+  }, [])
 
   const sel = useSelection<string>()
   const data = q.data
@@ -246,6 +421,17 @@ export default function Accounts() {
       return (s.nickname || '').toLowerCase().indexOf(kw) >= 0 || s.uid.toLowerCase().indexOf(kw) >= 0
     })
   }, [data, statusFilter, kw])
+
+  const rosterMap = useMemo(() => {
+    const m = new Map<string, RosterItem>()
+    for (const it of roster.data?.accounts ?? []) m.set(it.uid, it)
+    return m
+  }, [roster.data])
+
+  const groupUids = useMemo(
+    () => (roster.data?.accounts ?? []).filter((a) => a.group === group).map((a) => a.uid),
+    [roster.data, group],
+  )
 
   const proxies = px.data?.proxies ?? []
   const bindings = px.data?.bindings ?? {}
@@ -322,60 +508,392 @@ export default function Accounts() {
     })
   }
 
-  const runBatch = (action: 'balance' | 'pause' | 'resume' | 'revive', label: string) => {
+  const doCheckin = (uid: string) => {
+    void run('checkin:' + uid, async () => {
+      try {
+        const r = await api.post<CheckinResp>('/accounts/' + encodeURIComponent(uid) + '/checkin')
+        const note = checkinNote(r)
+        if (note.tone === 'ok') toast.ok(note.text)
+        else toast.warn(note.text)
+        q.reload()
+        ov.reload()
+      } catch (e) {
+        toast.err(errorText(e))
+      }
+    })
+  }
+
+  type BatchAct = 'checkin' | 'balance' | 'pause' | 'resume' | 'revive'
+
+  /** 与旧面板 BULK_ACT 一致：不满足条件的号直接跳过，不算失败。 */
+  const batchSkip = (act: BatchAct, r?: RosterItem): boolean => {
+    if (!r) return false
+    if (act === 'checkin') return !!r.enterprise || !!r.api_key || !!r.disabled
+    if (act === 'pause') return !!r.paused || !!r.disabled
+    if (act === 'resume') return !r.paused
+    if (act === 'revive') return !r.disabled
+    return false
+  }
+
+  const runBatch = (act: BatchAct, label: string) => {
     const uids = sel.list
     if (!uids.length) {
       toast.warn('先勾选账号')
       return
     }
-    void run('batch:' + action, async () => {
+    void run('batch:' + act, async () => {
+      let okCount = 0
+      let skipCount = 0
+      let firstErr = ''
+      for (const uid of uids) {
+        if (batchSkip(act, rosterMap.get(uid))) {
+          skipCount++
+          continue
+        }
+        try {
+          if (act === 'checkin') {
+            const r = await api.post<CheckinResp>('/accounts/' + encodeURIComponent(uid) + '/checkin')
+            if (r.skipped) skipCount++
+            else okCount++
+          } else {
+            await call(uid, act)
+            okCount++
+          }
+        } catch (e) {
+          if (!firstErr) firstErr = errorText(e)
+        }
+      }
+      const bits = [label + '：成功 ' + okCount + ' 个']
+      if (uids.length - okCount - skipCount > 0) bits.push('失败 ' + (uids.length - okCount - skipCount) + ' 个')
+      if (skipCount) bits.push('跳过 ' + skipCount + ' 个')
+      if (firstErr) toast.warn(bits.join('，') + '（' + firstErr + '）')
+      else if (!okCount) toast.warn(bits.join('，'))
+      else toast.ok(bits.join('，'))
+      q.reload()
+      ov.reload()
+    })
+  }
+
+  /** 组内批量：作用域是该分组全部账号（来自 roster），不是当前页。 */
+  const runGroupAct = (act: 'checkin' | 'pause' | 'resume') => {
+    const uids = groupUids
+    if (!uids.length) {
+      toast.warn('这个分组里没有账号')
+      return
+    }
+    void run('group:' + act, async () => {
       let okCount = 0
       let firstErr = ''
       for (const uid of uids) {
+        if (batchSkip(act, rosterMap.get(uid))) continue
         try {
-          await call(uid, action)
+          await call(uid, act)
           okCount++
         } catch (e) {
           if (!firstErr) firstErr = errorText(e)
         }
       }
-      if (okCount) {
-        toast.ok(label + '：成功 ' + okCount + ' 个' + (uids.length > okCount ? '，失败 ' + (uids.length - okCount) + ' 个' : ''))
-      }
-      if (firstErr) toast.err(firstErr)
+      if (okCount) toast.ok('组内' + (act === 'checkin' ? '签到' : act === 'pause' ? '暂停' : '恢复') + '：' + okCount + ' 个')
+      if (firstErr) toast.warn(firstErr)
       q.reload()
       ov.reload()
+    })
+  }
+
+  /** 全量动作：checkin/travel/activity/keepalive 异步执行，balance_all 同步返回。 */
+  const doAllAct = (act: AllActKind) => {
+    void run('all:' + act, async () => {
+      try {
+        await api.post<{ ok?: boolean; started?: boolean }>('/' + act)
+        toast.ok(act === 'balance_all' ? '余额已从上游刷新' : '已开始，后台执行中，稍后自动刷新')
+        q.reload()
+        ov.reload()
+      } catch (e) {
+        toast.err(errorText(e))
+      }
+    })
+  }
+
+  const applyGroup = (uids: string[], name: string) => {
+    if (!uids.length) {
+      toast.warn('先勾选账号')
+      return
+    }
+    void run('group', async () => {
+      let okCount = 0
+      let firstErr = ''
+      for (const uid of uids) {
+        try {
+          await call(uid, 'group', { group: name })
+          okCount++
+        } catch (e) {
+          if (!firstErr) firstErr = errorText(e)
+        }
+      }
+      if (okCount) toast.ok('分组已更新 ' + okCount + ' 个' + (firstErr ? '，失败 ' + (uids.length - okCount) + ' 个' : ''))
+      if (firstErr) toast.err(firstErr)
+      setBulkGroup('')
+      q.reload()
+      roster.reload()
     })
   }
 
   const runConfirm = () => {
     const c = confirm
     if (!c) return
+    if (c.kind === 'all') {
+      setConfirm(null)
+      doAllAct(c.act)
+      return
+    }
+    if (c.kind === 'export') {
+      setConfirm(null)
+      const a = document.createElement('a')
+      a.href = c.href
+      a.download = c.name
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      toast.ok('正在下载 ' + c.count + ' 个账号的 JSON（含明文 token，注意保管）')
+      return
+    }
+    const uids = c.uids
+    const groupName = c.group ?? ''
     void run('confirm', async () => {
-      const remove = c.kind === 'remove'
       let okCount = 0
       let firstErr = ''
-      for (const uid of c.uids) {
+      for (const uid of uids) {
         try {
-          await call(uid, remove ? 'remove' : 'disable', remove ? undefined : { reason: '面板批量禁用' })
+          if (c.kind === 'remove') await call(uid, 'remove')
+          else if (c.kind === 'disable') await call(uid, 'disable', { reason: '面板手动禁用' })
+          else if (c.kind === 'revive') await call(uid, 'revive')
+          else await call(uid, 'group', { group: groupName })
           okCount++
         } catch (e) {
           if (!firstErr) firstErr = errorText(e)
         }
       }
       if (okCount) {
-        toast.ok(
-          (remove ? '已删除 ' : '已禁用 ') + okCount + ' 个账号' +
-            (c.uids.length > okCount ? '，失败 ' + (c.uids.length - okCount) + ' 个' : ''),
-        )
+        const verb =
+          c.kind === 'remove' ? '已删除 ' : c.kind === 'disable' ? '已禁用 ' : c.kind === 'revive' ? '已解冻 ' : '分组已更新 '
+        toast.ok(verb + okCount + ' 个' + (uids.length > okCount ? '，失败 ' + (uids.length - okCount) + ' 个' : ''))
       }
       if (firstErr) toast.err(firstErr)
-      if (c.uids.length === 1 && detailUid === c.uids[0]) setDetailUid(null)
+      if (uids.length === 1 && detailUid === uids[0] && c.kind !== 'group') setDetailUid(null)
       setConfirm(null)
-      sel.clear()
+      if (c.kind !== 'group') sel.clear()
       q.reload()
       ov.reload()
+      roster.reload()
     })
+  }
+
+  // ---------- 添加账号：授权链接 ----------
+  const stopLoginPoll = () => {
+    if (loginTimer.current !== null) {
+      window.clearInterval(loginTimer.current)
+      loginTimer.current = null
+    }
+  }
+
+  const pollLogin = async () => {
+    const state = loginStateRef.current
+    if (!state) return
+    try {
+      const r = await api.get<LoginPoll>('/login/poll', { state })
+      loginFails.current = 0
+      if (r.fatal) {
+        stopLoginPoll()
+        loginStateRef.current = ''
+        setLoginErr(r.message || '登录被上游拒绝')
+        return
+      }
+      if (r.done) {
+        stopLoginPoll()
+        loginStateRef.current = ''
+        const who = (r.nickname || r.uid || '账号') + (r.realm === 'global' ? '（国际版）' : '')
+        const money =
+          typeof r.credits === 'number' && r.credits >= 0
+            ? ' · 积分 ' + credits(r.credits) + '/' + credits(r.credits_total)
+            : ''
+        setLogin(null)
+        setLoginDone(
+          '已添加 ' + who + money + (r.checkin_message ? ' · ' + r.checkin_message : '') + '，账号已载入池中',
+        )
+        if (r.balance_error) toast.warn('账号已添加，但余额校验失败：' + r.balance_error)
+        else toast.ok('已添加 ' + who)
+        q.reload()
+        ov.reload()
+        return
+      }
+      if (Date.now() - loginStartAt.current > 90000) {
+        setLoginNote('仍在等待浏览器完成登录。若浏览器已显示「登录失败」，请关闭本窗口重新获取授权链接（链接 15 分钟内有效）。')
+      } else if (r.message) {
+        setLoginNote(r.message)
+      }
+    } catch (e) {
+      const status = e instanceof ApiError ? e.status : 0
+      if (status === 404 || status === 410) {
+        stopLoginPoll()
+        loginStateRef.current = ''
+        setLogin(null)
+        setLoginErr('登录会话已过期，请关闭后重新添加')
+        return
+      }
+      loginFails.current += 1
+      if (loginFails.current >= 20) {
+        stopLoginPoll()
+        loginStateRef.current = ''
+        setLoginErr('连续 20 次查询失败，已停止轮询：' + errorText(e) + '（授权可能已完成，可关闭后重新添加）')
+        return
+      }
+      setLoginNote('网络中断，自动重试中（' + loginFails.current + '/20）：' + errorText(e))
+    }
+  }
+
+  const startLogin = () => {
+    void run('login:start', async () => {
+      setLoginErr('')
+      setLoginNote('')
+      setLoginDone('')
+      setLogin(null)
+      try {
+        const r = await api.post<LoginStart>('/login/start', { site })
+        if (!r.url || !r.state) {
+          setLoginErr('上游没有返回授权链接，请稍后重试')
+          return
+        }
+        setLogin(r)
+        loginStateRef.current = r.state
+        loginFails.current = 0
+        loginStartAt.current = Date.now()
+        stopLoginPoll()
+        loginTimer.current = window.setInterval(() => {
+          void pollLogin()
+        }, 3000)
+      } catch (e) {
+        setLoginErr(errorText(e))
+      }
+    })
+  }
+
+  const addApiKey = () => {
+    const token = keyToken.trim()
+    if (!token) {
+      toast.warn('请填写 API Key')
+      return
+    }
+    void run('apikey', async () => {
+      try {
+        const r = await api.post<{ uid?: string; nickname?: string }>('/accounts/add_apikey', {
+          access_token: token,
+          nickname: keyNick.trim(),
+          uid: keyUid.trim(),
+        })
+        toast.ok('已添加 ' + (r.nickname || r.uid || 'API Key 账号') + '（API Key 账号），账号已载入池中')
+        setKeyToken('')
+        setKeyNick('')
+        setKeyUid('')
+        q.reload()
+        ov.reload()
+      } catch (e) {
+        toast.err(errorText(e))
+      }
+    })
+  }
+
+  const openAdd = (tab: AddTab) => {
+    setAddTab(tab)
+    setAddOpen(true)
+  }
+
+  const closeAdd = () => {
+    stopLoginPoll()
+    loginStateRef.current = ''
+    setAddOpen(false)
+    setLogin(null)
+    setLoginErr('')
+    setLoginNote('')
+    setLoginDone('')
+    setPaste('')
+    setImportFile(null)
+    setFileKey(fileKey + 1)
+    setPreview(null)
+    setJob(null)
+    setImportErr('')
+    setKeyToken('')
+    setKeyNick('')
+    setKeyUid('')
+  }
+
+  // ---------- 备注 / 分组 ----------
+  const openRemarks = (only?: Account) => {
+    const nextRm: Record<string, string> = {}
+    const nextGp: Record<string, string> = {}
+    for (const it of roster.data?.accounts ?? []) {
+      nextRm[it.uid] = remarks[remarkKey(it.uid)] ?? ''
+      nextGp[it.uid] = it.group ?? ''
+    }
+    if (only) {
+      nextRm[only.uid] = remarks[remarkKey(only.uid)] ?? ''
+      nextGp[only.uid] = only.group ?? ''
+      setRmKw(acctName(only))
+    } else {
+      setRmKw('')
+    }
+    setRmText(nextRm)
+    setGpText(nextGp)
+    setRemarkOpen(true)
+  }
+
+  const saveRemarks = () => {
+    const next: Record<string, string> = { ...remarks }
+    for (const [uid, v] of Object.entries(rmText)) {
+      const key = remarkKey(uid)
+      const t = v.trim().slice(0, 24)
+      if (t) next[key] = t
+      else delete next[key]
+    }
+    const wrote = writeRemarks(next)
+    setRemarks(next)
+    if (!wrote) toast.warn('备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失')
+
+    const changed: { uid: string; group: string }[] = []
+    for (const [uid, v] of Object.entries(gpText)) {
+      const orig = rosterMap.get(uid)?.group ?? ''
+      const t = v.trim().slice(0, 24)
+      if (t !== orig) changed.push({ uid, group: t })
+    }
+    if (!changed.length) {
+      toast.ok('已保存备注')
+      setRemarkOpen(false)
+      q.reload()
+      return
+    }
+    void run('remarks', async () => {
+      let okCount = 0
+      let firstErr = ''
+      for (const it of changed) {
+        try {
+          await call(it.uid, 'group', { group: it.group })
+          okCount++
+        } catch (e) {
+          if (!firstErr) firstErr = errorText(e)
+        }
+      }
+      if (okCount) toast.ok('备注已保存，分组更新 ' + okCount + ' 个')
+      if (firstErr) toast.err(firstErr)
+      setRemarkOpen(false)
+      q.reload()
+      roster.reload()
+    })
+  }
+
+  const clearRemarks = () => {
+    writeRemarks({})
+    setRemarks({})
+    setRmText({})
+    toast.ok('已清空本机备注')
   }
 
   const openDetail = (s: Account) => {
@@ -450,23 +968,24 @@ export default function Accounts() {
     })
   }
 
-  const closeImport = () => {
-    setImportOpen(false)
-    setPaste('')
-    setImportFile(null)
-    setFileKey(fileKey + 1)
-    setPreview(null)
-    setJob(null)
-    setImportErr('')
-  }
-
   const counts: { all?: number; cn?: number; global?: number } = data?.counts ?? {}
-  const exportHref = api.downloadUrl(
-    '/accounts/export',
-    sel.size ? { uids: sel.list.join(',') } : { realm: realm === 'all' ? undefined : realm, group: group || undefined },
-  )
-  const exportName =
-    'workbuddy-accounts-' + (sel.size ? 'picked' + sel.size : 'all') + '-' + stamp() + '.json'
+
+  /** 与旧面板 accExportPath 一致：有勾选就按 uid 导出，否则按当前域/分组导出。 */
+  const askExport = (picked: boolean) => {
+    const href = api.downloadUrl(
+      '/accounts/export',
+      picked
+        ? { uids: sel.list.join(',') }
+        : { realm: realm === 'all' ? undefined : realm, group: group || undefined },
+    )
+    const n = picked ? sel.size : data?.total ?? 0
+    setConfirm({
+      kind: 'export',
+      href,
+      name: 'workbuddy-accounts-' + (picked ? 'picked' + sel.size : 'all') + '-' + stamp() + '.json',
+      count: n,
+    })
+  }
 
   const ovv = (v?: number): string => (ov.data ? num(v ?? 0) : '—')
 
@@ -481,27 +1000,22 @@ export default function Accounts() {
         </p>
       </div>
       <div className="acts">
-        <button className="btn sm ghost" onClick={() => setImportOpen(true)}>
-          导入
+        <button className="btn sm primary" onClick={() => openAdd('login')}>
+          添加账号
         </button>
-        <a
-          className="btn sm"
-          href={exportHref}
-          download={exportName}
-          title={sel.size ? '导出已勾选的 ' + sel.size + ' 个账号' : '导出当前域/分组的全部账号'}
-        >
-          导出
-        </a>
+        <button className="btn sm" onClick={() => askExport(false)} title="导出当前域 / 分组的全部账号">
+          导出全部
+        </button>
         <button
           className="btn sm"
-          disabled={q.loading}
-          onClick={() => {
-            q.reload()
-            ov.reload()
-            px.reload()
-          }}
+          disabled={!sel.size}
+          onClick={() => askExport(true)}
+          title={sel.size ? '导出已勾选的 ' + sel.size + ' 个账号' : '先勾选账号'}
         >
-          {q.loading ? '刷新中…' : '刷新'}
+          导出所选
+        </button>
+        <button className="btn sm ghost" disabled={!!busy} onClick={() => doAllAct('balance_all')}>
+          {busy === 'all:balance_all' ? '刷新中…' : '刷新余额'}
         </button>
       </div>
     </div>
@@ -533,19 +1047,23 @@ export default function Accounts() {
     {
       key: 'account',
       title: '账号',
-      sortValue: (s) => acctName(s).toLowerCase(),
-      render: (s) => (
-        <div className="entity">
-          <span className="avatar-sq">{acctName(s).slice(0, 1).toUpperCase()}</span>
-          <div className="meta">
-            <div className="n truncate">{acctName(s)}</div>
-            <div className="s tiny mono truncate">
-              {s.uid.slice(0, 8)}
-              {s.group ? ' · ' + s.group : ''}
+      sortValue: (s) => (remarks[remarkKey(s.uid)] || acctName(s)).toLowerCase(),
+      render: (s) => {
+        const rm = remarks[remarkKey(s.uid)]
+        return (
+          <div className="entity">
+            <span className="avatar-sq">{acctName(s).slice(0, 1).toUpperCase()}</span>
+            <div className="meta">
+              <div className="n truncate">{rm || acctName(s)}</div>
+              <div className="s tiny mono truncate">
+                {rm ? acctName(s) + ' · ' : ''}
+                {s.uid.slice(0, 8)}
+                {s.group ? ' · ' + s.group : ''}
+              </div>
             </div>
           </div>
-        </div>
-      ),
+        )
+      },
     },
     {
       key: 'status',
@@ -626,15 +1144,30 @@ export default function Accounts() {
       align: 'right',
       className: 'c-acts',
       render: (s) => (
-        <button
-          className="btn sm"
-          onClick={(e) => {
-            e.stopPropagation()
-            openDetail(s)
-          }}
-        >
-          详情
-        </button>
+        <span className="row gap1" style={{ justifyContent: 'flex-end' }}>
+          {s.enterprise || s.api_key ? null : (
+            <button
+              className="btn sm ghost"
+              disabled={!!busy}
+              title="签到"
+              onClick={(e) => {
+                e.stopPropagation()
+                doCheckin(s.uid)
+              }}
+            >
+              签到
+            </button>
+          )}
+          <button
+            className="btn sm"
+            onClick={(e) => {
+              e.stopPropagation()
+              openDetail(s)
+            }}
+          >
+            详情
+          </button>
+        </span>
       ),
     },
   ]
@@ -659,6 +1192,7 @@ export default function Accounts() {
         <Stat label="禁用" value={ovv(ov.data?.disabled)} tone="bad" sub="需解冻" />
         <Stat label="暂停" value={ovv(ov.data?.paused)} tone="accent" sub="保留但不选号" />
         <Stat label="积分合计" value={ov.data ? credits(ov.data.credits_sum) : '—'} sub="池内可用" />
+        <Stat label="粘性会话" value={ovv(ov.data?.sticky_sessions)} sub="绑定了账号的会话" />
       </StatsGrid>
 
       <Box
@@ -669,6 +1203,37 @@ export default function Accounts() {
             : '点行打开详情，可刷新余额、探测、暂停、绑定代理'
         }
       >
+        <div className="toolbar">
+          {ALL_ACTS.map((a) => (
+            <button
+              key={a.act}
+              className="btn sm"
+              disabled={!!busy}
+              title={ALL_ACT_HINT[a.act]}
+              onClick={() => setConfirm({ kind: 'all', act: a.act, name: a.label })}
+            >
+              {a.label}
+            </button>
+          ))}
+          <span className="sep" />
+          <button className="btn sm ghost" onClick={() => openRemarks()}>
+            备注 / 分组
+          </button>
+          {group ? (
+            <>
+              <button className="btn sm" disabled={!!busy} onClick={() => runGroupAct('checkin')}>
+                组内签到
+              </button>
+              <button className="btn sm" disabled={!!busy} onClick={() => runGroupAct('pause')}>
+                组内暂停
+              </button>
+              <button className="btn sm" disabled={!!busy} onClick={() => runGroupAct('resume')}>
+                组内恢复
+              </button>
+            </>
+          ) : null}
+        </div>
+
         <div className="filters">
           <select
             className="select"
@@ -744,6 +1309,9 @@ export default function Accounts() {
         {sel.size > 0 ? (
           <div className="actionbar">
             <span className="small muted">已选 {sel.size} 个</span>
+            <button className="btn sm" disabled={!!busy} onClick={() => runBatch('checkin', '签到')}>
+              签到
+            </button>
             <button className="btn sm" disabled={!!busy} onClick={() => runBatch('balance', '刷新余额')}>
               刷新余额
             </button>
@@ -769,6 +1337,21 @@ export default function Accounts() {
               onClick={() => setConfirm({ kind: 'remove', uids: sel.list, name: sel.size + ' 个账号' })}
             >
               删除
+            </button>
+            <input
+              className="input xs"
+              placeholder="分组名（留空=清除）"
+              aria-label="批量分组"
+              value={bulkGroup}
+              onChange={(e) => setBulkGroup(e.target.value)}
+            />
+            <button
+              className="btn sm"
+              disabled={!!busy}
+              onClick={() => applyGroup(sel.list, bulkGroup.trim())}
+              title="给已勾选的账号设置分组；留空即清除分组"
+            >
+              应用分组
             </button>
             <button className="btn sm ghost ml-auto" disabled={!!busy} onClick={sel.clear}>
               清空勾选
@@ -846,6 +1429,7 @@ export default function Accounts() {
             <KV
               items={[
                 { k: '状态', v: statusOf(detail).text },
+                { k: '备注', v: remarks[remarkKey(detail.uid)] || '—' },
                 { k: '域 / 分组', v: (detail.realm || 'cn') + (detail.group ? ' · ' + detail.group : ' · 未分组') },
                 { k: '积分 / 总额度', v: credits(detail.credits) + ' / ' + credits(detail.credits_total), mono: true },
                 {
@@ -882,6 +1466,15 @@ export default function Accounts() {
                   <button className="btn sm primary" disabled={!!busy} onClick={() => doBalance(detail.uid)}>
                     刷新余额
                   </button>
+                  {detail.enterprise || detail.api_key ? (
+                    <button className="btn sm" disabled title="企业版 / API Key 账号没有签到体系">
+                      签到（不适用）
+                    </button>
+                  ) : (
+                    <button className="btn sm" disabled={!!busy} onClick={() => doCheckin(detail.uid)}>
+                      签到
+                    </button>
+                  )}
                   <button className="btn sm" disabled={!!busy} onClick={() => doProbe(detail.uid)}>
                     探测封禁
                   </button>
@@ -917,6 +1510,9 @@ export default function Accounts() {
                     onClick={() => setConfirm({ kind: 'remove', uids: [detail.uid], name: acctName(detail) })}
                   >
                     删除
+                  </button>
+                  <button className="btn sm ghost" onClick={() => openRemarks(detail)}>
+                    备注 / 分组
                   </button>
                   <button className="btn sm ghost" onClick={() => setRawOpen(!rawOpen)}>
                     {rawOpen ? '隐藏原始 JSON' : '原始 JSON'}
@@ -976,25 +1572,88 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        open={importOpen}
-        title="导入账号"
-        onClose={closeImport}
+        open={addOpen}
+        title="添加账号"
+        onClose={closeAdd}
         wide
         footer={
           <div className="row gap2">
-            <button className="btn ghost" onClick={closeImport}>
+            <button className="btn ghost" onClick={closeAdd}>
               关闭
             </button>
-            <button className="btn" disabled={!!busy} onClick={doPreview}>
-              预览
-            </button>
-            <button className="btn primary" disabled={!!busy} onClick={doImport}>
-              开始导入
-            </button>
+            {addTab === 'login' ? (
+              <button className="btn primary" disabled={!!busy || !!login} onClick={startLogin}>
+                {login ? '等待授权中…' : '获取授权链接'}
+              </button>
+            ) : addTab === 'import' ? (
+              <>
+                <button className="btn" disabled={!!busy} onClick={doPreview}>
+                  预览
+                </button>
+                <button className="btn primary" disabled={!!busy} onClick={doImport}>
+                  开始导入
+                </button>
+              </>
+            ) : (
+              <button className="btn primary" disabled={!!busy} onClick={addApiKey}>
+                添加 API Key
+              </button>
+            )}
           </div>
         }
       >
-        <div className="stack">
+        <Tabs value={addTab} options={ADD_TABS} onChange={setAddTab} />
+        {addTab === 'login' ? (
+          <div className="stack">
+            <p className="small muted">
+              点「获取授权链接」，在下面的链接里完成浏览器登录，这里会自动检测并写入凭据。国际版登录后网关会自动完成注册地区、激活与试用额度领取。
+            </p>
+            {login ? null : (
+              <Field label="站点" hint="国内版走 codebuddy.cn；国际版走 workbuddy.ai 桌面端口径。">
+                <Segmented value={site} options={SITE_OPTIONS} onChange={setSite} ariaLabel="站点" />
+              </Field>
+            )}
+            {busy === 'login:start' ? <p className="small muted">正在获取授权链接…</p> : null}
+            {loginErr ? (
+              <div className="notice bad">
+                <span>{loginErr}</span>
+              </div>
+            ) : null}
+            {login ? (
+              <div className="stack">
+                <p className="small muted">等待授权完成，自动检测中；链接 15 分钟内有效。</p>
+                <div className="row v-center gap2 row-wrap">
+                  <input className="input grow mono" readOnly value={login.url ?? ''} aria-label="授权链接" />
+                  <CopyText value={login.url ?? ''} label="复制链接" />
+                  <a className="btn sm primary" href={login.url} target="_blank" rel="noreferrer">
+                    在浏览器打开
+                  </a>
+                </div>
+                {loginNote ? <p className="small muted">{loginNote}</p> : null}
+                <div className="row gap2">
+                  <button
+                    className="btn sm ghost"
+                    onClick={() => {
+                      stopLoginPoll()
+                      loginStateRef.current = ''
+                      setLogin(null)
+                      setLoginErr('')
+                      setLoginNote('')
+                    }}
+                  >
+                    换一个授权链接
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {loginDone ? (
+              <div className="notice ok">
+                <span>{loginDone}</span>
+              </div>
+            ) : null}
+          </div>
+        ) : addTab === 'import' ? (
+          <div className="stack">
           <Field label="粘贴 JSON" hint="支持数组、单个对象、{account} 嵌套、{accounts|data|list|items} 信封或 {uid: {...}} 字典。">
             <textarea
               className="textarea"
@@ -1085,21 +1744,134 @@ export default function Accounts() {
               {job.errors && job.errors.length ? <Pre maxHeight={140}>{job.errors.join('\n')}</Pre> : null}
             </div>
           ) : null}
+          </div>
+        ) : (
+          <div className="stack">
+            <p className="small muted">
+              粘贴 CodeBuddy 平台签发的静态 API Key（ck_/pt_ 前缀）。添加后直接可用、无需浏览器登录；该账号没有签到 / 成长任务体系，额度走企业口径。
+            </p>
+            <Field label="API Key" hint="必填，ck_ 或 pt_ 开头。">
+              <input
+                className="input mono"
+                placeholder="ck_..."
+                aria-label="API Key"
+                value={keyToken}
+                onChange={(e) => setKeyToken(e.target.value)}
+              />
+            </Field>
+            <div className="formgrid">
+              <Field label="昵称（可选）">
+                <input
+                  className="input"
+                  placeholder="例如 备用号 1"
+                  value={keyNick}
+                  onChange={(e) => setKeyNick(e.target.value)}
+                />
+              </Field>
+              <Field label="UID（可选）" hint="留空由 key 派生（apikey-<id>）。">
+                <input
+                  className="input mono"
+                  placeholder="留空自动派生"
+                  value={keyUid}
+                  onChange={(e) => setKeyUid(e.target.value)}
+                />
+              </Field>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={remarkOpen}
+        title="备注 / 分组"
+        onClose={() => setRemarkOpen(false)}
+        wide
+        footer={
+          <div className="row gap2">
+            <button className="btn ghost" onClick={clearRemarks}>
+              清空备注
+            </button>
+            <button className="btn ghost" onClick={() => setRemarkOpen(false)}>
+              取消
+            </button>
+            <button className="btn primary" disabled={!!busy} onClick={saveRemarks}>
+              保存
+            </button>
+          </div>
+        }
+      >
+        <div className="stack">
+          <p className="small muted">
+            备注只存在这台浏览器（localStorage），不写服务端、不参与选号与计费；分组是服务端字段，改完保存即生效。
+          </p>
+          <input
+            className="input"
+            placeholder="搜索昵称 / UID"
+            aria-label="搜索账号"
+            value={rmKw}
+            onChange={(e) => setRmKw(e.target.value)}
+          />
+          {!roster.data ? (
+            roster.error ? (
+              <div className="notice bad">
+                <span>账号名录加载失败：{errorText(roster.error)}</span>
+                <button className="btn sm" onClick={roster.reload}>
+                  重试
+                </button>
+              </div>
+            ) : (
+              <Skeleton rows={4} />
+            )
+          ) : (
+            <div className="stack">
+              {(roster.data.accounts ?? [])
+                .filter((it) => {
+                  const k = rmKw.trim().toLowerCase()
+                  if (!k) return true
+                  return (
+                    (it.nickname || '').toLowerCase().indexOf(k) >= 0 ||
+                    it.uid.toLowerCase().indexOf(k) >= 0 ||
+                    (it.group || '').toLowerCase().indexOf(k) >= 0
+                  )
+                })
+                .map((it) => (
+                  <div key={it.uid} className="row v-center gap2 row-wrap">
+                    <div className="meta grow" style={{ minWidth: '140px' }}>
+                      <div className="n truncate">{it.nickname || it.uid.slice(0, 8)}</div>
+                      <div className="s tiny mono muted">
+                        {it.uid.slice(0, 8)}
+                        {it.disabled ? ' · 禁用' : it.paused ? ' · 暂停' : ''}
+                      </div>
+                    </div>
+                    <input
+                      className="input xs"
+                      maxLength={24}
+                      placeholder="备注（留空即清除）"
+                      aria-label="备注"
+                      value={rmText[it.uid] ?? ''}
+                      onChange={(e) => setRmText({ ...rmText, [it.uid]: e.target.value })}
+                    />
+                    <input
+                      className="input xs"
+                      maxLength={24}
+                      placeholder="分组（留空即未分组）"
+                      aria-label="分组"
+                      value={gpText[it.uid] ?? ''}
+                      onChange={(e) => setGpText({ ...gpText, [it.uid]: e.target.value })}
+                    />
+                  </div>
+                ))}
+            </div>
+          )}
         </div>
       </Modal>
 
       <ConfirmDialog
         open={!!confirm}
-        title={confirm && confirm.kind === 'remove' ? '删除账号' : '禁用账号'}
-        message={
-          confirm
-            ? confirm.kind === 'remove'
-              ? '将从账号目录删除 ' + confirm.name + '，并尽量清掉对应授权文件。此操作不可撤销。'
-              : '将禁用 ' + confirm.name + '，它们不再参与选号；随时可以解冻。'
-            : ''
-        }
-        confirmText={confirm && confirm.kind === 'remove' ? '删除' : '禁用'}
-        danger
+        title={confirmTitle(confirm)}
+        message={confirmMessage(confirm)}
+        confirmText={confirmAction(confirm)}
+        danger={!!confirm && (confirm.kind === 'remove' || confirm.kind === 'disable')}
         busy={!!busy}
         onConfirm={runConfirm}
         onClose={() => setConfirm(null)}

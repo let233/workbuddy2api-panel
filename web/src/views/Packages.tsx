@@ -76,6 +76,12 @@ type AccRow = {
   sources: Source[]
 }
 
+type DayRow = {
+  days: number
+  parts: { label: string; value: number; color: string }[]
+  total: number
+}
+
 type PkgRow = {
   key: string
   account: string
@@ -230,6 +236,81 @@ export default function Packages() {
     })
     .sort((x, y) => y.remain - x.remain)
 
+  // 到期分布：账号内按「最早到期优先」把余额逐包裁剪，避免上游重复记账把金额算大；
+  // 没有可解析到期时间的余额进不了图，单独计数（旧面板同口径）。
+  const nameByUid: Record<string, string> = {}
+  const colorByUid: Record<string, string> = {}
+  for (let i = 0; i < accRows.length; i++) {
+    nameByUid[accRows[i].uid] = accRows[i].name
+    colorByUid[accRows[i].uid] = PALETTE[i % PALETTE.length]
+  }
+  const nowMs = Date.now()
+  const bucketMap: Record<string, Record<string, number>> = {}
+  let unavailable = 0
+  for (const a of okAccounts) {
+    const pkgs = (a.packages ?? []).slice().sort((x, y) => {
+      const ax = x.expires_at ?? Number.MAX_SAFE_INTEGER
+      const ay = y.expires_at ?? Number.MAX_SAFE_INTEGER
+      return ax - ay
+    })
+    let budget = Math.max(0, a.remain)
+    for (const pk of pkgs) {
+      if (budget <= 0) break
+      const take = Math.min(Math.max(0, pk.remain), budget)
+      if (take <= 0) continue
+      budget -= take
+      if (!pk.expires_at) {
+        unavailable += take
+        continue
+      }
+      const days = Math.max(0, Math.ceil((pk.expires_at - nowMs) / 86400000))
+      const key = String(days)
+      const row = bucketMap[key] ?? {}
+      row[a.uid] = (row[a.uid] ?? 0) + take
+      bucketMap[key] = row
+    }
+    if (budget > 0) unavailable += budget
+  }
+  const dayRows: DayRow[] = Object.keys(bucketMap)
+    .map((k) => {
+      const per = bucketMap[k]
+      const parts = Object.keys(per)
+        .map((uid) => ({ label: nameByUid[uid] || uid.slice(0, 8), value: per[uid], color: colorByUid[uid] || PALETTE[0] }))
+        .sort((x, y) => y.value - x.value)
+      return { days: Number(k), parts, total: parts.reduce((s, x) => s + x.value, 0) }
+    })
+    .filter((r) => r.total > 0)
+    .sort((x, y) => x.days - y.days)
+  const dayLegend = accRows.filter((a) => dayRows.some((r) => r.parts.some((x) => x.label === a.name)))
+  const dayRest = dayRows.slice(20)
+  const dayShown = dayRows.slice(0, 20)
+
+  // 明细分组：每账号最早到期的 5 个未用完包直接展示，其余折叠成一行合计（旧面板同口径）。
+  let restActiveCount = 0
+  let restActiveSize = 0
+  let restActiveRemain = 0
+  let doneCount = 0
+  let doneSize = 0
+  for (const a of okAccounts) {
+    const act = (a.packages ?? [])
+      .filter((pk) => pk.remain > 0)
+      .sort((x, y) => {
+        const ax = x.expires_at ?? Number.MAX_SAFE_INTEGER
+        const ay = y.expires_at ?? Number.MAX_SAFE_INTEGER
+        return ax - ay
+      })
+    for (const pk of act.slice(5)) {
+      restActiveCount += 1
+      restActiveSize += pk.size
+      restActiveRemain += pk.remain
+    }
+    for (const pk of a.packages ?? []) {
+      if (pk.remain > 0) continue
+      doneCount += 1
+      doneSize += pk.size
+    }
+  }
+
   const allPkgRows: PkgRow[] = []
   for (const a of okAccounts) {
     const pkgs = a.packages ?? []
@@ -260,6 +341,8 @@ export default function Packages() {
   const pages = Math.max(1, Math.ceil(allPkgRows.length / pageSize))
   const cur = Math.min(page, pages)
   const pagedPkgs = allPkgRows.slice((cur - 1) * pageSize, cur * pageSize)
+
+  const maxRemain = accRows.reduce((m, r) => Math.max(m, r.remain), 0)
 
   const accColumns: Column<AccRow>[] = [
     {
@@ -302,6 +385,37 @@ export default function Packages() {
           <span className="muted">—</span>
         ),
       hideMobile: true,
+    },
+    {
+      key: 'share',
+      title: '占最高',
+      align: 'right',
+      width: '88px',
+      sortValue: (r) => (maxRemain > 0 ? r.remain / maxRemain : 0),
+      render: (r) => {
+        if (maxRemain <= 0) return <span className="muted">—</span>
+        const share = Math.round((r.remain / maxRemain) * 100)
+        return <span className="num small">{share}%</span>
+      },
+      hideMobile: true,
+    },
+    {
+      key: 'sources',
+      title: '来源',
+      hideMobile: true,
+      render: (r) =>
+        r.sources.length === 0 ? (
+          <span className="muted">—</span>
+        ) : (
+          <div>
+            {r.sources.slice(0, 3).map((s) => (
+              <div className="tiny muted truncate" key={s.key}>
+                {s.label + ' x' + s.count + ' · ' + fmtCredits(s.size)}
+              </div>
+            ))}
+            {r.sources.length > 3 ? <div className="tiny dim">＋{r.sources.length - 3} 种</div> : null}
+          </div>
+        ),
     },
     {
       key: 'expiry',
@@ -351,6 +465,32 @@ export default function Packages() {
       render: (r) => (r.expiresAt ? <span title={shortTime(r.expiresAt)}>{expiryText(r.expiresAt)}</span> : <span className="muted">—</span>),
     },
   ]
+
+  const dayColumns: Column<DayRow>[] = [
+    {
+      key: 'days',
+      title: '剩余天数',
+      width: '96px',
+      sortValue: (r) => r.days,
+      render: (r) =>
+        r.days === 0 ? <Badge tone="bad">已到期</Badge> : <span className="num small">{r.days} 天</span>,
+    },
+    {
+      key: 'parts',
+      title: '各账号该批剩余',
+      render: (r) => <StackBar parts={r.parts} height={10} showLegend={false} />,
+    },
+    {
+      key: 'total',
+      title: '剩余积分',
+      align: 'right',
+      width: '120px',
+      sortValue: (r) => r.total,
+      render: (r) => <span className="num bold">{fmtCredits(r.total)}</span>,
+    },
+  ]
+
+  const dayRestSum = dayRest.reduce((s, r) => s + r.total, 0)
 
   const realmOptions = [{ value: 'all', label: '全部域' }].concat(realms.map((r) => ({ value: r, label: r })))
 
@@ -440,7 +580,53 @@ export default function Packages() {
             </Box>
           </div>
 
-          <Box title="逐账号" sub="按余额降序，构成条按包来源分色">
+          <Box
+            title="到期分布"
+            sub="先把账号余额按最早到期逐包裁剪，再按剩余天数分桶；无到期时间的余额不计入"
+            footer={
+              <div className="row row-wrap gap2 tiny muted">
+                <span>{num(dayLegend.length)} 个账号可汇总</span>
+                <span>{num(unavailable)} 积分无到期时间，未计入</span>
+                {dayRest.length > 0 ? (
+                  <span>
+                    另有 {num(dayRest.length)} 档较晚到期未展示（合计 {fmtCredits(dayRestSum)}）
+                  </span>
+                ) : null}
+              </div>
+            }
+          >
+            <DataTable
+              columns={dayColumns}
+              rows={dayShown}
+              rowKey={(r) => String(r.days)}
+              loading={q.loading}
+              empty="暂无可汇总积分"
+              emptyHint="等账号拿到带到期时间的积分包后再看"
+              initialSort={{ key: 'days', dir: 'asc' }}
+            />
+            {dayLegend.length > 0 ? (
+              <div className="chip-wrap" style={{ marginTop: 10 }}>
+                {dayLegend.map((a) => (
+                  <span className="chip" key={a.uid}>
+                    <i
+                      aria-hidden="true"
+                      style={{
+                        display: 'inline-block',
+                        width: 8,
+                        height: 8,
+                        marginRight: 5,
+                        borderRadius: 2,
+                        background: colorByUid[a.uid],
+                      }}
+                    />
+                    {a.name}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </Box>
+
+          <Box title="逐账号" sub={'按余额降序 · 占最高以本域余额最高的账号为 100% · 来源按积分包面额汇总'}>
             <DataTable
               columns={accColumns}
               rows={accRows}
@@ -457,12 +643,18 @@ export default function Packages() {
             sub={'共 ' + num(allPkgRows.length) + ' 个包 · 按到期时间升序'}
             actions={<Switch checked={onlyActive} onChange={setOnlyActive} label="只看未用完" />}
             footer={
-              <Pager
-                page={cur}
-                pageSize={pageSize}
-                total={allPkgRows.length}
-                onPage={setPage}
-              />
+              <div className="stack gap1">
+                <div className="row row-wrap gap2 tiny muted">
+                  <span>
+                    其余未用完 {num(restActiveCount)} 个包（面额合计 {fmtCredits(restActiveSize)} · 剩余{' '}
+                    {fmtCredits(restActiveRemain)}）
+                  </span>
+                  <span>
+                    已用完 {num(doneCount)} 个包（面额合计 {fmtCredits(doneSize)}）
+                  </span>
+                </div>
+                <Pager page={cur} pageSize={pageSize} total={allPkgRows.length} onPage={setPage} />
+              </div>
             }
           >
             <DataTable
