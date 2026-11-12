@@ -306,7 +306,23 @@ curl -s http://127.0.0.1:7863/v1/images/strip-watermark   -H "Authorization: Bea
 | POST | `/panel/api/auth/logout` | 作废当前会话并清 Cookie |
 | POST | `/panel/api/auth/password` | `{"old_password","new_password"}`；旧密码错回 `400 invalid_old_password` |
 
-未登录访问 `/panel/api/*` 一律 `401 login_required`，访问页面则 302 回 `/panel/`（登录层就在首页里，不另开路由）。
+未登录访问 `/panel/api/*` 一律 `401 login_required`；页面与静态资源本身不含秘密，匿名也能加载（登录层就在首页里，不另开路由）。
+
+## 🧩 前端（React）开发与部署
+
+面板前端是 `web/` 下的 React + Vite 工程，**不进二进制**：构建产物落在仓库根 `public/`，运行时由 Go 直接把该目录映射到 `/panel/`（`internal/panel/index.go`）。换界面只替换目录，不用重新编译 Go。
+
+```bash
+npm --prefix web install     # 只需一次
+npm --prefix web run dev     # 开发服务器 :5273，/panel/api 代理到 127.0.0.1:7863
+npm --prefix web run build   # typecheck + 打包到 public/
+```
+
+- **目录**：`src/styles`（令牌与基础样式）、`src/lib`（fetch/路由/主题/会话/轮询）、`src/components`（外壳、表格、图表、通用件）、`src/views`（13 个视图，逐个懒加载）。约定见 `web/CONVENTIONS.md`。
+- **产物目录可换**：`config.json` 的 `panel.public_dir`（默认 `./public`，相对进程工作目录）。目录里没有 `index.html` 时面板返回一段说明页，而不是空白 404。
+- **缓存策略**：`index.html` 走 `no-store`，`/panel/assets/*` 文件名带内容 hash，走一年 `immutable`。
+- **Docker**：镜像第一个阶段就是前端构建，运行镜像里带 `/app/public`，无需手工构建。
+- **发布包**：CI 会先 `npm run build` 再把 `public/` 打进压缩包；解压后二进制与 `public/` 同级即可直接跑。
 
 ## 代理池与账号绑定
 
@@ -519,7 +535,7 @@ DMG 未公证，首次打开需要右键 →「打开」。
 
 | 能力 | 说明 |
 |---|---|
-| **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
+| **Web 管理面板** | `internal/panel` 提供 API 并映射前端产物，前端是 `web/` 下的 React + Vite 工程（不进二进制，换界面不必重编译）。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题、手机端抽屉式导航 |
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；归档只把请求元数据写进数据库表 `req_logs`，不写提示词、响应正文或凭证。请求记录表带**调用来源**（客户端 IP / User-Agent，按 `logging.request_client_info` 可关），支持按 IP / UA / 模型 / 账号 / 请求 ID 与结果筛选 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（全热生效）** | 面板改的每一项都**立即生效**：`soft_rate` / 脱敏开关 / 池参数 / 任务排程 / 上游超时与 UA / 提示词 / 模型名单 / 告警 / 预算 / 监听端口……配置存数据库（`app_kv`），不再写回配置文件；唯一还需重启的只剩 `state_file` 与 `database` 两个引导参数 |

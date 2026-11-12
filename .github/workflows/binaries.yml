@@ -25,6 +25,22 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # 前端不再 go:embed 进二进制：public/ 由 Go 在运行时映射成 /panel/。
+      # 所以 CI 必须先构建前端——go test 里的静态资源断言、以及发布 zip 里的
+      # public/ 都依赖它，缺了它面板起来就是一段「请先构建前端」的说明页。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: build web
+        run: |
+          set -euo pipefail
+          npm ci --prefix web --no-audit --no-fund --registry=https://registry.npmmirror.com
+          npm run build --prefix web
+          test -f public/index.html
+
       - name: test
         run: go test ./...
 
@@ -49,12 +65,15 @@ jobs:
           # ponytail: 包结构跟上游一样；主程序 windows/linux/darwin × amd64/arm64
           # （darwin 是 issue #23 的诉求：M 系列跑 arm64 原生，不套 Docker）。
           mkdir -p dist
+          # public/ 是前端产物（vite build 输出），必须随包发布：二进制只带一个
+          # 指向 ./public 的映射，压缩包解压到哪、就地运行就吃到哪份前端。
           pack() {
             dir="dist/$1-$2"
             mkdir -p "$dir"
             cp "$3" "$dir/"
             cp config.example.json README.md "$dir/"
-            python3 -c 'import os,sys,zipfile; n,d=sys.argv[1:]; z=zipfile.ZipFile(n,"w",zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f), f) for f in os.listdir(d)]; z.close()' \
+            cp -r public "$dir/"
+            python3 -c 'import os,sys,zipfile; n,d=sys.argv[1:]; z=zipfile.ZipFile(n,"w",zipfile.ZIP_DEFLATED); [z.write(os.path.join(r,f), os.path.relpath(os.path.join(r,f), d)) for r,_,fs in os.walk(d) for f in fs]; z.close()' \
               "dist/wb2api-panel-${VERSION}-$1-$2.zip" "$dir"
           }
           for os in windows linux darwin; do
