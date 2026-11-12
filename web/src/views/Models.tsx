@@ -39,6 +39,11 @@ type ModelEntry = {
   max_output_tokens?: number
   default_effort?: string
   supported_efforts?: string[] | null
+  /** 限时优惠：credits 是牌价，promo_* 是当前生效折扣 */
+  promo_factor?: number
+  promo_credits?: string
+  promo_label?: string
+  promo_note?: string
   /** 运行期标记：每次响应现算 */
   hidden: boolean
   gateway_policy_enabled: boolean
@@ -75,6 +80,52 @@ type OverviewResp = {
 
 type RealmFilter = 'all' | 'cn' | 'global'
 type VisFilter = 'all' | 'shown' | 'hidden'
+type CapFilter = 'all' | 'tool' | 'vision' | 'reasoning' | 'default'
+type EffortFilter = 'all' | 'max' | 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'off'
+type PromoFilter = 'all' | 'promo' | 'free' | 'discount'
+type SortKey = 'default' | 'rate' | 'context' | 'output' | 'name'
+
+const CAP_OPTIONS: { value: CapFilter; label: string }[] = [
+  { value: 'all', label: '全部能力' },
+  { value: 'tool', label: '工具调用' },
+  { value: 'vision', label: '图片输入' },
+  { value: 'reasoning', label: '推理' },
+  { value: 'default', label: '默认模型' },
+]
+
+const EFFORT_OPTIONS: { value: EffortFilter; label: string }[] = [
+  { value: 'all', label: '全部档位' },
+  { value: 'max', label: 'max' },
+  { value: 'xhigh', label: 'xhigh' },
+  { value: 'high', label: 'high' },
+  { value: 'medium', label: 'medium' },
+  { value: 'low', label: 'low' },
+  { value: 'minimal', label: 'minimal' },
+  { value: 'off', label: '可关思考' },
+]
+
+const PROMO_OPTIONS: { value: PromoFilter; label: string }[] = [
+  { value: 'all', label: '全部价格' },
+  { value: 'promo', label: '有优惠' },
+  { value: 'free', label: '限时免费' },
+  { value: 'discount', label: '有折扣' },
+]
+
+const SORT_OPTIONS: { value: SortKey; label: string }[] = [
+  { value: 'default', label: '默认顺序' },
+  { value: 'rate', label: '积分倍率' },
+  { value: 'context', label: '上下文' },
+  { value: 'output', label: '输出上限' },
+  { value: 'name', label: '名称' },
+]
+
+/** 把 "x0.05" / "0.50x" 这类倍率原文解析成数字，解析不出排最后。 */
+function rateNum(s: string | undefined): number {
+  const m = (s ?? '').match(/[0-9]*\.?[0-9]+/)
+  if (!m) return Number.POSITIVE_INFINITY
+  const n = Number(m[0])
+  return isFinite(n) ? n : Number.POSITIVE_INFINITY
+}
 
 const LOCK_STATE: Record<string, { text: string; tone: Tone }> = {
   locked: { text: '全部锁定', tone: 'bad' },
@@ -135,6 +186,10 @@ export default function Models() {
   const debounced = useDebounced(search, 200)
   const [realm, setRealm] = useState<RealmFilter>('all')
   const [vis, setVis] = useState<VisFilter>('all')
+  const [cap, setCap] = useState<CapFilter>('all')
+  const [effortFilter, setEffortFilter] = useState<EffortFilter>('all')
+  const [promo, setPromo] = useState<PromoFilter>('all')
+  const [sort, setSort] = useState<SortKey>('default')
 
   const models = useMemo(() => q.data?.models ?? [], [q.data])
   const locks = useMemo(() => ov.data?.model_locks ?? [], [ov.data])
@@ -146,17 +201,63 @@ export default function Models() {
     return m
   }, [locks])
 
+  // 筛选与排序全在前端做：目录一次拉全，不重复打上游（与旧面板一致）。
   const rows = useMemo(() => {
-    const needle = debounced.trim().toLowerCase()
-    return models.filter((m) => {
+    const tokens = debounced.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    const out = models.filter((m) => {
       const { realm: r } = splitId(m.id)
       if (realm !== 'all' && r !== realm) return false
       if (vis === 'shown' && m.hidden) return false
       if (vis === 'hidden' && !m.hidden) return false
-      if (!needle) return true
-      return m.id.toLowerCase().includes(needle) || (m.name || '').toLowerCase().includes(needle)
+      if (cap === 'tool' && !m.supports_tool_call) return false
+      if (cap === 'vision' && !m.supports_images) return false
+      if (cap === 'reasoning' && !m.supports_reasoning) return false
+      if (cap === 'default' && !m.is_default) return false
+      if (effortFilter !== 'all') {
+        const sup = m.supported_efforts ?? []
+        const hit =
+          effortFilter === 'off'
+            ? Boolean(m.can_disable_thinking)
+            : sup.includes(effortFilter) || m.default_effort === effortFilter
+        if (!hit) return false
+      }
+      if (promo === 'promo' && !(m.promo_factor != null || m.promo_label)) return false
+      if (promo === 'free' && m.promo_factor !== 0) return false
+      if (promo === 'discount' && !(typeof m.promo_factor === 'number' && m.promo_factor > 0)) return false
+      if (tokens.length > 0) {
+        const hay = [m.id, m.name, m.vendor ?? '', m.description ?? '', (m.tags ?? []).join(' ')]
+          .join(' ')
+          .toLowerCase()
+        if (!tokens.every((t) => hay.includes(t))) return false
+      }
+      return true
     })
-  }, [models, debounced, realm, vis])
+    // 隐藏模型统一排末尾，其余按所选排序键；同键保持原顺序（sort 稳定）。
+    const keyOf = (m: ModelEntry): number | string => {
+      switch (sort) {
+        case 'rate': {
+          const eff = m.promo_credits ? m.promo_credits : m.credits
+          return rateNum(eff)
+        }
+        case 'context':
+          return -(m.context_length ?? 0)
+        case 'output':
+          return -(m.max_output_tokens ?? 0)
+        case 'name':
+          return (m.name || splitId(m.id).bare).toLowerCase()
+        default:
+          return 0
+      }
+    }
+    out.sort((a, b) => {
+      if (a.hidden !== b.hidden) return a.hidden ? 1 : -1
+      const ka = keyOf(a)
+      const kb = keyOf(b)
+      if (typeof ka === 'string' || typeof kb === 'string') return String(ka).localeCompare(String(kb))
+      return ka - kb
+    })
+    return out
+  }, [models, debounced, realm, vis, cap, effortFilter, promo, sort])
 
   const stats = useMemo(() => {
     let hidden = 0
@@ -168,6 +269,18 @@ export default function Models() {
       lockedModels: locks.length,
     }
   }, [models, locks])
+
+  const customFiltered = search !== '' || realm !== 'all' || vis !== 'all' || cap !== 'all' || effortFilter !== 'all' || promo !== 'all' || sort !== 'default'
+
+  const resetFilter = () => {
+    setSearch('')
+    setRealm('all')
+    setVis('all')
+    setCap('all')
+    setEffortFilter('all')
+    setPromo('all')
+    setSort('default')
+  }
 
   const setHidden = (m: ModelEntry, hidden: boolean) => {
     void run('hidden:' + m.id, async () => {
@@ -271,6 +384,9 @@ export default function Models() {
             {m.tier ? <span className="chip">{m.tier}</span> : null}
             {m.is_default ? <span className="chip">默认</span> : null}
             {m.supports_images ? <span className="chip">图片</span> : null}
+            {m.promo_factor != null ? (
+              <span className="chip">{m.promo_label || (m.promo_factor === 0 ? '限时免费' : '折扣')}</span>
+            ) : null}
           </div>
         </div>
       ),
@@ -386,6 +502,11 @@ export default function Models() {
         <div className="stack" style={{ gap: 2 }}>
           <span className="small muted">上下文 {m.context_length ? num(m.context_length) : '未知'}</span>
           <span className="small muted">输出 {m.max_output_tokens ? num(m.max_output_tokens) : '未知'}</span>
+          {m.credits || m.promo_credits ? (
+            <span className="tiny muted">
+              {m.promo_credits ? m.promo_credits + '（原价 ' + (m.credits || '—') + '）' : m.credits}
+            </span>
+          ) : null}
         </div>
       ),
     },
@@ -487,16 +608,20 @@ export default function Models() {
 
       <Box
         title="模型列表"
-        sub={models.length > 0 ? '共 ' + models.length + ' 个模型 · 档位改动即时生效' : undefined}
+        sub={
+          models.length > 0
+            ? '命中 ' + rows.length + ' / ' + models.length + ' 个模型 · 档位改动即时生效'
+            : undefined
+        }
         actions={
           <>
             <input
               className="input"
-              placeholder="搜索模型名 / ID"
+              placeholder="搜索名称 / ID / 厂商 / 标签"
               aria-label="搜索模型"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              style={{ maxWidth: 200 }}
+              style={{ maxWidth: 220 }}
             />
             <Segmented<RealmFilter>
               ariaLabel="按域筛选"
@@ -508,16 +633,72 @@ export default function Models() {
                 { value: 'global', label: 'global' },
               ]}
             />
-            <Segmented<VisFilter>
-              ariaLabel="按可见性筛选"
+            <select
+              className="select sm"
+              aria-label="按能力筛选"
+              value={cap}
+              onChange={(e) => setCap(e.target.value as CapFilter)}
+            >
+              {CAP_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="select sm"
+              aria-label="按档位筛选"
+              value={effortFilter}
+              onChange={(e) => setEffortFilter(e.target.value as EffortFilter)}
+            >
+              {EFFORT_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="select sm"
+              aria-label="按优惠筛选"
+              value={promo}
+              onChange={(e) => setPromo(e.target.value as PromoFilter)}
+            >
+              {PROMO_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="select sm"
+              aria-label="按可见性筛选"
               value={vis}
-              onChange={setVis}
-              options={[
-                { value: 'all', label: '全部' },
-                { value: 'shown', label: '可见' },
-                { value: 'hidden', label: '隐藏' },
-              ]}
-            />
+              onChange={(e) => setVis(e.target.value as VisFilter)}
+            >
+              <option value="all">全部可见性</option>
+              <option value="shown">可见</option>
+              <option value="hidden">隐藏</option>
+            </select>
+            <select
+              className="select sm"
+              aria-label="排序方式"
+              value={sort}
+              onChange={(e) => setSort(e.target.value as SortKey)}
+            >
+              {SORT_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={resetFilter}
+              disabled={!customFiltered}
+            >
+              重置筛选
+            </button>
           </>
         }
         flush
@@ -542,7 +723,7 @@ export default function Models() {
                   </button>
                 </>
               ) : (
-                '换个关键词，或把域 / 可见性筛选切回「全部」。'
+                '换个关键词，或点「重置筛选」清空条件。'
               )
             }
           />

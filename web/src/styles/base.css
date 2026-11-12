@@ -252,9 +252,17 @@ code, pre, .mono, .num { font-family: var(--mono); font-variant-numeric: tabular
 @media (max-width: 1023px) {
   .only-sm { display: inline-flex !important; }
   .hide-sm { display: none !important; }
+  /* 单列布局下侧栏必须整体收起，否则它会以 100dvh 高度压在正文上；
+     点顶栏菜单键后由 AppShell 加上 .drawer 才作为抽屉滑出。 */
+  .shell > .sidebar:not(.drawer) { display: none; }
 }
 @media (max-width: 640px) {
   .topbar h1 { font-size: var(--fs-4); }
+  /* 窄屏：一行放不下时换行，而不是被裁掉（筛选条、统计卡操作、表格工具行都靠这条）。 */
+  .row, .toolbar, .filters, .actionbar { flex-wrap: wrap; }
+  /* 反例：卡片头部的操作行常带 .flex-shrink0（flex:0 0 auto），窄屏会顶出卡片被裁掉，
+     这里放开它，让 .row 的 wrap 生效。 */
+  .content .row.flex-shrink0 { flex: 1 1 auto; min-width: 0; }
 }
 
 /* ---------- 工具类补充 ---------- */

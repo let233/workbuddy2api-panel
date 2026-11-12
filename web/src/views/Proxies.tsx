@@ -20,6 +20,7 @@ import {
   Field,
   KV,
   Modal,
+  Pager,
   Segmented,
   Skeleton,
   Stat,
@@ -146,6 +147,8 @@ export default function Proxies() {
   const [imported, setImported] = useState<ImportResult[] | null>(null)
   const [del, setDel] = useState<ProxyView | null>(null)
   const [hForm, setHForm] = useState<HealthForm | null>(null)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
 
   const snap = q.data ?? null
   const proxies = useMemo(() => snap?.proxies ?? [], [snap])
@@ -187,6 +190,13 @@ export default function Proxies() {
     })
   }, [proxies, debounced, status])
 
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize))
+  const safePage = Math.min(page, pageCount)
+  const pageRows = useMemo(
+    () => rows.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [rows, safePage, pageSize],
+  )
+
   const nameById = useMemo(() => {
     const m = new Map<string, string>()
     for (const p of proxies) m.set(p.id, p.name || hostOf(p.url))
@@ -198,6 +208,31 @@ export default function Proxies() {
     if (!b) return '随机池（未设置）'
     if (b.mode === 'fixed') return '固定：' + (nameById.get(b.proxy_id ?? '') ?? b.proxy_id ?? '已删除的节点')
     return MODE_TEXT[b.mode] ?? b.mode
+  }
+
+  /** select 的当前值：random / direct / <proxyId>；固定节点已被删除时回落「随机池」。 */
+  const realmValue = (realm: string): string => {
+    const b = realms[realm]
+    if (!b || b.mode === 'random' || !b.mode) return 'random'
+    if (b.mode === 'direct') return 'direct'
+    if (b.mode === 'fixed' && b.proxy_id && nameById.has(b.proxy_id)) return b.proxy_id
+    return 'random'
+  }
+
+  const saveRealm = (realm: 'cn' | 'global', value: string) => {
+    void run('realm:' + realm, async () => {
+      try {
+        const body =
+          value === 'random' || value === 'direct' ? { mode: value } : { mode: 'fixed', proxy_id: value }
+        await api.put('/proxies/realm/' + realm, body)
+        toast.ok(realm + ' 默认出口已更新')
+      } catch (e) {
+        toast.err('保存失败：' + errorText(e))
+      } finally {
+        // 无论成败都以服务端为准，避免下拉和服务端值不一致。
+        q.reload()
+      }
+    })
   }
 
   const unavailable = q.error instanceof ApiError && q.error.status === 501
@@ -302,23 +337,36 @@ export default function Proxies() {
       toast.err('先粘贴至少一条代理地址')
       return
     }
+    // 无效行要能原样改完重提：按后端返回的行号回填到输入框，其余行清掉。
+    const rawLines = lines.split(/\r?\n/)
     void run('import', async () => {
       try {
         const res = await api.post<ImportResp>('/proxies', { lines })
         const list = res.results ?? []
         setImported(list)
         let added = 0
-        let skipped = 0
+        let dup = 0
+        let invalid = 0
+        let unsupported = 0
+        const badLines: string[] = []
         for (const r of list) {
           if (r.status === 'added') added++
-          else skipped++
+          else if (r.status === 'duplicate') dup++
+          else if (r.status === 'unsupported') unsupported++
+          else invalid++
+          if (r.status === 'invalid') {
+            const src = rawLines[r.line - 1]
+            if (src && src.trim()) badLines.push(src.trim())
+          }
         }
-        if (added > 0) {
-          toast.ok('新增 ' + added + ' 个节点' + (skipped > 0 ? '，跳过 ' + skipped + ' 条' : ''))
-          setAddText('')
-        } else {
-          toast.warn('没有新增节点，全部被跳过（' + skipped + ' 条）')
-        }
+        const parts = ['添加 ' + added + ' 个']
+        if (dup > 0) parts.push('重复 ' + dup + ' 个')
+        if (invalid > 0) parts.push('无效 ' + invalid + ' 条')
+        if (unsupported > 0) parts.push('不支持 ' + unsupported + ' 条')
+        const summary = parts.join(' · ')
+        setAddText(badLines.join('\n'))
+        if (added > 0) toast.ok(summary)
+        else toast.warn('没有新增节点：' + summary)
         q.reload()
       } catch (e) {
         toast.err(errorText(e))
@@ -489,7 +537,13 @@ export default function Proxies() {
           <button type="button" className="btn ghost sm" onClick={() => openEdit(p)}>
             编辑
           </button>
-          <button type="button" className="btn danger sm" onClick={() => setDel(p)}>
+          <button
+            type="button"
+            className="btn danger sm"
+            disabled={p.bound_count > 0}
+            title={p.bound_count > 0 ? '先解除 ' + p.bound_count + ' 个账号的绑定再删除' : undefined}
+            onClick={() => setDel(p)}
+          >
             删除
           </button>
         </div>
@@ -562,7 +616,11 @@ export default function Proxies() {
 
       <Box
         title="节点列表"
-        sub={proxies.length > 0 ? '每 5 秒自动刷新检测结果' : undefined}
+        sub={
+          proxies.length > 0
+            ? proxies.length + ' 个代理 · ' + stats.ok + ' 个可用 · 每 5 秒自动刷新检测结果'
+            : undefined
+        }
         actions={
           <>
             <input
@@ -594,9 +652,10 @@ export default function Proxies() {
             <Skeleton rows={5} />
           </div>
         ) : (
+          <>
           <DataTable<ProxyView>
             columns={columns}
-            rows={rows}
+            rows={pageRows}
             rowKey={(p) => p.id}
             loading={q.loading}
             empty={proxies.length === 0 ? '代理池还是空的' : '没有匹配的节点'}
@@ -613,21 +672,65 @@ export default function Proxies() {
               )
             }
           />
+          <Pager
+            page={safePage}
+            pageSize={pageSize}
+            total={rows.length}
+            onPage={setPage}
+            onPageSize={(n) => {
+              setPageSize(n)
+              setPage(1)
+            }}
+          />
+          </>
         )}
       </Box>
 
       <div className="grid2">
         <Box title="默认出口" sub="账号没有显式绑定时按这里走">
-          <KV
-            items={[
-              { k: 'cn', v: realmDesc('cn') },
-              { k: 'global', v: realmDesc('global') },
-              { k: '账号级绑定', v: Object.keys(bindings).length + ' 个账号已单独指定' },
-            ]}
-          />
-          <div className="muted tiny" style={{ marginTop: 8 }}>
-            账号级绑定优先于默认出口；固定节点被停用或删除前需要先解绑。
-          </div>
+          {q.first ? (
+            <Skeleton rows={3} />
+          ) : (
+            <div className="stack">
+              <Field label="cn 域" hint={'当前：' + realmDesc('cn')}>
+                <select
+                  className="select"
+                  aria-label="cn 域默认出口"
+                  value={realmValue('cn')}
+                  disabled={busy === 'realm:cn'}
+                  onChange={(e) => saveRealm('cn', e.target.value)}
+                >
+                  <option value="random">随机池（默认）</option>
+                  <option value="direct">直连（不走代理）</option>
+                  {proxies.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {(p.name || hostOf(p.url)) + ' · ' + (STATUS[p.status]?.text ?? p.status)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="global 域" hint={'当前：' + realmDesc('global')}>
+                <select
+                  className="select"
+                  aria-label="global 域默认出口"
+                  value={realmValue('global')}
+                  disabled={busy === 'realm:global'}
+                  onChange={(e) => saveRealm('global', e.target.value)}
+                >
+                  <option value="random">随机池（默认）</option>
+                  <option value="direct">直连（不走代理）</option>
+                  {proxies.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {(p.name || hostOf(p.url)) + ' · ' + (STATUS[p.status]?.text ?? p.status)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <div className="muted tiny">
+                账号级绑定：{Object.keys(bindings).length} 个账号已单独指定，优先于这里的默认出口。
+              </div>
+            </div>
+          )}
         </Box>
 
         <Box
@@ -682,7 +785,11 @@ export default function Proxies() {
 
           {imported && imported.length > 0 ? (
             <div className="feed">
-              <div className="small bold">导入结果</div>
+              <div className="small bold">
+                导入结果 · 添加 {imported.filter((r) => r.status === 'added').length} 个 · 重复{' '}
+                {imported.filter((r) => r.status === 'duplicate').length} 个 · 无效{' '}
+                {imported.filter((r) => r.status !== 'added' && r.status !== 'duplicate').length} 条
+              </div>
               {imported.map((r) => {
                 const s = IMPORT_STATUS[r.status] ?? { text: r.status, tone: 'muted' as Tone }
                 return (

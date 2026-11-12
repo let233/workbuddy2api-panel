@@ -84,7 +84,9 @@
 .stat .v { font-size: var(--fs-6); font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.25; }
 .stat .k { color: var(--ink-3); font-size: var(--fs-2); margin-top: 2px; }
 .stat .sub { color: var(--ink-3); font-size: var(--fs-1); margin-top: 4px; }
-.stat.good .v { color: var(--ok); }
+/* ok 与 good 同色：Stat 的 tone 两种写法都有调用方，统一在这里兜住 */
+.stat.good .v,
+.stat.ok .v { color: var(--ok); }
 .stat.warn .v { color: var(--warn); }
 .stat.bad .v { color: var(--bad); }
 .stat.accent .v { color: var(--accent); }

@@ -41,6 +41,8 @@ type Model = {
   within30: number
 }
 
+type DayRow = { key: string; date: string; realm: string; days: number; accounts: number; amount: number }
+
 type Filter = 'all' | 'near'
 
 const FILTER_OPTIONS: { value: Filter; label: string }[] = [
@@ -203,6 +205,38 @@ export default function Expiry() {
   }, [models])
 
   const shown = filter === 'near' ? models.filter((m) => m.days !== null && m.days >= 0 && m.days <= 7) : models
+
+  const creditsSum = models.reduce((s, m) => s + m.credits, 0)
+
+  /** 按 UTC+8 自然日跨账号合计；混域时按 cn/global 分行，否则合并一行。 */
+  const dayRows: DayRow[] = useMemo(() => {
+    const mixed = new Set(models.map((m) => m.realm)).size > 1
+    const acc = new Map<string, { date: string; realm: string; amount: number; uids: Set<string> }>()
+    for (const m of models) {
+      for (const b of m.buckets) {
+        const day = bucketDay(b)
+        const d = dayDiff(day)
+        if (d === null || d < 0) continue
+        const date = cstDate(day)
+        const realm = mixed ? m.realm : ''
+        const key = date + '|' + realm
+        const cur = acc.get(key) ?? { date, realm, amount: 0, uids: new Set<string>() }
+        cur.amount += b.remain
+        cur.uids.add(m.uid)
+        acc.set(key, cur)
+      }
+    }
+    return [...acc.entries()]
+      .map(([key, v]) => ({
+        key,
+        date: v.date,
+        realm: v.realm,
+        days: dayDiff(v.date + 'T00:00:00+08:00') ?? 0,
+        accounts: v.uids.size,
+        amount: v.amount,
+      }))
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.realm < b.realm ? -1 : 1))
+  }, [models])
 
   const doCsv = () => {
     if (!shown.length) {
@@ -370,6 +404,48 @@ export default function Expiry() {
     },
   ]
 
+  const dayCols: Column<DayRow>[] = [
+    {
+      key: 'day',
+      title: '到期日',
+      width: '160px',
+      sortValue: (r) => r.date,
+      render: (r) => (
+        <span>
+          <span className="mono">{r.date}</span>
+          {r.realm ? <span className="tiny muted"> · {r.realm === 'global' ? '国际版' : '国内版'}</span> : null}
+        </span>
+      ),
+    },
+    {
+      key: 'days',
+      title: '距到期',
+      width: '104px',
+      sortValue: (r) => r.days,
+      render: (r) => (
+        <Badge tone={toneOf(r.days)}>{r.days === 0 ? '今天' : r.days === 1 ? '明天' : r.days + ' 天'}</Badge>
+      ),
+    },
+    {
+      key: 'accounts',
+      title: '账号数',
+      align: 'right',
+      mono: true,
+      width: '88px',
+      sortValue: (r) => r.accounts,
+      render: (r) => num(r.accounts),
+    },
+    {
+      key: 'amount',
+      title: '该日到期',
+      align: 'right',
+      mono: true,
+      width: '128px',
+      sortValue: (r) => r.amount,
+      render: (r) => credits(r.amount),
+    },
+  ]
+
   return (
     <div className="page">
       {head}
@@ -393,11 +469,27 @@ export default function Expiry() {
           sub={expired > 0 ? '已失效，无法再用' : '后端已剔除过期批次'}
         />
         <Stat label="未来到期积分" value={credits(totalRemain)} tone="accent" sub="按批次合计" />
+        <Stat label="账号积分合计" value={credits(creditsSum)} sub={num(models.length) + ' 个账号当前可用'} />
         <Stat label="涉及账号" value={num(models.length)} sub="有未来到期批次" />
       </StatsGrid>
 
       <Box title="到期分布" sub="按 UTC+8 自然日聚合，柱高是该日到期的积分；最多显示 21 个日期">
         <BarChart items={chart} height={220} format={(v: number) => credits(v)} emptyText="没有未来到期的积分批次" />
+      </Box>
+
+      <Box
+        title="按天汇总"
+        sub="跨账号按 UTC+8 自然日合计「该日到期」；同一账号同一天的多批只算一个账号，混域时按国内版 / 国际版分行"
+      >
+        <DataTable<DayRow>
+          columns={dayCols}
+          rows={dayRows}
+          rowKey={(r) => r.key}
+          loading={q.loading}
+          empty="没有未来到期批次"
+          emptyHint="后台刷新余额后才会出现批次；可以先点右上角「刷新余额」，或等下一次自动刷新。"
+          initialSort={{ key: 'day', dir: 'asc' }}
+        />
       </Box>
 
       <Box
