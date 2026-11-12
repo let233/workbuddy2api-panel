@@ -45,8 +45,9 @@ const (
 
 // fileVersion 是旧 usage.json 的格式版本，仅用于一次性导入旧数据。
 // 版本 2 增加积分观测字段，版本 3 增加模型生效倍率分区，版本 4 增加前缀缓存
-// 命中/未命中累计；旧版本缺失字段按零值读入，旧数据不会丢弃。
-const fileVersion = 4
+// 命中/未命中累计，版本 5 增加客户端 Key 维度；旧版本缺失字段按零值读入，
+// 旧数据不会丢弃。
+const fileVersion = 5
 
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量，同时是表 usage_buckets
 // 的一行。JSON 字段名沿用旧格式（短名），一次性导入旧 usage.json 时不需要转换表。
@@ -60,18 +61,22 @@ type bucket struct {
 	Model string `json:"m" gorm:"column:model;size:191"`
 	// Rate 请求时生效的积分倍率（规范化数值；旧桶为空）。上游 PR #69 引入：
 	// 同一模型不同倍率档分开聚合，才能算准「这段倍率下的积分/Token」。
-	Rate  string  `json:"x,omitempty" gorm:"column:rate;size:32"`
-	Req   int64   `json:"q" gorm:"column:req"`           // 请求数（含失败）
-	Err   int64   `json:"e" gorm:"column:err"`           // 失败数
-	PT    int64   `json:"p" gorm:"column:prompt_tokens"` // prompt tokens
-	CT    int64   `json:"c" gorm:"column:completion_tokens"`
-	TT    int64   `json:"t" gorm:"column:total_tokens"` // total tokens（上游给什么用什么的合计）
-	CH    int64   `json:"ch" gorm:"column:cache_hit"`   // prompt 缓存命中 token
-	CM    int64   `json:"cm" gorm:"column:cache_miss"`  // prompt 缓存未命中 token
-	LatMs int64   `json:"l" gorm:"column:lat_ms"`       // 延迟累计（ms）
-	LatN  int64   `json:"ln" gorm:"column:lat_n"`       // 延迟样本数
-	TPS   float64 `json:"v" gorm:"column:tps"`          // 吐字速率累计
-	TPSN  int64   `json:"vn" gorm:"column:tps_n"`       // 速率样本数
+	Rate string `json:"x,omitempty" gorm:"column:rate;size:32"`
+	// APIKey 发起请求的客户端 Key 的 ID（gatewaykeys.Key.ID）。空 = 未按 Key 归集：
+	// 升级前的历史桶、以及 Key 鉴权关闭/未带 Key 的调用。面板「用量明细」和
+	// 「积分扣除历史」的「按 API Key」维度就是按这一列分组。
+	APIKey string  `json:"k,omitempty" gorm:"column:api_key;size:64;index"`
+	Req    int64   `json:"q" gorm:"column:req"`           // 请求数（含失败）
+	Err    int64   `json:"e" gorm:"column:err"`           // 失败数
+	PT     int64   `json:"p" gorm:"column:prompt_tokens"` // prompt tokens
+	CT     int64   `json:"c" gorm:"column:completion_tokens"`
+	TT     int64   `json:"t" gorm:"column:total_tokens"` // total tokens（上游给什么用什么的合计）
+	CH     int64   `json:"ch" gorm:"column:cache_hit"`   // prompt 缓存命中 token
+	CM     int64   `json:"cm" gorm:"column:cache_miss"`  // prompt 缓存未命中 token
+	LatMs  int64   `json:"l" gorm:"column:lat_ms"`       // 延迟累计（ms）
+	LatN   int64   `json:"ln" gorm:"column:lat_n"`       // 延迟样本数
+	TPS    float64 `json:"v" gorm:"column:tps"`          // 吐字速率累计
+	TPSN   int64   `json:"vn" gorm:"column:tps_n"`       // 速率样本数
 	// CR 本片实测扣费积分（上游末帧 usage.credit 累计）。仅统计拿到 credit 的请求：
 	// 免费/限免请求记 0，没观测到 credit 的请求不参与，避免把"没测到"算成"没花钱"。
 	CR float64 `json:"cr" gorm:"column:credits"`
@@ -89,13 +94,20 @@ func init() {
 }
 
 // bucketKey 桶的聚合键，同时是主键列 id。
-func bucketKey(scope, realm, uid, model, rate string) string {
-	return scope + "|" + realm + "|" + uid + "|" + model + "|" + rate
+//
+// apiKey 为空时**不追加**那一段：升级前写下的行主键是 5 段，保持原样才能和新的
+// 「无 Key」行落进同一个桶（否则同一小时的同一账号会被劈成两行，历史行永远不再累加）。
+func bucketKey(scope, realm, uid, model, rate, apiKey string) string {
+	k := scope + "|" + realm + "|" + uid + "|" + model + "|" + rate
+	if apiKey != "" {
+		k += "|" + apiKey
+	}
+	return k
 }
 
 // bucketUpdateCols 写库时冲突要更新的列（除主键外的全部累计列）。
 var bucketUpdateCols = []string{
-	"scope", "realm", "uid", "model", "rate",
+	"scope", "realm", "uid", "model", "rate", "api_key",
 	"req", "err", "prompt_tokens", "completion_tokens", "total_tokens",
 	"cache_hit", "cache_miss", "lat_ms", "lat_n", "tps", "tps_n",
 	"credits", "credit_samples", "credit_tokens",
@@ -121,7 +133,7 @@ func importLegacyUsage(s *store.Store, dir string) error {
 	rows := make([]bucket, 0, len(f.Buckets))
 	for i := range f.Buckets {
 		b := f.Buckets[i]
-		b.ID = bucketKey(b.Scope, b.Realm, b.UID, b.Model, b.Rate)
+		b.ID = bucketKey(b.Scope, b.Realm, b.UID, b.Model, b.Rate, b.APIKey)
 		rows = append(rows, b)
 	}
 	if len(rows) == 0 {
@@ -228,6 +240,8 @@ type Delta struct {
 	HasCredit bool
 	// ModelRate 请求时生效的积分倍率（规范化数值文本；目录缓存取不到则为空）。
 	ModelRate string
+	// APIKey 发起本次调用的客户端 Key ID（空 = 未鉴权/Key 鉴权关闭）。
+	APIKey string
 }
 
 // Add 记录一次请求尝试。
@@ -245,14 +259,14 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		model = "(unknown)"
 	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	key := bucketKey(scope, realm, uid, model, d.ModelRate, d.APIKey)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{ID: key, Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
+		b = &bucket{ID: key, Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate, APIKey: d.APIKey}
 		r.buckets[key] = b
 	}
 	b.Req++
@@ -329,7 +343,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
-		cand = append(cand, move{k, day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate, ts})
+		cand = append(cand, move{k, bucketKey(day, b.Realm, b.UID, b.Model, b.Rate, b.APIKey), ts})
 	}
 	sort.Slice(cand, func(i, j int) bool { return cand[i].ts.Before(cand[j].ts) })
 	folded := 0
@@ -599,9 +613,14 @@ type Snapshot struct {
 	Series          []Point     `json:"series"`
 	CreditByAccount []CreditAgg `json:"credit_by_account"`
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	// ByAPIKey/CreditByAPIKey 按客户端 Key 分组的用量与实扣积分（null 表示本次
+	// 快照不统计该维度；空 Key 行 = 升级前的历史数据或未鉴权调用）。
+	// 与上面几个维度同窗口口径，行内 Extra/Nickname 放 Key 名（删掉的 Key 为空）。
+	ByAPIKey       []KeyedAgg  `json:"by_api_key"`
+	CreditByAPIKey []CreditAgg `json:"credit_by_api_key"`
+	Buckets        int         `json:"buckets"`
+	FileBytes      int64       `json:"file_bytes"`
+	Since          string      `json:"since,omitempty"`
 	// LastError/FailedFlushes 落盘健康观测：失败计数与最近一次错误（面板可显示
 	// 「用量文件已 N 轮没写成功」）；零值省略，健康时不出现。
 	LastError     string `json:"last_error,omitempty"`
@@ -680,7 +699,15 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 // （曾长期是"卡片为全部历史累计、hours 只改时序分片"的口径，界面上被读成"筛选没
 // 生效"，已废弃）。小时桶按整点入窗；日桶（Rollup 折叠出的长期数据）按日起点入窗，
 // 故小时窗口天然不含更早的日桶。
+//
+// keyNames 可为 nil（老调用方）：此时「按 API Key」两维照常产出，只是没有 Key 名。
 func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate func(realm, model string) string) Snapshot {
+	return r.SnapshotWindowKeys(w, nicks, nil, currentRate)
+}
+
+// SnapshotWindowKeys 等价 SnapshotWindow，额外接受 keyNames（客户端 Key ID → 名称），
+// 用于面板「按 API Key」维度把 ID 翻译成人看得懂的名字。
+func (r *Recorder) SnapshotWindowKeys(w Window, nicks, keyNames map[string]string, currentRate func(realm, model string) string) Snapshot {
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
@@ -705,6 +732,8 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	daySeries := map[string]*aggAcc{}
 	creditAcctAgg := map[string]*creditAcc{}
 	creditModelAgg := map[string]*creditAcc{}
+	apiKeyAgg := map[string]*aggAcc{}
+	creditKeyAgg := map[string]*creditAcc{}
 	rateCache := map[string]string{}
 
 	// 数据起点（全库最早分片）：不受窗口影响，表示"记录自何时开始"。scope 字典序
@@ -751,6 +780,11 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			modelAgg[b.Model] = &aggAcc{}
 		}
 		modelAgg[b.Model].add(b)
+
+		if apiKeyAgg[b.APIKey] == nil {
+			apiKeyAgg[b.APIKey] = &aggAcc{}
+		}
+		apiKeyAgg[b.APIKey].add(b)
 
 		if strings.HasPrefix(b.Scope, "h:") {
 			scope := strings.TrimPrefix(b.Scope, "h:")
@@ -799,6 +833,13 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 				creditModelAgg[modelKey] = cm
 			}
 			cm.add(b)
+
+			ck := creditKeyAgg[b.APIKey]
+			if ck == nil {
+				ck = &creditAcc{CreditAgg: CreditAgg{Key: b.APIKey, Nickname: keyNames[b.APIKey]}}
+				creditKeyAgg[b.APIKey] = ck
+			}
+			ck.add(b)
 		}
 	}
 
@@ -813,10 +854,14 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		ByModel:         keyed(modelAgg, func(k string) (string, string) { return k, "" }),
 		CreditByAccount: creditKeyed(creditAcctAgg),
 		CreditByModel:   creditKeyed(creditModelAgg),
-		Buckets:         matched,
-		Generated:       time.Now().Format(time.RFC3339),
-		LastError:       lastErr,
-		FailedFlushes:   failedFlushes,
+		ByAPIKey: keyed(apiKeyAgg, func(k string) (string, string) {
+			return k, keyNames[k]
+		}),
+		CreditByAPIKey: creditKeyed(creditKeyAgg),
+		Buckets:        matched,
+		Generated:      time.Now().Format(time.RFC3339),
+		LastError:      lastErr,
+		FailedFlushes:  failedFlushes,
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]

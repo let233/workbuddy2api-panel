@@ -891,7 +891,18 @@ function renderUpdateStatus(update) {
   } else if (unknown) {
     note.textContent = unknownVersionNote(update);
   } else if (update.update_available) {
-    note.textContent = '发现新版本 v' + update.latest_version + (update.can_install ? '' : ' · 请手动更新');
+    let text = '发现新版本 v' + update.latest_version;
+    if (update.can_install) {
+      // 容器内更新是「原地替换 + exec 自身」：容器不重启、端口不断，但重建容器
+      // （pull / up）会把二进制换回镜像里的版本。这一点必须写在用户点按钮之前，
+      // 否则下次重启「新版本又变回去了」会被当成更新失败。
+      if (update.container) text += ' · 容器内原地更新（重建容器会回到镜像版本）';
+    } else {
+      text += ' · 请手动更新';
+      // 后端已经算好「为什么不能装」，直接摆出来，省得用户点了才知道。
+      if (update.install_blocked) text += '：' + update.install_blocked;
+    }
+    note.textContent = text;
   } else if (update.latest_version) {
     note.textContent = '已是最新版本 · v' + update.latest_version;
   } else {
@@ -996,7 +1007,10 @@ async function checkForUpdates() {
 
 async function installUpdate() {
   if (updateBusy || !updateData || updateData.installing || !updateData.can_install || !updateData.update_available) return;
-  if (!confirm('将安装 v' + updateData.latest_version + ' 并重启服务，期间服务会短暂中断。请避开正在处理的请求，确认继续？')) return;
+  const ask = updateData.container
+    ? '将安装 v' + updateData.latest_version + '：本服务运行在容器里，会在原地替换程序并原地重启同一进程——端口不断、容器不重建（重建容器会回到镜像里的版本）。请避开正在处理的请求，确认继续？'
+    : '将安装 v' + updateData.latest_version + ' 并重启服务，期间服务会短暂中断。请避开正在处理的请求，确认继续？';
+  if (!confirm(ask)) return;
   const button = $('btnUpdateInstall');
   updateBusy = true;
   button.disabled = true;
@@ -3774,6 +3788,8 @@ const US_DIMS = {
   account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 11 },
   model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 8 },
   realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 8 },
+  // 按 API Key：Key 名在 extra（服务端用 Key 表翻过），空 Key 行 = 升级前历史/未鉴权。
+  apikey: { key: 'by_api_key', title: 'API Key', withRealm: false, withPerf: false, span: 8 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -3808,79 +3824,132 @@ function usTabsHtml(dims, active, counts) {
   }).join('');
 }
 
-const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域']];
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域'], ['apikey', '按 API Key']];
+const US_CREDIT_TABS = [['account', '按账号'], ['model', '按模型'], ['apikey', '按 API Key']];
+
+/* ── 两张用量表的分页 ──────────────────────────────────────────────
+   行数随窗口增长（选「全部历史」+ 按 API Key 时可能上百行），整表铺开会把页面拉
+   很长、还要横向滚很久。默认每页 10 行，切维度/切排序回到第 1 页。
+   状态与 helper 都放在这个切片里（usage_overview_frontend_test.go 从 fmtTok 切到
+   renderUsageChart），不能依赖切片外的 setHTML 之类。 */
+const US_PAGE_SIZE = 10;
+let usDimPage = 1;
+let usCreditPage = 1;
+
+/* usPageSlice 取某页的行，并把越界的页码夹回 [1, pages]（数据刷新后行数变少时，
+   停在第 9 页的人应该落在最后一页而不是看空白）。 */
+function usPageSlice(rows, page) {
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / US_PAGE_SIZE));
+  const cur = Math.min(Math.max(1, Number(page) || 1), pages);
+  return { rows: rows.slice((cur - 1) * US_PAGE_SIZE, cur * US_PAGE_SIZE), page: cur, pages, total };
+}
+
+/* usPagerHtml 页码条：首页/末页 + 当前 ±2，中间省略号。不足一页时整条为空——
+   只有 3 行还画个「1 页」只是噪音。按钮用 data-uspage，点击由委托监听处理。 */
+function usPagerHtml(p) {
+  if (p.total <= US_PAGE_SIZE) return '';
+  const want = [1, p.page - 2, p.page - 1, p.page, p.page + 1, p.page + 2, p.pages]
+    .filter(n => n >= 1 && n <= p.pages);
+  const nums = [];
+  let last = 0;
+  for (const n of [...new Set(want)].sort((a, b) => a - b)) {
+    if (last && n - last > 1) nums.push('<span class="gap">…</span>');
+    nums.push('<button class="xs' + (n === p.page ? ' on' : '') + '" type="button" data-uspage="' + n + '">' + n + '</button>');
+    last = n;
+  }
+  return '<button class="xs" type="button" data-uspage="' + (p.page - 1) + '"' + (p.page <= 1 ? ' disabled' : '') + '>上一页</button>' +
+    '<span class="pager-nums">' + nums.join('') + '</span>' +
+    '<button class="xs" type="button" data-uspage="' + (p.page + 1) + '"' + (p.page >= p.pages ? ' disabled' : '') + '>下一页</button>' +
+    '<span class="grow"></span>' +
+    '<span class="note">第 ' + p.page + ' / ' + p.pages + ' 页 · 共 ' + p.total + ' 行</span>';
+}
 
 function renderUsageDim() {
   const d = usageData || {};
   const m = US_DIMS[usDim] || US_DIMS.account;
   const rows = usSortRows(d[m.key] || [], usSort);
+  const p = usPageSlice(rows, usDimPage);
+  usDimPage = p.page;
   $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
     account: (d.by_account || []).length,
     model: (d.by_model || []).length,
     realm: (d.by_realm || []).length,
+    apikey: (d.by_api_key || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = rows.map(x => {
+  $('usDimBody').innerHTML = p.rows.map(x => {
     const isAcct = usDim === 'account';
+    const isKey = usDim === 'apikey';
     const key = isAcct ? String(x.key || '').slice(0, 8) : x.key;
-    return usRow(key,
-      isAcct ? (x.extra || '') : '',
-      x,
+    // Key 维度：主名是 Key 名（extra），副行是 Key ID 前缀；空 Key 行单独说明来由，
+    // 否则「一整行没有名字」会被当成渲染 bug。
+    const name = isKey ? (x.extra || (x.key ? String(x.key).slice(0, 8) : '未按 Key 记录')) : key;
+    const sub = isAcct ? (x.extra || '')
+      : isKey ? (x.key ? String(x.key).slice(0, 12) : '升级前历史 / 未鉴权调用')
+      : '';
+    return usRow(name, sub, x,
       isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
       m.withPerf,
       isAcct ? remarkName(x.key, esc(key)) : '');
   }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+  $('usDimPager').innerHTML = usPagerHtml(p);
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
-/* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
+/* 积分扣除：按账号 / 按模型 / 按 API Key 三个维度共用一张表（同上，box 合成一个）。 */
 function usCreditHead(dim) {
-  return dim === 'model'
-    ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
-    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
+  if (dim === 'model') {
+    return '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
       '<th class="num">请求</th><th class="num">扣除积分</th>' +
       '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+  }
+  const first = dim === 'apikey' ? 'API Key' : '账号';
+  return '<tr><th class="mark" aria-hidden="true"></th><th>' + first + '</th>' +
+    '<th class="num">请求</th><th class="num">扣除积分</th>' +
+    '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
 }
 
 function renderCreditDim() {
   const d = usageData || {};
   $('usCreditHead').innerHTML = usCreditHead(usCreditDim);
   const empty = '暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。';
-  if (usCreditDim === 'model') {
-    const models = d.credit_by_model || [];
-    $('usCreditBody').innerHTML = models.map(row =>
-      '<tr>' +
-        '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + esc(row.key || '—') + '</td>' +
-        '<td>' + esc(fmtModelRate(row.rate)) + '</td>' +
-        '<td class="num">' + fmtTok(row.requests) + '</td>' +
-        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
-        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
-        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
-        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
-      '</tr>'
-    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
-  } else {
-    const accounts = d.credit_by_account || [];
-    $('usCreditBody').innerHTML = accounts.map(row => {
-      const uid = String(row.key || '');
-      const account = row.nickname || uid.slice(0, 8) || '—';
-      return '<tr>' +
-        '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
-        '<td class="num">' + fmtTok(row.requests) + '</td>' +
-        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
-        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
-        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
-        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
-        '</tr>';
-    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
-  }
-  $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
+  const field = usCreditDim === 'model' ? 'credit_by_model'
+    : usCreditDim === 'apikey' ? 'credit_by_api_key'
+    : 'credit_by_account';
+  const p = usPageSlice(d[field] || [], usCreditPage);
+  usCreditPage = p.page;
+  // 三个维度后五列完全一致（请求/积分/样本 token/每 1M/命中率），只有首列不同。
+  const tail = row =>
+    '<td class="num">' + fmtTok(row.requests) + '</td>' +
+    '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+    '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+    '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+    '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>';
+  const mark = '<td class="mark" aria-hidden="true"></td>';
+  $('usCreditBody').innerHTML = p.rows.map(row => {
+    if (usCreditDim === 'model') {
+      return '<tr>' + mark + '<td>' + esc(row.key || '—') + '</td>' +
+        '<td>' + esc(fmtModelRate(row.rate)) + '</td>' + tail(row) + '</tr>';
+    }
+    if (usCreditDim === 'apikey') {
+      const id = String(row.key || '');
+      const name = row.nickname || (id ? id.slice(0, 8) : '未按 Key 记录');
+      const sub = id ? 'Key ' + id.slice(0, 12) : '升级前历史 / 未鉴权调用';
+      return '<tr>' + mark +
+        '<td>' + esc(name) + '<div class="note">' + esc(sub) + '</div></td>' + tail(row) + '</tr>';
+    }
+    const uid = String(row.key || '');
+    const account = row.nickname || uid.slice(0, 8) || '—';
+    return '<tr>' + mark +
+      '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+      tail(row) + '</tr>';
+  }).join('') || '<tr><td colspan="' + (usCreditDim === 'model' ? 8 : 7) + '" class="empty">' + empty + '</td></tr>';
+  $('usCreditPager').innerHTML = usPagerHtml(p);
+  $('usCreditTabs').innerHTML = usTabsHtml(US_CREDIT_TABS, usCreditDim, {
     account: (d.credit_by_account || []).length,
     model: (d.credit_by_model || []).length,
+    apikey: (d.credit_by_api_key || []).length,
   });
 }
 
@@ -3947,7 +4016,8 @@ function renderUsage(d) {
       '上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大');
   $('usCreditNote').textContent =
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
-    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · ' +
+    (usageData.credit_by_api_key || []).length + ' 个 API Key · 仅统计与积分同时观测到的 Token';
 
   renderUsageDim();
   renderCreditDim();
@@ -3955,23 +4025,44 @@ function renderUsage(d) {
   renderUsageHours(usageData.series || []);
 }
 
-// 维度切换 / 排序控件。
+// 维度切换 / 排序控件。换维度或换排序都回到第 1 页：排第一的行变了，停在第 3 页
+// 只会让人以为筛选没生效。
 if ($('usDimTabs')) $('usDimTabs').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-dim]');
   if (!b) return;
   usDim = b.dataset.dim;
+  usDimPage = 1;
   renderUsageDim();
 });
 if ($('usCreditTabs')) $('usCreditTabs').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-dim]');
   if (!b) return;
   usCreditDim = b.dataset.dim;
+  usCreditPage = 1;
   renderCreditDim();
 });
 if ($('usSort')) $('usSort').onchange = () => {
   usSort = $('usSort').value;
+  usDimPage = 1;
   renderUsageDim();
 };
+/* 两张表的分页条（委托式，同账号池的做法）：只换当前页再重渲染，不重新请求。
+ * which 取 'dim'（用量明细）或 'credit'（积分扣除历史）——不用回调参数，避免
+ * 「被调函数必须在同文件里有定义」的守卫抓不到参数式回调。 */
+function usBindPager(id, which) {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-uspage]');
+    if (!b || b.disabled) return;
+    const n = Number(b.dataset.uspage);
+    if (!Number.isFinite(n)) return;
+    if (which === 'credit') { usCreditPage = n; renderCreditDim(); }
+    else { usDimPage = n; renderUsageDim(); }
+  });
+}
+usBindPager('usDimPager', 'dim');
+usBindPager('usCreditPager', 'credit');
 
 /* renderUsageChart 画堆叠柱状图。
  *
@@ -6500,6 +6591,187 @@ for (const [id, realm] of [['proxyRealmCn', 'cn'], ['proxyRealmGlobal', 'global'
   };
 }
 
+/* ── 模型多选（可用模型，API Key 与分组模板共用）────────────────────
+   原来是两个 textarea：一行一个模型 ID，得自己记住上游模型名和 cn: / global: 前缀，
+   敲错一个字母就是「模型不可用」，页面上还看不出是哪个错。
+   改成下拉多选：点开是上游模型目录的复选列表（可搜索），目录里没有的模型也能
+   直接敲名字回车加进去（自定义名 / 别名 / 目录降级时缺失的模型）。
+   选中结果仍写回隐藏 input（每行一个），保存协议与后端完全不变。 */
+let mpCatalog = null;      // [{id,name}] 上游目录：首次展开时拉一次，全站复用
+let mpCatalogErr = '';     // 目录读取失败的原因（失败也要能手动输入）
+let mpCatalogLoading = null;
+
+function mpSplit(v) {
+  return String(v == null ? '' : v).split('\n').map(s => s.trim()).filter(Boolean);
+}
+function mpJoin(list) {
+  return (Array.isArray(list) ? list : []).filter(Boolean).join('\n');
+}
+function mpHas(list, id) { return (Array.isArray(list) ? list : []).indexOf(id) >= 0; }
+function mpToggle(list, id) {
+  const cur = (Array.isArray(list) ? list : []).slice();
+  const i = cur.indexOf(id);
+  if (i >= 0) cur.splice(i, 1); else cur.push(id);
+  return cur;
+}
+// mpAdd 追加但去重：回车加名字时不能把同一个模型塞两遍（后端按集合语义用，重复只是噪声）。
+function mpAdd(list, id) {
+  const cur = (Array.isArray(list) ? list : []).slice();
+  const v = String(id == null ? '' : id).trim();
+  if (v && cur.indexOf(v) < 0) cur.push(v);
+  return cur;
+}
+// mpFilter 关键字同时匹配 ID 与展示名：用户记得住「GLM」未必记得住 glm-5.2。
+function mpFilter(catalog, q, selected) {
+  const kw = String(q == null ? '' : q).trim().toLowerCase();
+  const out = [];
+  (Array.isArray(catalog) ? catalog : []).forEach(m => {
+    const id = String((m && m.id) || '');
+    if (!id) return;
+    const name = String((m && m.name) || '');
+    if (kw && id.toLowerCase().indexOf(kw) < 0 && name.toLowerCase().indexOf(kw) < 0) return;
+    out.push({ id: id, name: name, on: mpHas(selected, id) });
+  });
+  return out;
+}
+
+function mpEl(name, suffix) { return $(name + suffix); }
+
+function mpRenderChips(name) {
+  const chips = mpEl(name, 'Chips'), input = $(name);
+  if (!chips || !input) return;
+  const sel = mpSplit(input.value);
+  if (!sel.length) { setHTML(chips, '<span class="mpick-none">全部模型（不限）</span>'); return; }
+  setHTML(chips, sel.map(id =>
+    '<span class="mpick-chip">' + esc(id) +
+    '<button type="button" class="mpick-x" data-mp-del="' + esc(id) + '" title="移除" aria-label="移除 ' + esc(id) + '">×</button></span>'
+  ).join(''));
+}
+
+function mpRenderMenu(name) {
+  const menu = mpEl(name, 'Menu'), input = $(name), q = mpEl(name, 'Q');
+  if (!menu || !input) return;
+  const sel = mpSplit(input.value);
+  const kw = String((q && q.value) || '').trim();
+  const note = t => '<div class="mpick-note">' + t + '</div>';
+  // 已选但目录里没有的（自定义名 / 目录降级时缺失）：单独列出来，否则勾了看不见。
+  const known = (mpCatalog || []).map(m => String((m && m.id) || ''));
+  const custom = sel.filter(id => known.indexOf(id) < 0)
+    .filter(id => !kw || id.toLowerCase().indexOf(kw.toLowerCase()) >= 0);
+  const rows = mpFilter(mpCatalog || [], kw, sel);
+  const html = [];
+  const errNote = mpCatalogErr
+    ? '模型目录读取失败：' + esc(mpCatalogErr) + '，可直接输入模型名回车添加' : '';
+  if (mpCatalog === null) {
+    html.push(note(errNote || '正在读取上游模型目录…'));
+  } else if (errNote) {
+    html.push(note(errNote));
+  } else if (!rows.length && !custom.length) {
+    html.push(note(kw ? '没有匹配的模型，回车把「' + esc(kw) + '」作为自定义模型加进去' : '没有匹配的模型'));
+  } else if (!rows.length) {
+    // 目录里没有命中，但下面还要列出已填的自定义模型，别写「没有匹配」自相矛盾。
+    html.push(note('目录里没有匹配项，下面是已添加的自定义模型'));
+  }
+  rows.forEach(m => {
+    html.push('<label class="mpick-item' + (m.on ? ' on' : '') + '">' +
+      '<input type="checkbox" value="' + esc(m.id) + '"' + (m.on ? ' checked' : '') + '>' +
+      '<span class="mpick-id">' + esc(m.id) + '</span>' +
+      (m.name && m.name !== m.id ? '<span class="mpick-name">' + esc(m.name) + '</span>' : '') +
+      '</label>');
+  });
+  custom.forEach(id => {
+    html.push('<label class="mpick-item on"><input type="checkbox" value="' + esc(id) + '" checked>' +
+      '<span class="mpick-id">' + esc(id) + '</span><span class="mpick-name">自定义</span></label>');
+  });
+  setHTML(menu, html.join(''));
+}
+
+async function mpLoadCatalog() {
+  if (mpCatalog !== null || mpCatalogLoading) return mpCatalogLoading;
+  mpCatalogLoading = (async () => {
+    try {
+      const d = await api('models');
+      mpCatalog = (Array.isArray(d && d.models) ? d.models : []).map(m => ({
+        id: String((m && m.id) || ''), name: String((m && m.name) || ''),
+      })).filter(m => m.id);
+    } catch (e) {
+      mpCatalog = [];
+      mpCatalogErr = (e && e.message) ? e.message : '未知错误';
+    }
+    mpCatalogLoading = null;
+    return mpCatalog;
+  })();
+  return mpCatalogLoading;
+}
+
+// mpSync 把 hidden input 的值刷新到 chip 与列表上（外部改了 value 必须调一次）。
+// skipMenu=true 用于勾选菜单项：整块重绘会把用户刚点的复选框换成新节点（焦点丢失、
+// 菜单滚动位置跳回顶部），那种场景只更新 chip 和那一行的 .on 就够。
+function mpSync(name, list, skipMenu) {
+  const input = $(name);
+  if (!input) return;
+  if (list !== undefined) input.value = mpJoin(list);
+  mpRenderChips(name);
+  const menu = mpEl(name, 'Menu');
+  if (!skipMenu && menu && !menu.hidden) mpRenderMenu(name);
+}
+function mpReset(name, list) { mpSync(name, Array.isArray(list) ? list : []); }
+
+function mpAddTyped(name) {
+  const q = mpEl(name, 'Q'), input = $(name);
+  if (!q || !input) return false;
+  const v = q.value.trim();
+  if (!v) return false;
+  const before = mpSplit(input.value);
+  mpSync(name, mpAdd(before, v));
+  q.value = '';
+  if (before.indexOf(v) < 0) toast('已加入可用模型「' + v + '」', 'ok');
+  return true;
+}
+
+function mpBind(name) {
+  const pick = mpEl(name, 'Pick'), menu = mpEl(name, 'Menu'), q = mpEl(name, 'Q'), input = $(name);
+  if (!pick || !menu || !q || !input) return;
+  const open = () => {
+    if (!menu.hidden) return;
+    menu.hidden = false;
+    pick.classList.add('open');
+    mpRenderMenu(name);
+    mpLoadCatalog().then(() => { if (!menu.hidden) mpRenderMenu(name); });
+  };
+  const close = () => { menu.hidden = true; pick.classList.remove('open'); };
+  pick.addEventListener('click', ev => {
+    const del = ev.target.closest('[data-mp-del]');
+    if (del) {
+      ev.preventDefault();
+      mpSync(name, mpSplit(input.value).filter(id => id !== del.getAttribute('data-mp-del')));
+      return;
+    }
+    if (ev.target.closest('.mpick-menu')) return; // 菜单内点击交给 change
+    q.focus();
+    open();
+  });
+  q.addEventListener('focus', open);
+  q.addEventListener('input', () => { open(); mpRenderMenu(name); });
+  q.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); if (mpAddTyped(name)) mpRenderMenu(name); return; }
+    if (ev.key === 'Escape') { close(); return; }
+    if (ev.key === 'Backspace' && !q.value) {
+      const sel = mpSplit(input.value);
+      if (sel.length) { sel.pop(); mpSync(name, sel); }
+    }
+  });
+  menu.addEventListener('change', ev => {
+    const cb = ev.target.closest('input[type=checkbox]');
+    if (!cb) return;
+    const row = cb.closest('.mpick-item');
+    if (row) row.classList.toggle('on', cb.checked);
+    mpSync(name, mpToggle(mpSplit(input.value), cb.value), true);
+  });
+  // 点空白处收起：只在选择器外面才收，否则点一次勾选就会把自己关掉。
+  document.addEventListener('click', ev => { if (!pick.contains(ev.target)) close(); });
+  mpSync(name);
+}
 /* ── 客户端 API Key（多 Key + 分组模板）─────────────────────────────
    客户端 Key = 网关签发给下游的密钥（sk- 开头），与账号池里的上游 key 无关。
    每个 Key 可单独限定：到期时间 / 可用模型（空 = 全部）/ 积分额度 /
@@ -6645,7 +6917,7 @@ function gkResetForm() {
   $('gkExpires').value = '';
   $('gkLimit').value = '';
   $('gkUsedView').value = '0';
-  $('gkModels').value = '';
+  mpReset('gkModels', []);
   $('gkMode').value = '';
   $('gkPrompt').value = '';
   $('gkMemo').value = '';
@@ -6671,7 +6943,7 @@ function openGatewayKeyEdit(id) {
   $('gkExpires').value = gkLocalInput(k.expires_at);
   $('gkLimit').value = k.credit_limit ? gkNum(k.credit_limit) : '';
   $('gkUsedView').value = gkNum(k.credit_used);
-  $('gkModels').value = (k.models || []).join('\n');
+  mpReset('gkModels', k.models || []);
   $('gkMode').value = k.prompt_mode || '';
   $('gkPrompt').value = k.prompt_text || '';
   $('gkMemo').value = k.note || '';
@@ -6685,7 +6957,7 @@ function gkApplyTemplate() {
   if (!id) return;
   const tpl = (gkData.templates || []).find(t => t.id === id);
   if (!tpl) return;
-  $('gkModels').value = (tpl.models || []).join('\n');
+  mpReset('gkModels', tpl.models || []);
   $('gkLimit').value = tpl.credit_limit ? gkNum(tpl.credit_limit) : '';
   $('gkMode').value = tpl.prompt_mode || '';
   $('gkPrompt').value = tpl.prompt_text || '';
@@ -6788,7 +7060,7 @@ function gkResetTplForm() {
   $('gkTplDays').value = '';
   $('gkTplLimit').value = '';
   $('gkTplMode').value = '';
-  $('gkTplModels').value = '';
+  mpReset('gkTplModels', []);
   $('gkTplPrompt').value = '';
   gkClearErr('gkTplErr');
   if ($('gkTplNote')) $('gkTplNote').textContent = '新建模板';
@@ -6803,7 +7075,7 @@ function gkEditTpl(id) {
   $('gkTplDays').value = tpl.expiry_days ? String(tpl.expiry_days) : '';
   $('gkTplLimit').value = tpl.credit_limit ? gkNum(tpl.credit_limit) : '';
   $('gkTplMode').value = tpl.prompt_mode || '';
-  $('gkTplModels').value = (tpl.models || []).join('\n');
+  mpReset('gkTplModels', tpl.models || []);
   $('gkTplPrompt').value = tpl.prompt_text || '';
   if ($('gkTplNote')) $('gkTplNote').textContent = '编辑模板 · ' + (tpl.name || tpl.id);
 }
@@ -6858,6 +7130,8 @@ if ($('btnGkTpl')) $('btnGkTpl').onclick = () => {
 if ($('btnGkTplClose')) $('btnGkTplClose').onclick = () => $('gkTplVeil').classList.remove('on');
 if ($('btnGkTplClear')) $('btnGkTplClear').onclick = gkResetTplForm;
 if ($('btnGkTplSave')) $('btnGkTplSave').onclick = gkSaveTpl;
+mpBind('gkModels');
+mpBind('gkTplModels');
 if ($('gkBody')) $('gkBody').addEventListener('click', ev => {
   const btn = ev.target.closest('[data-gk-act]');
   if (!btn) return;
@@ -6871,7 +7145,9 @@ if ($('gkBody')) $('gkBody').addEventListener('click', ev => {
 if ($('gkTplBody')) $('gkTplBody').addEventListener('click', ev => {
   const btn = ev.target.closest('[data-gktpl-act]');
   if (!btn) return;
-  const id = btn.dataset.gkTplId;
+  // dataset 驼峰化：data-gktpl-id → dataset.gktplId（写成 gkTplId 会永远读到 undefined，
+  // 编辑/删除就这样静默失效过）。
+  const id = btn.dataset.gktplId;
   if (btn.dataset.gktplAct === 'edit') gkEditTpl(id);
   else if (btn.dataset.gktplAct === 'del') gkDeleteTpl(id);
 });

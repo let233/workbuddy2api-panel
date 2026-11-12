@@ -48,6 +48,9 @@ type chatStat struct {
 	mode  string // "stream" | "sync"
 	uid   string // 完整 uid，展示时只取前 8 位
 	nick  string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
+	// keyID 发起本次调用的客户端 Key ID（gatewaykeys.Key.ID）。空 = 未鉴权或
+	// Key 鉴权关闭。用量落库时带上它，面板「按 API Key」维度才有数据。
+	keyID string
 	ttfb  time.Duration
 	toks  int // <0 表示 usage 缺失 → 显示 "-"
 	// think：本次 completion_tokens 里有多少是思考 token（上游把思考算进 completion）。

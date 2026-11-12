@@ -29,6 +29,26 @@ func requestGatewayKey(r *http.Request) *gatewaykeys.Key {
 	return k
 }
 
+// gatewayKeyID 取本次请求命中的客户端 Key ID；未命中（未鉴权/鉴权关闭）返回空。
+func gatewayKeyID(r *http.Request) string {
+	if k := requestGatewayKey(r); k != nil {
+		return k.ID
+	}
+	return ""
+}
+
+// gatewayKeyIDCtx 同 gatewayKeyID，但用于没有 *http.Request 的执行路径
+// （如托管工具里的出图调用，只拿得到父请求的 context）。
+func gatewayKeyIDCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if k, _ := ctx.Value(gatewayKeyCtxKey{}).(*gatewaykeys.Key); k != nil {
+		return k.ID
+	}
+	return ""
+}
+
 // withGatewayKey 把 Key 挂到请求上下文（中间件用）。
 func withGatewayKey(r *http.Request, k *gatewaykeys.Key) *http.Request {
 	if k == nil {

@@ -1081,6 +1081,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// routeModel：映射请求显示真实路由名（别名 INFO 行已记录 客户端名 -> 真实名，
 	// 两行合看即全链路；流水行与账本/上游口径一致，运维排查不用做心算翻译）。
 	st := newChatStat(time.Now(), routeModel, peek.Stream, h.budget)
+	st.keyID = gatewayKeyID(r)
 	// 等上游首帧期间向客户端补 SSE 注释帧（见 headkeepalive.go）：大上下文 TTFB
 	// 可达 3~6 秒，而 StreamHint 首帧否决窗口内一个字节都不写，客户端会把它当
 	// 「连接僵死」自行放弃（线上实测四次零内容中断全落在 3.46~4.09s）。
@@ -1296,6 +1297,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				realm = a.Realm
 			}
 			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+				APIKey:           st.keyID,
 				PromptTokens:     delta.PromptTokens,
 				HasPromptTokens:  delta.HasPromptTokens,
 				CompletionTokens: delta.CompletionTokens,

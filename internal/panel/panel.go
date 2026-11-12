@@ -1605,7 +1605,17 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, currentRate))
+	// Key 名映射只用于「按 API Key」维度展示；Manager 为空（测试/纯内存）则没有名字，
+	// 前端退化成显示 ID 前缀。
+	var keyNames map[string]string
+	if p.cfg.Keys != nil {
+		keys := p.cfg.Keys.List()
+		keyNames = make(map[string]string, len(keys))
+		for _, k := range keys {
+			keyNames[k.ID] = k.Name
+		}
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindowKeys(win, nicks, keyNames, currentRate))
 }
 
 // parseTimeParam 解析时间查询参数：unix 秒（前端默认）或 RFC3339（便于手工调

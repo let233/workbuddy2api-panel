@@ -249,6 +249,7 @@ func (h *Handler) imageGenerate(ctx context.Context, req map[string]any) ([]byte
 		return nil, err
 	}
 	st := newChatStat(time.Now(), bare, false, h.budget)
+	st.keyID = gatewayKeyIDCtx(ctx)
 	if tr, _ := ctx.Value(requestTraceKey{}).(*requestTrace); tr != nil {
 		st.requestID = tr.id
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
@@ -376,6 +377,7 @@ func recordImageUsage(h *Handler, st *chatStat, realm, uid, bare, modelRate stri
 		logfmt.Label(uid, st.nick), bare, imgs, u.Credit, time.Since(start).Round(time.Millisecond))
 	if h.cfg.Usage != nil {
 		h.cfg.Usage.Add(time.Now(), realm, uid, bare, usage.Delta{
+			APIKey:          st.keyID,
 			PromptTokens:    u.InputTokens,
 			HasPromptTokens: u.InputTokens > 0,
 			TotalTokens:     u.TotalTokens,

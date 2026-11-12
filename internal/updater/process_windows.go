@@ -53,6 +53,12 @@ func launchCleanup(executable, path string, pid int) {
 	_ = startChild(cmd)
 }
 
+// reexecSelf Windows 没有 exec 原语（进程映像只能由 CreateProcess 另起一个），
+// 容器内的 in-place 更新只在 linux 分支可达，这里是编译占位。
+func reexecSelf(_ string, _ []string) error {
+	return errors.New("Windows 不支持进程内 exec 重启")
+}
+
 func processSupervised() bool {
 	managed, err := svc.IsWindowsService()
 	return err == nil && managed

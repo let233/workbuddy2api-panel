@@ -46,7 +46,11 @@ import (
 // appVersion 面板版本，透出到 /panel/api/overview。
 // 本地构建保持 dev。发布构建由 CI 用 -X 注入上海时间（2026.9.26.711），不跟上游 1.x。
 var appVersion = "dev"
-var appRepository = "misakano7545/workbuddy2api-panel"
+
+// appRepository 面板「在线更新」查询 Release 用的仓库（owner/repo），可在构建时用
+// -X 覆盖。与 go.mod 里的模块路径无关：模块路径是历史血缘，跟着上游走没意义，
+// 这里只决定「去哪儿找新版本」。
+var appRepository = "let233/workbuddy2api-panel"
 
 // defaultCredWarning 首次部署的初始口令 + 非回环监听 = 把面板交给整个内网：
 // 只要管理员还是「刚建出来、没改过密码」的状态就提醒一次（改密后不再打扰）。

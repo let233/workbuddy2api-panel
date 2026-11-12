@@ -1,8 +1,10 @@
 services:
   wb2api:
-    # 默认使用上游预编译镜像：docker compose pull && docker compose up -d --no-build。
+    # 默认使用预编译镜像：docker compose pull && docker compose up -d --no-build。
     # latest 跟随 main；固定版本可用 :2026.11.1.905（镜像标签不带 v）。
-    image: ghcr.io/misakano7545/workbuddy2api-panel:latest
+    # 面板「关于 → 立即更新」在容器内也能用：程序会原地替换 /app/wb2api 并 exec 自身，
+    # 容器不重启、端口不断；重建容器（pull/up）会回到镜像里的版本。
+    image: ghcr.io/let233/workbuddy2api-panel:latest
     # 源码构建：注释 image，取消下面 build 段的注释，
     # 再 git pull && docker compose up -d --build；两种方式二选一。
     # build:

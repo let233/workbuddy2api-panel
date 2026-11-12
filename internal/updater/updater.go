@@ -106,6 +106,14 @@ type Status struct {
 	// LastErrorKind 上次失败的网络类目（dns/connect/tls/header-timeout/body-stall/
 	// checksum/http/unknown），供面板给出对应建议动作。
 	LastErrorKind string `json:"last_error_kind,omitempty"`
+	// Container 是否在容器里运行。面板据此提示「重建容器会回到镜像版本」。
+	Container bool `json:"container,omitempty"`
+	// InstallBlocked 不能原地更新的原因（空 = 可更新）。面板直接展示，省得用户
+	// 点了「立即更新」才拿到一句错误。
+	InstallBlocked string `json:"install_blocked,omitempty"`
+	// InstallMode 生效的安装方式：helper（替换后由 helper 拉起新进程）/
+	// in-place（容器内进程内替换 + exec 自身）。
+	InstallMode string `json:"install_mode,omitempty"`
 }
 
 type release struct {
@@ -140,6 +148,13 @@ type Manager struct {
 	client     *http.Client
 	now        func() time.Time
 
+	// container 是否运行在容器里（New 时探测一次，之后不变）。
+	container bool
+	// execDirWritable 程序目录能否写入（容器内更新要 rename 二进制到这个目录）。
+	execDirWritable bool
+	// reexec 进程内 exec 的实现，默认 reexecSelf；测试可替换以观察调用。
+	reexec func(path string, argv []string) error
+
 	mu          sync.RWMutex
 	checkMu     sync.Mutex
 	settings    Settings
@@ -148,6 +163,8 @@ type Manager struct {
 	lastCheck   time.Time
 	lastAutoDay string
 	restarting  func()
+	// pendingReexec 容器内更新已替换好文件、等 RestartAfter 触发 exec。
+	pendingReexec bool
 }
 
 // New creates an updater for a standalone process. An empty repository falls back
@@ -158,7 +175,7 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		executable = resolved
 	}
 	if repository == "" {
-		repository = "misakano7545/workbuddy2api-panel"
+		repository = "let233/workbuddy2api-panel"
 	}
 	if settings.AutoTime == "" {
 		settings.AutoTime = "04:00"
@@ -186,6 +203,8 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		client:     &http.Client{Timeout: 30 * time.Second},
 		now:        time.Now,
 		settings:   settings,
+		container:  isContainer(),
+		reexec:     reexecSelf,
 		status: Status{
 			CurrentVersion: version,
 			AutoEnabled:    settings.AutoEnabled,
@@ -194,10 +213,15 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 	}
 	m.applyChannelStatusLocked()
 	_, m.status.CurrentKnown = parseVersion(m.version)
-	m.status.CanInstall = m.canInstallLocked()
+	// 能不能原地换二进制取决于「程序目录写不写得了」，这个只能试一次才知道
+	// （容器里属主/ACL/只读挂载混在一起，看权限位没用）。
+	m.execDirWritable = executable != "" && dirWritable(filepath.Dir(executable))
+	m.refreshInstallStatusLocked()
 	if executable != "" {
 		CleanupStaleTempFiles(filepath.Dir(executable), staleTempAge)
 	}
+	// 上一个进程被容器内更新换掉时留下的标记：新版本活过观察窗口就清掉 .old。
+	m.armInPlaceFinalize()
 	return m
 }
 
@@ -343,7 +367,7 @@ func (m *Manager) Check(ctx context.Context) error {
 			current, currentOK := parseVersion(m.version)
 			// An unknown build may be newer than the Release; do not advertise a downgrade.
 			m.status.UpdateAvailable = currentOK && newestVersion.ordinal > current.ordinal
-			m.status.CanInstall = m.canInstallLocked()
+			m.refreshInstallStatusLocked()
 			m.status.LastError = ""
 			m.status.CheckedAt = m.now().Format(time.RFC3339)
 			m.lastCheck = m.now()
@@ -403,11 +427,16 @@ func (m *Manager) Install(ctx context.Context) (err error) {
 		m.mu.Unlock()
 		return errors.New("更新已在进行中")
 	}
-	if !m.canInstallLocked() {
+	ok, reason := m.installSupportLocked()
+	if !ok {
 		m.mu.Unlock()
+		if m.container {
+			return fmt.Errorf("当前部署不支持原地更新：%s；请拉取新镜像或改用可写的程序目录", reason)
+		}
 		return errors.New("当前部署不支持原地更新，请从 Release 页面下载或更新容器镜像")
 	}
-	if m.restarting == nil {
+	// 容器里靠 exec 自身重启，不需要外部回调；普通部署靠回调让进程起来。
+	if !m.container && m.restarting == nil {
 		m.mu.Unlock()
 		return errors.New("更新重启回调未配置")
 	}
@@ -478,6 +507,13 @@ func (m *Manager) Install(ctx context.Context) (err error) {
 			os.Remove(stagePath)
 			return fmt.Errorf("设置更新文件权限: %w", err)
 		}
+	}
+
+	// 容器里没有 helper 那一步可用：主进程就是 PID 1，退出即容器停、helper 被
+	// 一起杀掉，替换永远走不完。改为在本进程里换文件（Linux 允许 rename 正在
+	// 执行的 inode），随后由 RestartAfter 触发 exec 自身。
+	if m.container {
+		return m.installInPlace(stagePath, version)
 	}
 
 	helperFile, err := os.CreateTemp(dir, ".wb2api-updater-*"+filepath.Ext(expectedBinary))
@@ -1022,10 +1058,19 @@ func copyFile(srcPath, dstPath string) error {
 }
 
 // RestartAfter gives the HTTP handler time to flush its accepted response.
+//
+// 容器内更新（in-place）走另一条路：文件已经换好，这里到点 exec 自身即可，不依赖
+// 外部回调（main 里的 SetRestart 是「退出进程让 systemd/docker 重启」，在容器里
+// 会连容器一起停）。
 func (m *Manager) RestartAfter(delay time.Duration) {
 	m.mu.RLock()
 	fn := m.restarting
+	reexec := m.pendingReexec
 	m.mu.RUnlock()
+	if reexec {
+		time.AfterFunc(delay, m.execSelf)
+		return
+	}
 	if fn == nil {
 		return
 	}
@@ -1086,11 +1131,8 @@ func (m *Manager) scheduleDue(now time.Time) (auto, regular bool) {
 }
 
 func (m *Manager) canInstallLocked() bool {
-	_, versioned := parseVersion(m.version)
-	return versioned &&
-		(runtime.GOOS == "linux" || runtime.GOOS == "windows") &&
-		(runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") &&
-		m.executable != "" && !isContainer() && !processSupervised()
+	ok, _ := m.installSupportLocked()
+	return ok
 }
 
 func parseVersion(tag string) (parsedVersion, bool) {

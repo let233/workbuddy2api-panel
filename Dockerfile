@@ -19,10 +19,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${APP_VE
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
+# /app 放宽到 0777：面板「关于 → 立即更新」要在容器里原地替换 /app/wb2api，
+# 换文件只需要目录写权限，而 compose 允许 PUID/PGID 覆盖成宿主机 uid（镜像默认
+# 10001:10001）。容器内所有进程本来就是同一个用户，放宽目录权限不扩大权限面。
 RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
- && chown -R app:app /app
+ && chown -R app:app /app \
+ && chmod 0777 /app
 WORKDIR /app
 # 脚本置入 + 去 CRLF（Windows 检出可能性）在切到 app 之前以 root 完成——
 # app 对 root 所有文件无写权限，sed -i 需要写权限。

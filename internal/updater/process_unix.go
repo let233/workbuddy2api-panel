@@ -3,6 +3,7 @@
 package updater
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -29,6 +30,22 @@ func waitForProcessExit(pid int, timeout time.Duration) error {
 }
 
 func launchCleanup(_, _ string, _ int) {}
+
+// reexecSelf 用 path 上的新二进制替换当前进程（容器内在线更新用）。
+//
+// unix 允许 rename 掉正在执行的文件：当前进程持有旧 inode，syscall.Exec 让新文件
+// 接管同一个 PID。容器里这是唯一可行的重启方式——拉起子进程再让父进程退出会把
+// 容器一起带走（主进程即 PID 1）。exec 成功则本函数不返回；argv 原样沿用调用方
+// 的 os.Args，启动参数（-config 等）一字不改。
+func reexecSelf(path string, argv []string) error {
+	if path == "" {
+		return errors.New("缺少可执行文件路径")
+	}
+	if len(argv) == 0 {
+		argv = []string{path}
+	}
+	return syscall.Exec(path, argv, os.Environ())
+}
 
 func processSupervised() bool {
 	if runtime.GOOS == "linux" {
