@@ -111,11 +111,20 @@ jobs:
             exit 0
           fi
 
-          # 主干最新提交上本来就失败的检查名——主干已红时不算 PR 的锅
+          # 主干本来就红的检查名，不算 PR 的锅。两个来源取并集：
+          #   1) PR 的 base 提交上的 check-runs
+          #   2) default 分支上最近一次 binaries 运行里失败的 job（主干常红时更准）
           base_sha=$(gh pr view "$PR_URL" --json baseRefOid --jq .baseRefOid)
           gh api "repos/$REPO/commits/$base_sha/check-runs?per_page=100" \
             --jq '[.check_runs[] | select(.conclusion == "failure") | .name] | sort | .[]' \
             > base_fail.txt 2>/dev/null || : > base_fail.txt
+
+          latest_run=$(gh run list --repo "$REPO" --workflow binaries --branch main --event push \
+            --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "${latest_run:-}" ]; then
+            gh run view "$latest_run" --repo "$REPO" --json jobs \
+              --jq '.jobs[] | select(.conclusion == "failure") | .name' >> base_fail.txt 2>/dev/null || true
+          fi
 
           new_fail=$(sort head_fail.txt | comm -23 - <(sort -u base_fail.txt) | sed '/^$/d')
 
