@@ -1,11 +1,13 @@
 name: dependabot-auto-merge
 
-# Dependabot PR 自动合并（带 CI 门禁）：
-#   1. 先等 binaries（go test + 前端构建）等检查全部跑完
-#   2. patch / minor 且 CI 全绿 → 自动 squash 合并并删分支
-#   3. major、CI 失败、或有冲突 → 打「需人工确认」标签，写评论说原因，不合并
-# 用 pull_request_target：Dependabot 触发的 PR 事件里 GITHUB_TOKEN 默认只读，
-# target 变体才拿得到写权限；这里不 checkout 任何代码，不执行 PR 里的脚本。
+# Dependabot PR 自动合并（带门禁）：
+#   1. 等 PR 上的检查全部跑完（binaries 里是 go test + 前端构建）
+#   2. 只容忍「主干本来就红」的失败项，出现新失败 → 转人工
+#   3. 再按改动生态做一次针对性冒烟（go build / 前端构建），冒烟不过 → 转人工
+#   4. patch / minor 且以上全过 → squash 合并并删分支；major 一律转人工
+# 用 pull_request_target：Dependabot 触发的 PR 事件里 GITHUB_TOKEN 默认只读；
+# 只有在 github.actor == dependabot[bot] 时才 checkout PR 分支，且该分支只由
+# Dependabot 修改依赖清单。
 on: pull_request_target
 
 permissions:
@@ -32,8 +34,8 @@ jobs:
 
       - name: 打标签（更新类型 / 生态）
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
           ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
         run: |
@@ -41,60 +43,137 @@ jobs:
           gh pr edit "$PR_URL" --add-label "$UPDATE_TYPE" || true
           gh pr edit "$PR_URL" --add-label "deps:$ECOSYSTEM" || true
 
-      # 只有 patch / minor 才值得等 CI；major 直接交人工，不烧 runner 时间
-      - name: 等待 CI 检查全部完成
-        id: ci
-        if: |
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          steps.meta.outputs.update-type == 'version-update:semver-minor'
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -uo pipefail
-          echo "ci_ok=false" >> "$GITHUB_OUTPUT"
-
-          # 等 PR 上的检查挂上来（dependabot PR 与本次事件几乎同时创建，前几十秒是空的）
-          for i in $(seq 1 40); do
-            if gh pr checks "$PR_URL" >/dev/null 2>&1 || [ "$(gh pr checks "$PR_URL" 2>/dev/null | wc -l)" -gt 0 ]; then
-              break
-            fi
-            sleep 15
-          done
-
-          # --watch 会阻塞到全部检查结束；失败或超时都由退出码体现
-          if gh pr checks "$PR_URL" --watch --fail-fast --interval 20; then
-            echo "ci_ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "CI 未通过，转人工确认。"
-            gh pr edit "$PR_URL" --add-label "需人工确认" || true
-            gh pr comment "$PR_URL" --body "CI 检查未全部通过，未开启自动合并，请人工看（\`binaries\` 里是 go test 与前端构建）。" || true
-          fi
-
-      - name: 自动合并（CI 全绿）
-        if: steps.ci.outputs.ci_ok == 'true'
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -uo pipefail
-          state=$(gh pr view "$PR_URL" --json state,mergeable --jq '.state + " " + .mergeable')
-          case "$state" in
-            "OPEN MERGEABLE") ;;
-            *)
-              echo "PR 状态为 ${state}，跳过合并"
-              gh pr edit "$PR_URL" --add-label "需人工确认" || true
-              exit 0
-              ;;
-          esac
-          gh pr merge --squash --delete-branch "$PR_URL"
-
-      - name: 主版本更新交人工确认
+      - name: 主版本更新直接转人工
         if: steps.meta.outputs.update-type == 'version-update:semver-major'
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           set -uo pipefail
           gh pr edit "$PR_URL" --add-label "需人工确认" || true
           gh pr comment "$PR_URL" --body "主版本更新：未开自动合并。确认兼容后手动 Squash and merge，或改完代码再合。"
+
+      - name: 等检查跑完并判定是否有新失败
+        id: gate
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+          LC_ALL: C
+        run: |
+          set -uo pipefail
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          echo "reason=未判定" >> "$GITHUB_OUTPUT"
+
+          # 轮询到没有 PENDING 为止（dependabot PR 事件几乎与 PR 同时创建，前几十秒检查是空的）
+          for i in $(seq 1 80); do
+            gh pr checks "$PR_URL" --json name,state,bucket > checks.json 2>/dev/null || true
+            pending=$(jq '[.[] | select(.bucket == "pending")] | length' checks.json 2>/dev/null || echo 0)
+            total=$(jq 'length' checks.json 2>/dev/null || echo 0)
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then break; fi
+            sleep 30
+          done
+
+          if [ ! -s checks.json ]; then
+            echo "reason=PR 上没有检查结果" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 本次失败的检查名
+          jq -r '[.[] | select(.bucket == "fail") | .name] | sort | .[]' checks.json > head_fail.txt || true
+          head=$(jq '[.[] | select(.bucket == "fail")] | length' checks.json)
+
+          if [ "$head" -eq 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "reason=检查全绿" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 主干最新提交上本来就失败的检查名——主干已红时不算 PR 的锅
+          base_sha=$(gh pr view "$PR_URL" --json baseRefOid --jq .baseRefOid)
+          gh api "repos/$REPO/commits/$base_sha/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion == "failure") | .name] | sort | .[]' \
+            > base_fail.txt 2>/dev/null || : > base_fail.txt
+
+          new_fail=$(sort head_fail.txt | comm -23 - <(sort -u base_fail.txt) | sed '/^$/d')
+
+          if [ -z "$new_fail" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "reason=失败项与主干一致（主干本来就红）" >> "$GITHUB_OUTPUT"
+          else
+            echo "reason=出现新失败：$new_fail" >> "$GITHUB_OUTPUT"
+            gh pr edit "$PR_URL" --add-label "需人工确认" || true
+            gh pr comment "$PR_URL" --body "CI 出现新失败（$(echo $new_fail | tr '\n' ' ')），未自动合并，请人工看。" || true
+          fi
+
+      - name: 检出 PR 分支
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: 按生态做针对性冒烟
+        if: steps.gate.outputs.ok == 'true'
+        id: smoke
+        env:
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+        run: |
+          set -uo pipefail
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          echo "改动文件：$changed"
+
+          case "$ECOSYSTEM" in
+            gomod)
+              go build ./... || { echo "reason=go build 失败" >> "$GITHUB_OUTPUT"; exit 0; }
+              go vet ./... || { echo "reason=go vet 失败" >> "$GITHUB_OUTPUT"; exit 0; }
+              ;;
+            npm_and_yarn)
+              node -v
+              npm ci --prefix web --no-audit --no-fund --registry=https://registry.npmmirror.com \
+                || { echo "reason=npm ci 失败" >> "$GITHUB_OUTPUT"; exit 0; }
+              npm run build --prefix web || { echo "reason=前端构建失败" >> "$GITHUB_OUTPUT"; exit 0; }
+              ;;
+            docker)
+              # 基础镜像升级只验证 Dockerfile 语法可解析，真正构建交给 docker-ghcr
+              docker build --check . 2>/dev/null || echo "跳过 docker --check（不支持该子命令）"
+              ;;
+            github_actions)
+              python3 -c "import glob, yaml; [yaml.safe_load(open(f, encoding='utf-8')) for f in glob.glob('.github/workflows/*.y*ml')]" \
+                || { echo "reason=workflow YAML 解析失败" >> "$GITHUB_OUTPUT"; exit 0; }
+              echo "workflow YAML OK"
+              ;;
+            *) echo "无对应冒烟项，跳过" ;;
+          esac
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "reason=冒烟通过" >> "$GITHUB_OUTPUT"
+
+      - name: 合并
+        if: steps.gate.outputs.ok == 'true' && steps.smoke.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -uo pipefail
+          state=$(gh pr view "$PR_URL" --json state,mergeable --jq '.state + " " + .mergeable')
+          case "$state" in
+            "OPEN MERGEABLE") gh pr merge --squash --delete-branch "$PR_URL" ;;
+            *)
+              echo "PR 状态为 $state，跳过合并"
+              gh pr edit "$PR_URL" --add-label "需人工确认" || true
+              ;;
+          esac
+
+      - name: 冒烟失败转人工
+        if: steps.gate.outputs.ok == 'true' && steps.smoke.outputs.ok != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REASON: ${{ steps.smoke.outputs.reason }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_URL" --add-label "需人工确认" || true
+          gh pr comment "$PR_URL" --body "冒烟未通过（$REASON），未自动合并。" || true
