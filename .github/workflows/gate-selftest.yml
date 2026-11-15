@@ -1,0 +1,43 @@
+name: gate-selftest
+
+on: workflow_dispatch:
+  inputs:
+    pr:
+      description: "PR 号"
+      required: true
+      default: "6"
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 跑判定核心片段
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+          LC_ALL: C
+        run: |
+          set -uo pipefail
+          PR_URL="https://github.com/$REPO/pull/$PR"
+          gh pr checks "$PR_URL" --json name,state,bucket > checks.json
+          echo "--- checks ---"; jq -c '.[] | {name,bucket}' checks.json
+          pending=$(jq '[.[] | select(.bucket == "pending")] | length' checks.json)
+          head=$(jq '[.[] | select(.bucket == "fail")] | length' checks.json)
+          echo "pending=$pending head_fail=$head"
+          jq -r '[.[] | select(.bucket == "fail") | .name] | sort | .[]' checks.json > head_fail.txt || true
+          base_sha=$(gh pr view "$PR_URL" --json baseRefOid --jq .baseRefOid)
+          echo "base_sha=$base_sha"
+          gh api "repos/$REPO/commits/$base_sha/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion == "failure") | .name] | sort | .[]' \
+            > base_fail.txt 2>/dev/null || : > base_fail.txt
+          echo "--- head_fail ---"; cat head_fail.txt
+          echo "--- base_fail ---"; cat base_fail.txt
+          new_fail=$(sort head_fail.txt | comm -23 - <(sort -u base_fail.txt) | sed '/^$/d')
+          echo "--- new_fail ---"; echo "$new_fail"
+          if [ -z "$new_fail" ]; then echo "VERDICT: 可自动合并（无新失败）"; else echo "VERDICT: 转人工（新失败 = $new_fail）"; fi
