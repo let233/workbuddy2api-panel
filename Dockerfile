@@ -1,7 +1,7 @@
 # ---------- 前端构建（React + Vite） ----------
 # 前端产物不再打进 Go 二进制：Go 侧运行时把 public/ 目录映射成 /panel/ 静态资源
 # （internal/panel/index.go）。所以镜像里需要这一阶段，输出 public/ 供运行镜像复制。
-FROM node:22-alpine AS web
+FROM node:26-alpine AS web
 WORKDIR /src/web
 # 先只拷依赖清单：源码改动不会让 npm ci 这层缓存失效
 COPY web/package.json web/package-lock.json ./
@@ -13,7 +13,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---------- 后端构建 ----------
-FROM golang:1.26.10-alpine AS build
+FROM golang:1.27.0-alpine AS build
 # Go module 代理：默认官方源（境外/CI 不多绕一跳）；境内或镜像环境用
 # --build-arg 覆盖，容器内直连 proxy.golang.org 在境内会长时间卡住：
 #   docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
@@ -32,7 +32,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${APP_VE
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
 
-FROM alpine:3.20
+FROM alpine:3.24
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
 # /app 放宽到 0777：面板「关于 → 立即更新」要在容器里原地替换 /app/wb2api，
 # 换文件只需要目录写权限，而 compose 允许 PUID/PGID 覆盖成宿主机 uid（镜像默认
