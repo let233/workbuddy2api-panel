@@ -1,8 +1,9 @@
 name: dependabot-auto-merge
 
-# Dependabot PR 自动合并：
-#   - patch / minor 更新：等 docker-ghcr 等 CI 绿了自动 squash 合并
-#   - major 更新：打上「需人工确认」标签，交给人看
+# Dependabot PR 自动合并（带 CI 门禁）：
+#   1. 先等 binaries（go test + 前端构建）等检查全部跑完
+#   2. patch / minor 且 CI 全绿 → 自动 squash 合并并删分支
+#   3. major、CI 失败、或有冲突 → 打「需人工确认」标签，写评论说原因，不合并
 # 用 pull_request_target：Dependabot 触发的 PR 事件里 GITHUB_TOKEN 默认只读，
 # target 变体才拿得到写权限；这里不 checkout 任何代码，不执行 PR 里的脚本。
 on: pull_request_target
@@ -10,6 +11,8 @@ on: pull_request_target
 permissions:
   contents: write
   pull-requests: write
+  checks: read
+  statuses: read
 
 concurrency:
   group: dependabot-auto-merge-${{ github.event.pull_request.number }}
@@ -19,6 +22,7 @@ jobs:
   auto-merge:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: 读取依赖更新元数据
         id: meta
@@ -33,17 +37,57 @@ jobs:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
           ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
         run: |
+          set -uo pipefail
           gh pr edit "$PR_URL" --add-label "$UPDATE_TYPE" || true
           gh pr edit "$PR_URL" --add-label "deps:$ECOSYSTEM" || true
 
-      - name: 补丁与次版本更新开启自动合并
+      # 只有 patch / minor 才值得等 CI；major 直接交人工，不烧 runner 时间
+      - name: 等待 CI 检查全部完成
+        id: ci
         if: |
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
           steps.meta.outputs.update-type == 'version-update:semver-minor'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge --auto --squash --delete-branch "$PR_URL"
+        run: |
+          set -uo pipefail
+          echo "ci_ok=false" >> "$GITHUB_OUTPUT"
+
+          # 等 PR 上的检查挂上来（dependabot PR 与本次事件几乎同时创建，前几十秒是空的）
+          for i in $(seq 1 40); do
+            if gh pr checks "$PR_URL" >/dev/null 2>&1 || [ "$(gh pr checks "$PR_URL" 2>/dev/null | wc -l)" -gt 0 ]; then
+              break
+            fi
+            sleep 15
+          done
+
+          # --watch 会阻塞到全部检查结束；失败或超时都由退出码体现
+          if gh pr checks "$PR_URL" --watch --fail-fast --interval 20; then
+            echo "ci_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "CI 未通过，转人工确认。"
+            gh pr edit "$PR_URL" --add-label "需人工确认" || true
+            gh pr comment "$PR_URL" --body "CI 检查未全部通过，未开启自动合并，请人工看（\`binaries\` 里是 go test 与前端构建）。" || true
+          fi
+
+      - name: 自动合并（CI 全绿）
+        if: steps.ci.outputs.ci_ok == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          state=$(gh pr view "$PR_URL" --json state,mergeable --jq '.state + " " + .mergeable')
+          case "$state" in
+            "OPEN MERGEABLE") ;;
+            *)
+              echo "PR 状态为 ${state}，跳过合并"
+              gh pr edit "$PR_URL" --add-label "需人工确认" || true
+              exit 0
+              ;;
+          esac
+          gh pr merge --squash --delete-branch "$PR_URL"
 
       - name: 主版本更新交人工确认
         if: steps.meta.outputs.update-type == 'version-update:semver-major'
@@ -51,5 +95,6 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -uo pipefail
           gh pr edit "$PR_URL" --add-label "需人工确认" || true
-          gh pr comment "$PR_URL" --body "主版本更新未开自动合并：改完代码手动合，或确认兼容后点 Squash and merge。"
+          gh pr comment "$PR_URL" --body "主版本更新：未开自动合并。确认兼容后手动 Squash and merge，或改完代码再合。"
