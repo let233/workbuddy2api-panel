@@ -1,11 +1,12 @@
 name: gate-selftest
 
-on: workflow_dispatch:
-  inputs:
-    pr:
-      description: "PR 号"
-      required: true
-      default: "6"
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR 号"
+        required: true
+        default: "6"
 
 permissions:
   contents: read
