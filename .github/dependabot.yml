@@ -1,0 +1,112 @@
+version: 2
+
+# Dependabot 版本更新（自动维护依赖）
+# 生态覆盖：Go 模块 / 前端 npm / Dockerfile 基础镜像 / GitHub Actions
+# 策略：全部每周一 09:00（Asia/Shanghai）巡检一次，一条 PR 一组依赖，减少噪音。
+# 合并策略由 .github/workflows/dependabot-auto-merge.yml 控制：
+#   patch / minor 自动 squash 合并；major 打「需人工确认」标签等人看。
+updates:
+  # ---------- Go 模块（go.mod / go.sum） ----------
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    target-branch: main
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      # gorm / redis / sqlite 这类常一起动的次要升级打包成一条 PR
+      go-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Go 标准库跟随 go.mod 的 go 指令，跨大版本由人工决定
+      - dependency-name: golang.org/x/*
+        update-types:
+          - version-update:semver-major
+
+  # ---------- 前端 npm（web/package.json + package-lock.json） ----------
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    target-branch: main
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - javascript
+    commit-message:
+      prefix: deps
+      include: scope
+    versioning-strategy: increase
+    groups:
+      web-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # react 19 / vite 6 这类大版本要配合代码改造，走人工
+      - dependency-name: react
+        update-types:
+          - version-update:semver-major
+      - dependency-name: react-dom
+        update-types:
+          - version-update:semver-major
+
+  # ---------- Docker（Dockerfile 的 node / golang / alpine 基础镜像） ----------
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    target-branch: main
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      base-images:
+        patterns:
+          - "*"
+
+  # ---------- GitHub Actions 版本 ----------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    target-branch: main
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions-all:
+        patterns:
+          - "*"

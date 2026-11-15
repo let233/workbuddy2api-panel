@@ -1,0 +1,55 @@
+name: dependabot-auto-merge
+
+# Dependabot PR 自动合并：
+#   - patch / minor 更新：等 docker-ghcr 等 CI 绿了自动 squash 合并
+#   - major 更新：打上「需人工确认」标签，交给人看
+# 用 pull_request_target：Dependabot 触发的 PR 事件里 GITHUB_TOKEN 默认只读，
+# target 变体才拿得到写权限；这里不 checkout 任何代码，不执行 PR 里的脚本。
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 读取依赖更新元数据
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 打标签（更新类型 / 生态）
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+        run: |
+          gh pr edit "$PR_URL" --add-label "$UPDATE_TYPE" || true
+          gh pr edit "$PR_URL" --add-label "deps:$ECOSYSTEM" || true
+
+      - name: 补丁与次版本更新开启自动合并
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash --delete-branch "$PR_URL"
+
+      - name: 主版本更新交人工确认
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit "$PR_URL" --add-label "需人工确认" || true
+          gh pr comment "$PR_URL" --body "主版本更新未开自动合并：改完代码手动合，或确认兼容后点 Squash and merge。"
