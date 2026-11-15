@@ -6,12 +6,13 @@ on:
       pr:
         description: "PR 号"
         required: true
-        default: "6"
+        default: "9"
 
 permissions:
   contents: read
   pull-requests: read
   checks: read
+  actions: read
 
 jobs:
   t:
@@ -27,18 +28,19 @@ jobs:
           set -uo pipefail
           PR_URL="https://github.com/$REPO/pull/$PR"
           gh pr checks "$PR_URL" --json name,state,bucket > checks.json
-          echo "--- checks ---"; jq -c '.[] | {name,bucket}' checks.json
-          pending=$(jq '[.[] | select(.bucket == "pending")] | length' checks.json)
-          head=$(jq '[.[] | select(.bucket == "fail")] | length' checks.json)
-          echo "pending=$pending head_fail=$head"
           jq -r '[.[] | select(.bucket == "fail") | .name] | sort | .[]' checks.json > head_fail.txt || true
           base_sha=$(gh pr view "$PR_URL" --json baseRefOid --jq .baseRefOid)
-          echo "base_sha=$base_sha"
           gh api "repos/$REPO/commits/$base_sha/check-runs?per_page=100" \
             --jq '[.check_runs[] | select(.conclusion == "failure") | .name] | sort | .[]' \
             > base_fail.txt 2>/dev/null || : > base_fail.txt
-          echo "--- head_fail ---"; cat head_fail.txt
-          echo "--- base_fail ---"; cat base_fail.txt
+          latest_run=$(gh run list --repo "$REPO" --workflow binaries --branch main --event push \
+            --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "${latest_run:-}" ]; then
+            gh run view "$latest_run" --repo "$REPO" --json jobs \
+              --jq '.jobs[] | select(.conclusion == "failure") | .name' >> base_fail.txt 2>/dev/null || true
+          fi
+          echo "=== head_fail ==="; cat head_fail.txt
+          echo "=== base_fail ==="; cat base_fail.txt
           new_fail=$(sort head_fail.txt | comm -23 - <(sort -u base_fail.txt) | sed '/^$/d')
-          echo "--- new_fail ---"; echo "$new_fail"
-          if [ -z "$new_fail" ]; then echo "VERDICT: 可自动合并（无新失败）"; else echo "VERDICT: 转人工（新失败 = $new_fail）"; fi
+          echo "=== new_fail ==="; echo "$new_fail"
+          if [ -z "$new_fail" ]; then echo "VERDICT: OK-可自动合并"; else echo "VERDICT: MANUAL-$new_fail"; fi
