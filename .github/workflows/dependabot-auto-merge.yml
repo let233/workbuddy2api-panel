@@ -41,7 +41,11 @@ jobs:
           ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
         run: |
           set -uo pipefail
-          gh pr edit "$PR_URL" --add-label "$UPDATE_TYPE" || true
+          # 多依赖混合更新的 PR 里 fetch-metadata 给不出 update-type（值为 null），此时不打版本标签
+          case "$UPDATE_TYPE" in
+            ""|null) echo "update-type 无法判定，跳过版本标签" ;;
+            *) gh pr edit "$PR_URL" --add-label "$UPDATE_TYPE" || true ;;
+          esac
           gh pr edit "$PR_URL" --add-label "deps:$ECOSYSTEM" || true
 
       - name: 主版本更新直接转人工
@@ -53,6 +57,20 @@ jobs:
           set -uo pipefail
           gh pr edit "$PR_URL" --add-label "需人工确认" || true
           gh pr comment "$PR_URL" --body "主版本更新：未开自动合并。确认兼容后手动 Squash and merge，或改完代码再合。"
+
+      - name: 更新类型无法判定转人工
+        if: |
+          steps.meta.outputs.update-type != 'version-update:semver-patch' &&
+          steps.meta.outputs.update-type != 'version-update:semver-minor' &&
+          steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_URL" --add-label "需人工确认" || true
+          gh pr comment "$PR_URL" --body "更新类型无法判定（$UPDATE_TYPE，通常是一次含多个依赖或跨大版本），未自动合并，请人工确认。" || true
 
       - name: 等检查跑完并判定是否有新失败
         id: gate
