@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   auto-merge:
-    if: github.actor == 'dependabot[bot]'
+    # 用 PR 作者判定而不是 actor：仓库维护者 reopen/推送后再评估时，actor 不是 dependabot
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
