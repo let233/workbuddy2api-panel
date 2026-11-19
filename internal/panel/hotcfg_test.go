@@ -59,7 +59,7 @@ func TestLogStoreConfigureHot(t *testing.T) {
 	s := NewLogStore(db, 7, 0)
 	defer s.Close()
 
-	s.Append(LogEntry{TS: dayTS("2026-11-08", 10), Ch: ChSys, Text: "before-off"})
+	s.Append(LogEntry{TS: dayTS(dayAgo(0), 10), Ch: ChSys, Text: "before-off"})
 	s.Flush()
 	if rows := logRows(t, db); len(rows) != 1 {
 		t.Fatalf("种子行数 = %d want 1", len(rows))
@@ -69,7 +69,7 @@ func TestLogStoreConfigureHot(t *testing.T) {
 	if !s.Disabled() {
 		t.Fatal("Configure(enabled=false) 后应处于关闭态")
 	}
-	s.Append(LogEntry{TS: dayTS("2026-11-08", 11), Ch: ChSys, Text: "while-off"})
+	s.Append(LogEntry{TS: dayTS(dayAgo(0), 11), Ch: ChSys, Text: "while-off"})
 	s.Flush()
 	if rows := logRows(t, db); len(rows) != 1 {
 		t.Fatalf("关闭期间不应落库, 行数 = %d want 1", len(rows))
@@ -79,7 +79,7 @@ func TestLogStoreConfigureHot(t *testing.T) {
 	if s.Disabled() {
 		t.Fatal("重新开启后不应仍处于关闭态")
 	}
-	s.Append(LogEntry{TS: dayTS("2026-11-08", 12), Ch: ChSys, Text: "after-on"})
+	s.Append(LogEntry{TS: dayTS(dayAgo(0), 12), Ch: ChSys, Text: "after-on"})
 	s.Flush()
 	if rows := logRows(t, db); len(rows) != 2 {
 		t.Fatalf("重新开启后应继续落库, 行数 = %d want 2", len(rows))

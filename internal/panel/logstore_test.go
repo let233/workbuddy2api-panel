@@ -18,6 +18,16 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/store/storetest"
 )
 
+// dayAgo 返回「今天往前 n 天」的 CST 自然日（2006-01-02）。
+//
+// 为什么不用绝对日期（对齐上游 20261116 的修法）：NewLogStore / Configure 会按保留期
+// 清理掉更早的行，写死的 2026-11-08/-09 一旦越过 7 天保留期，这些用例就会永久失败
+// （实测 11-16 起 TestLogStoreBackfillNewestFirst 必挂，连带整个 binaries 工作流红）。
+// 凡是与「保留期 / 清理 / 回填」相关的断言，日期都必须相对当下。
+func dayAgo(n int) string {
+	return cst.Now().AddDate(0, 0, -n).Format(logStoreDayLayout)
+}
+
 // dayTS 指定自然日的某个时刻（CST）。
 func dayTS(day string, hour int) time.Time {
 	t, err := time.ParseInLocation("2006-01-02 15", day+" "+string(rune('0'+hour/10))+string(rune('0'+hour%10)), cst.Loc)
@@ -45,15 +55,15 @@ func TestLogStorePersistsPerDayRows(t *testing.T) {
 		t.Fatal("NewLogStore 返回 nil")
 	}
 	defer s.Close()
-	s.Append(LogEntry{TS: dayTS("2026-11-08", 23), Ch: ChChat, Text: "row-a"})
-	s.Append(LogEntry{TS: dayTS("2026-11-09", 1), Ch: ChSys, Text: "row-b"})
+	s.Append(LogEntry{TS: dayTS(dayAgo(2), 23), Ch: ChChat, Text: "row-a"})
+	s.Append(LogEntry{TS: dayTS(dayAgo(1), 1), Ch: ChSys, Text: "row-b"})
 	s.Flush()
 
 	rows := logRows(t, db)
 	if len(rows) != 2 {
 		t.Fatalf("落库行数 = %d want 2（%+v）", len(rows), rows)
 	}
-	want := map[string]string{"row-a": "2026-11-08", "row-b": "2026-11-09"}
+	want := map[string]string{"row-a": dayAgo(2), "row-b": dayAgo(1)}
 	for _, row := range rows {
 		if day, ok := want[row.Text]; !ok || row.Day != day {
 			t.Fatalf("行 %q 的 day = %q want %q（按自然日分列是保留期与导出的口径）", row.Text, row.Day, want[row.Text])
@@ -71,8 +81,8 @@ func TestLogStoreByteCapDropsOldestDays(t *testing.T) {
 	db := storetest.Open(t)
 	big := strings.Repeat("x", 200)
 	if err := store.Insert(db,
-		panelLogRow{TS: dayTS("2026-11-07", 12), Day: "2026-11-07", Ch: string(ChSys), Text: big},
-		panelLogRow{TS: dayTS("2026-11-09", 12), Day: "2026-11-09", Ch: string(ChSys), Text: big},
+		panelLogRow{TS: dayTS(dayAgo(2), 12), Day: dayAgo(2), Ch: string(ChSys), Text: big},
+		panelLogRow{TS: dayTS(dayAgo(1), 12), Day: dayAgo(1), Ch: string(ChSys), Text: big},
 	); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -81,8 +91,8 @@ func TestLogStoreByteCapDropsOldestDays(t *testing.T) {
 	s.cleanup()
 
 	rows := logRows(t, db)
-	if len(rows) != 1 || rows[0].Day != "2026-11-09" {
-		t.Fatalf("超量清理后 = %+v want 只留 2026-11-09（丢日志=丢事故现场，但更旧的可回收）", rows)
+	if len(rows) != 1 || rows[0].Day != dayAgo(1) {
+		t.Fatalf("超量清理后 = %+v want 只留 %s（丢日志=丢事故现场，但更旧的可回收）", rows, dayAgo(1))
 	}
 }
 
@@ -91,10 +101,10 @@ func TestLogStoreBackfillNewestFirst(t *testing.T) {
 	db := storetest.Open(t)
 	s := NewLogStore(db, 7, 0)
 	for i := 0; i < 5; i++ {
-		s.Append(LogEntry{TS: dayTS("2026-11-08", 10).Add(time.Duration(i) * time.Minute), Ch: ChSys, Text: "old-" + string(rune('0'+i))})
+		s.Append(LogEntry{TS: dayTS(dayAgo(2), 10).Add(time.Duration(i) * time.Minute), Ch: ChSys, Text: "old-" + string(rune('0'+i))})
 	}
 	for i := 0; i < 3; i++ {
-		s.Append(LogEntry{TS: dayTS("2026-11-09", 10).Add(time.Duration(i) * time.Minute), Ch: ChSys, Text: "new-" + string(rune('0'+i))})
+		s.Append(LogEntry{TS: dayTS(dayAgo(1), 10).Add(time.Duration(i) * time.Minute), Ch: ChSys, Text: "new-" + string(rune('0'+i))})
 	}
 	s.Close()
 
@@ -120,11 +130,11 @@ func TestLogStoreExportFiltersByRange(t *testing.T) {
 	db := storetest.Open(t)
 	s := NewLogStore(db, 7, 0)
 	defer s.Close()
-	base := dayTS("2026-11-09", 8)
+	base := dayTS(dayAgo(1), 8)
 	for i := 0; i < 6; i++ {
 		s.Append(LogEntry{TS: base.Add(time.Duration(i) * time.Hour), Ch: ChSys, Text: "line-" + string(rune('0'+i))})
 	}
-	s.Append(LogEntry{TS: dayTS("2026-11-07", 8), Ch: ChSys, Text: "too-old"})
+	s.Append(LogEntry{TS: dayTS(dayAgo(4), 8), Ch: ChSys, Text: "too-old"})
 
 	tmp, err := os.CreateTemp(t.TempDir(), "export-*.zip")
 	if err != nil {
@@ -136,7 +146,7 @@ func TestLogStoreExportFiltersByRange(t *testing.T) {
 		t.Fatalf("Export: %v", err)
 	}
 	if files != 1 {
-		t.Fatalf("导出文件数 = %d want 1（只该含 11-09 那天的一包）", files)
+		t.Fatalf("导出文件数 = %d want 1（只该含 %s 那天的一包）", files, dayAgo(1))
 	}
 	entries, err := zip.OpenReader(tmp.Name())
 	if err != nil {
@@ -145,8 +155,8 @@ func TestLogStoreExportFiltersByRange(t *testing.T) {
 	defer entries.Close()
 	var lines []string
 	for _, f := range entries.File {
-		if f.Name != "panel-2026-11-09.jsonl" {
-			t.Fatalf("zip 条目名 = %q want panel-2026-11-09.jsonl", f.Name)
+		if want := "panel-" + dayAgo(1) + ".jsonl"; f.Name != want {
+			t.Fatalf("zip 条目名 = %q want %s", f.Name, want)
 		}
 		rc, err := f.Open()
 		if err != nil {
@@ -202,11 +212,12 @@ func TestLogStoreLegacyDirImported(t *testing.T) {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"ts":"2026-11-09T10:00:00+08:00","ch":"sys","seq":1,"text":"legacy-1"}
-{"ts":"2026-11-09T10:01:00+08:00","ch":"sys","seq":2,"text":"legacy-2"}
+	day := dayAgo(1)
+	body := `{"ts":"` + day + `T10:00:00+08:00","ch":"sys","seq":1,"text":"legacy-1"}
+{"ts":"` + day + `T10:01:00+08:00","ch":"sys","seq":2,"text":"legacy-2"}
 {"broken line
 `
-	if err := os.WriteFile(filepath.Join(logDir, "panel-2026-11-09.jsonl"), []byte(body), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(logDir, "panel-"+day+".jsonl"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	db := storetest.OpenDir(t, dir)
