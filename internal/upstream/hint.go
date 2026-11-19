@@ -140,6 +140,12 @@ func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
+	// 11140 账号风控限制文书要 code + 文案同时成立，而 code 在帧的 error.code 上、不在
+	// message 里：只拿 message 去 Classify 会把它判成普通 4xx，首帧否决后照样换号，
+	// 于是同一请求顺着轮转把整池账号挨个送进风控（见 restrict.go）。
+	if IsRestricted(payload) {
+		return ErrAccountFault
+	}
 	var f struct {
 		Error struct {
 			Message string `json:"message"`

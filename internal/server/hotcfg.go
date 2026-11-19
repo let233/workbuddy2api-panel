@@ -21,7 +21,7 @@ type hotConfig struct {
 	maxPayloadBytes atomic.Int64
 	// headKeepalive 等上游首帧期间的 SSE 注释帧间隔。0 = 关闭。
 	headKeepalive atomic.Int64
-	// restrictionHold 11140 风控连坐的全池暂停时长。0 = 只保留「命中即停手」。
+	// restrictionHold 11140 风控连坐暂停的时长上限（退避不超过它）。0 = 只保留「命中即停手」。
 	restrictionHold atomic.Int64
 	// softCooldown 软冷却基数。0 = 未热改 → getter 回退 live 快照/静态字段/缺省。
 	softCooldown atomic.Int64
@@ -87,7 +87,7 @@ func (h *Handler) headKeepalive() time.Duration {
 	return time.Duration(h.hot.headKeepalive.Load())
 }
 
-// restrictionHold 11140 连坐全池暂停时长（0 = 只保留命中即停手）。
+// restrictionHold 11140 连坐暂停时长上限（0 = 只保留命中即停手）。
 func (h *Handler) restrictionHold() time.Duration {
 	return time.Duration(h.hot.restrictionHold.Load())
 }
@@ -182,7 +182,7 @@ func (h *Handler) SetHeadKeepalive(d time.Duration) {
 	h.hot.headKeepalive.Store(int64(d))
 }
 
-// SetRestrictionHold 热改 11140 连坐的全池暂停时长。0 = 只保留「命中即停手」。
+// SetRestrictionHold 热改 11140 连坐暂停的时长上限。0 = 只保留「命中即停手」。
 func (h *Handler) SetRestrictionHold(d time.Duration) {
 	if h == nil {
 		return
