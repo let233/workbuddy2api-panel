@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -159,6 +160,11 @@ type Manager struct {
 
 	stop chan struct{}
 	done chan struct{}
+
+	// loadErr 最近一次从库加载的错误。非 nil 表示 keys/templates **不是**库里的
+	// 真实内容（读库失败时内存是空的）。这个标志是「更新后 Key 全 401」的护栏：
+	// 空清单必须能被识别成「没读到」，而不是「确实没有 Key」。
+	loadErr error
 }
 
 // NewManager 从库加载全量 Key 与模板；db 为 nil 时纯内存（测试用）。
@@ -177,6 +183,31 @@ func NewManager(db *store.Store) *Manager {
 		go m.loop()
 	}
 	return m
+}
+
+// LoadError 报告最近一次从库加载的结果。非 nil 表示内存清单**不是**库的真实
+// 内容——调用方（启动流程）据此决定是否继续，绝不能把「读到空」当成「没有 Key」：
+// 那样网关会对所有客户端 Key 返回 401，而 EnsureSystemKey 还会再播种一把新的。
+func (m *Manager) LoadError() error {
+	if m == nil {
+		return ErrInvalid
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.loadErr
+}
+
+// Reload 重新从库加载全量清单（失败时保留上一次的内存内容并记录 LoadError）。
+func (m *Manager) Reload() error {
+	if m == nil {
+		return ErrInvalid
+	}
+	if m.db == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.load()
 }
 
 // Close 停止回写协程并把未落库的计数刷进库。
@@ -273,7 +304,18 @@ func (m *Manager) EnsureSystemKey() (Key, bool, error) {
 	if m == nil {
 		return Key{}, false, ErrInvalid
 	}
-	if len(m.List()) > 0 {
+	// 「有没有 Key」以库为准：内存清单可能只是因为读库失败才是空的。按内存判断
+	// 会在这种时刻再播种一把新 Key——旧 Key 全部 401 的同时还多出一把没人知道的
+	// Key，重启后又「自己好了」。库里一行都没有，才是真正的新装实例。
+	if m.db != nil {
+		n, cerr := store.Count[keyRow](m.db)
+		if cerr != nil {
+			return Key{}, false, fmt.Errorf("读取客户端 Key 数量: %w", cerr)
+		}
+		if n > 0 {
+			return Key{}, false, nil
+		}
+	} else if len(m.List()) > 0 {
 		return Key{}, false, nil
 	}
 	k, err := m.Create(Key{Name: SystemKeyName, Note: SystemKeyNote, PromptMode: ModeInherit})
@@ -643,34 +685,50 @@ func (m *Manager) secretTakenLocked(secret, exceptID string) bool {
 	return false
 }
 
-func (m *Manager) load() {
+// load 从库重建内存清单。调用方持有写锁（NewManager 时单线程调用，不必加锁）。
+//
+// 读库失败**必须**返回错误并留下 loadErr：历史实现只 log 一句就继续，内存里是空
+// 清单，于是网关把所有客户端 Key 全判 401，而 EnsureSystemKey 又顺手播种一把新
+// Key——现象就是「更新完 Key 全部不可用，重启才恢复」。
+func (m *Manager) load() error {
 	if m.db == nil {
-		return
+		return nil
 	}
 	rows, err := store.LoadAll[keyRow](m.db)
 	if err != nil {
 		log.Printf("gatewaykeys: 读取失败: %v", err)
+		m.loadErr = fmt.Errorf("读取客户端 Key: %w", err)
+		return m.loadErr
 	}
+	trows, terr := store.LoadAll[templateRow](m.db)
+	if terr != nil {
+		log.Printf("gatewaykeys: 读取模板失败: %v", terr)
+		m.loadErr = fmt.Errorf("读取 Key 模板: %w", terr)
+		return m.loadErr
+	}
+	// 先建新表再整体替换：半截数据比空清单更难查。
+	keys := make(map[string]*Key, len(rows))
 	for _, row := range rows {
 		var k Key
 		if err := json.Unmarshal([]byte(row.Payload), &k); err != nil || k.ID == "" {
 			continue
 		}
 		kk := k
-		m.keys[k.ID] = &kk
+		keys[k.ID] = &kk
 	}
-	trows, err := store.LoadAll[templateRow](m.db)
-	if err != nil {
-		log.Printf("gatewaykeys: 读取模板失败: %v", err)
-	}
+	templates := make(map[string]*Template, len(trows))
 	for _, row := range trows {
 		var t Template
 		if err := json.Unmarshal([]byte(row.Payload), &t); err != nil || t.ID == "" {
 			continue
 		}
 		tt := t
-		m.templates[t.ID] = &tt
+		templates[t.ID] = &tt
 	}
+	m.keys = keys
+	m.templates = templates
+	m.loadErr = nil
+	return nil
 }
 
 func (m *Manager) persist(k Key) error {

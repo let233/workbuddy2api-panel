@@ -356,6 +356,29 @@ func localDBPath(dsn string) (string, bool) {
 	return p, true
 }
 
+// AbsPath 返回 SQLite 库文件的绝对路径（相对路径按当前工作目录解析，与 Open 的
+// 语义一致）。非 SQLite 驱动或内存库返回 ok=false。
+//
+// 存在的意义只有一个：把「进程到底在读写哪个文件」写进启动日志。默认 DSN 是相对
+// 路径 wb2api.db，换个工作目录启动（桌面快捷方式、服务管理器、计划任务、更新后由
+// helper 拉起的进程）就会静默开出**另一个空库**——面板里 Key / 账号 / 用量全空，
+// 用户看到的现象是「数据丢了」或「Key 全部不可用」，而服务本身毫无报错。日志里钉死
+// 绝对路径，这种事一眼可辨。
+func AbsPath(driver, dsn string) (string, bool) {
+	if normalizeDriver(driver) != DriverSQLite {
+		return "", false
+	}
+	p, ok := localDBPath(dsn)
+	if !ok {
+		return "", false
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p, true
+	}
+	return abs, true
+}
+
 // LogSummary 启动时打一条连接摘要（口令已隐去）。
 func (s *Store) LogSummary() {
 	if s == nil {

@@ -506,6 +506,13 @@ Start-ScheduledTask -TaskName 'wb2api-panel'
 - **二进制部署**：旧进程退出 → updater helper 子进程换二进制 → 拉起新进程（新版本起不来就自动回滚）。
 - **容器**：主进程一退出容器就停了，helper 会被一起杀掉，所以改成在**当前进程里**替换 `/app/wb2api`，再 `exec` 自身，把同一个 PID 交给新版本。容器不重建、端口不断，正在处理的请求照常结束。
 
+更新包里的**非二进制部分**也会一起落地（过去只换二进制，于是面板报「已是最新版本」而浏览器里跑的还是旧前端）：
+
+- `public/` 前端产物走「整个目录 rename 交换」：旧目录先改名成 `public.wb2api-old`，新目录放到原位，不会新旧 chunk 混装；新版本活过观察窗口（8 秒）才删备份，起不来就连同二进制一起回滚（容器内只换不滚，见下面第 1 条）。
+- 落地位置是 `panel.public_dir`（默认 `public`，相对**进程工作目录**解析），与面板静态目录是同一份配置——改了它，下一次更新就写到新位置。
+- 随包的 `config.example.json` / `README.md` 同步替换（`config.json` 是你的配置，不动）。
+- 包里没有 `public/index.html` 时只更新程序文件，日志会留一条 `WARN: [updater] 更新包内未找到 public/index.html`，提醒「页面还是旧的」。
+
 三条边界：
 
 1. 旧二进制留在 `/app/wb2api.old`，新版本活过 8 秒观察窗口后自动清掉；容器里没有自动回滚，新版本真起不来就 `mv /app/wb2api.old /app/wb2api` 后重启容器；

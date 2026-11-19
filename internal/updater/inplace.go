@@ -102,11 +102,33 @@ func (m *Manager) refreshInstallStatusLocked() {
 //
 // 调用方已把 status.Installing 置为 true、stage 文件已就绪（0755）；真正重启发生在
 // RestartAfter → execSelf（handler 先回 202，再延迟 800ms）。
-func (m *Manager) installInPlace(stagePath string, version parsedVersion) error {
+func (m *Manager) installInPlace(stagePath, payloadDir string, version parsedVersion) error {
+	// 前端产物暂存目录由本函数负责收尾（无论成败），调用方不再管它。
+	defer func() {
+		if payloadDir != "" {
+			_ = os.RemoveAll(payloadDir)
+		}
+	}()
 	// 替换成功后不回滚：当前进程仍持有旧 inode，正在处理的请求不受影响；真有
 	// 问题也能从 .old 手工换回来。
 	if _, _, err := replaceBinaryWithRollback(stagePath, m.executable); err != nil {
 		return fmt.Errorf("替换程序文件: %w", err)
+	}
+	// 前端产物同样要换（旧版只换二进制，public/ 一直停在第一次解压那一版）。
+	// 容器内没有健康观察窗口可等——exec 前当前进程仍在服务，所以这里失败只告警
+	// 不阻断：二进制已经换好，回滚它带来的风险比「新后端配旧前端」更大。
+	if cwd, werr := os.Getwd(); werr != nil {
+		log.Printf("WARN: [updater] 取工作目录失败，跳过前端产物更新: %v", werr)
+	} else if publicDir := m.publicDirPath(cwd); payloadDir != "" {
+		commitPayload, _, installed, perr := installPayload(payloadDir, cwd, publicDir)
+		if perr != nil {
+			log.Printf("WARN: [updater] 容器内更新前端产物失败（程序文件已更新）: %v", perr)
+		} else {
+			commitPayload()
+			if installed {
+				log.Printf("[updater] 前端产物已就位: %s", publicDir)
+			}
+		}
 	}
 	if err := writeReplacedMarker(filepath.Dir(m.executable), version.text); err != nil {
 		// 标记写不上不影响本次更新，只是下次启动不会自动清 .old。

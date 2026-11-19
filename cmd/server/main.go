@@ -144,6 +144,16 @@ func main() {
 	}
 	defer db.Close()
 	db.LogSummary()
+	// 相对 DSN 按工作目录解析：换目录启动（快捷方式 / 服务管理器 / 更新后由 helper
+	// 拉起）会静默开出另一个空库，表现为「Key 全失效、数据全没了」。把绝对路径钉在
+	// 日志里，一眼就能看出读的是不是同一个文件。
+	if abs, ok := store.AbsPath(dbCfg.Driver, dbCfg.DSN); ok {
+		if cwd, cerr := os.Getwd(); cerr == nil {
+			log.Printf("[store] SQLite 库文件: %s（工作目录 %s）", abs, cwd)
+		} else {
+			log.Printf("[store] SQLite 库文件: %s", abs)
+		}
+	}
 	// 旧版 JSON 数据一次性导入库（幂等：成功后写 app_kv 标记并把旧文件改名
 	// *.imported）。必须早于各记录器装配，否则记录器先从空表起算再被导入覆盖。
 	store.ImportLegacy(db, dataDir)
@@ -462,6 +472,9 @@ func main() {
 	log.Printf("[credithist] 积分历史已启用: %s（%d 条封顶）", db.Describe(), 2000)
 
 	updateManager := updater.New(appVersion, appRepository, *cfgPath, updateSettingsFrom(cfg))
+	// 更新包里 public/ 的落点：与面板静态目录同一个配置，否则更新完「二进制新了、
+	// 前端还是旧的」。
+	updateManager.SetPublicDir(cfg.Panel.PublicDir)
 	// 热应用入口：启动末尾与面板每次保存都走同一份映射（见 apply.go）。
 	// gw/pn/mon/logs/serve 稍后装配时再补进来；这里先给出此刻已就绪的组件。
 	ap := &hotApplier{
@@ -472,6 +485,14 @@ func main() {
 	// 与分组模板落库，重启后原样恢复；网关照它鉴权并按 Key 计费。
 	gatewayKeys := gatewaykeys.NewManager(db)
 	defer gatewayKeys.Close()
+	// 读库失败时内存清单是空的，而网关会把所有客户端 Key 判 401、EnsureSystemKey 还会
+	// 再播种一把新的——现场表现就是「更新后 Key 全不可用，重启才恢复」（库被旧进程
+	// 短暂占用时正好落在这个窗口里）。这里给一小段重试，仍失败就退出，让部署方看到
+	// 明确错误，好过让所有客户端拿到 401。
+	if kerr := waitGatewayKeysLoaded(gatewayKeys); kerr != nil {
+		log.Fatalf("[gateway] 客户端 Key 读取失败，不以空清单启动（空清单会让所有客户端 Key 都 401）: %v", kerr)
+	}
+	log.Printf("[gateway] 已加载 %d 把客户端 Key（%s）", len(gatewayKeys.List()), db.Describe())
 	// 首次部署播种一把最高级别 Key（不限积分/模型、提示词跟随全局）：否则新装实例
 	// 一把客户端 Key 都没有，网关对全部请求 401，用户会以为服务坏了。
 	if k, created, kerr := gatewayKeys.EnsureSystemKey(); kerr != nil {
@@ -518,6 +539,8 @@ func main() {
 			}
 			// 更新镜像设置（更新源/自动更新）与保存同批：保存后不必再读文件。
 			updateManager.Configure(updateSettingsFrom(settings.Current()))
+			// 目录配置也可能在这一批里改过，跟着刷新，别让下一次更新写回旧位置。
+			updateManager.SetPublicDir(settings.Current().Panel.PublicDir)
 			return fields, nil
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
@@ -737,6 +760,35 @@ func main() {
 //
 // 失败处理：单域失败只记 WARN（不阻塞、不致命——后续懒触发仍会补上）；global 域
 // 仅在其路由开关开启时预热（逃生门关锁时按 CN 处理，无需探测）。
+// waitGatewayKeysLoaded 启动时确认客户端 Key 清单真的从库里读到了。
+//
+// gatewaykeys.NewManager 读库失败时内存是空清单（历史上只 log 一句），网关随后把
+// 所有客户端 Key 判 401，EnsureSystemKey 还会再播种一把新的——现场就是「更新完 Key
+// 全部不可用，重启才恢复」（旧进程尚未完全退出、库被短暂占用时正好撞进这个窗口）。
+// 给它一小段重试窗口比直接起跑强：要么等到库，要么带着明确错误退出。
+func waitGatewayKeysLoaded(keys *gatewaykeys.Manager) error {
+	const (
+		budget = 10 * time.Second
+		step   = 500 * time.Millisecond
+	)
+	if keys == nil {
+		return nil
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		err := keys.LoadError()
+		if err == nil {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return err
+		}
+		log.Printf("WARN: [gateway] 客户端 Key 未能从库加载，%s 后重试: %v", step, err)
+		time.Sleep(step)
+		_ = keys.Reload()
+	}
+}
+
 func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	// 预热不得拖住进程退出：ctx 取消（SIGINT/SIGTERM）时立刻放弃剩余域。
 	if ctx.Err() != nil {

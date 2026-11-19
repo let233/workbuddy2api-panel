@@ -181,6 +181,10 @@ type Manager struct {
 	repository string
 	executable string
 	configPath string
+	// publicDir 前端产物目录（panel.public_dir，缺省 "public"，由 SetPublicDir 注入）。
+	// 更新包里的 public/ 要落到这里：过去只换二进制，面板报「已是最新版本」而浏览器
+	// 里跑的还是旧前端。相对路径按进程工作目录解析（与 internal/panel 的 staticDir 一致）。
+	publicDir  string
 	apiBaseURL string
 	client     *http.Client
 	now        func() time.Time
@@ -482,6 +486,36 @@ func (m *Manager) fetchReleases(ctx context.Context) ([]release, error) {
 	return all, nil
 }
 
+// SetPublicDir 设置前端产物目录（panel.public_dir）。配置保存后要重新调用：目录
+// 改了而 updater 还记着旧值，下一次更新就会把 public/ 写到没人读的地方。
+func (m *Manager) SetPublicDir(dir string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.publicDir = strings.TrimSpace(dir)
+	m.mu.Unlock()
+}
+
+// publicDirPath 把配置里的前端产物目录解析成绝对路径：空值取 "public"，相对路径
+// 按给定的工作目录解析（调用方传的就是进程 cwd，与 internal/panel 的 staticDir
+// 同一套语义）。
+func (m *Manager) publicDirPath(cwd string) string {
+	dir := ""
+	if m != nil {
+		m.mu.RLock()
+		dir = m.publicDir
+		m.mu.RUnlock()
+	}
+	if dir == "" {
+		dir = publicDirName
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(cwd, dir)
+	}
+	return filepath.Clean(dir)
+}
+
 // Install downloads and stages the matching release asset. The caller should
 // send its response before calling RestartAfter.
 func (m *Manager) Install(ctx context.Context) (err error) {
@@ -572,34 +606,60 @@ func (m *Manager) Install(ctx context.Context) (err error) {
 		}
 	}
 
+	// 前端产物也随包更新。老流程只解二进制，public/ 因此永远停在第一次手工解压
+	// 那一版：面板报「已是最新版本」，页面上的新功能一个都不出现。这里把 public/
+	// 与随包文档解到程序目录旁的 .wb2api-payload-*，由 helper 在旧进程退出后整体
+	// 换过去（容器内则由 installInPlace 当场换）。
+	payloadDir, err := os.MkdirTemp(dir, payloadDirPrefix+"*")
+	if err != nil {
+		os.Remove(stagePath)
+		return fmt.Errorf("创建更新暂存目录: %w", err)
+	}
+	hasPublic, err := extractPayload(archivePath, payloadDir)
+	if err != nil {
+		os.RemoveAll(payloadDir)
+		os.Remove(stagePath)
+		return err
+	}
+	if !hasPublic {
+		// 老包 / 第三方重打包：没有前端产物不是错误，二进制照样更新，但要说清楚
+		// 「页面还是旧的」，否则用户又要在浏览器缓存上白找一轮。
+		log.Printf("WARN: [updater] 更新包内未找到 %s/%s，本次只更新程序文件，前端产物保持现状",
+			publicDirName, payloadIndexFile)
+	}
+
 	// 容器里没有 helper 那一步可用：主进程就是 PID 1，退出即容器停、helper 被
 	// 一起杀掉，替换永远走不完。改为在本进程里换文件（Linux 允许 rename 正在
 	// 执行的 inode），随后由 RestartAfter 触发 exec 自身。
 	if m.container {
-		return m.installInPlace(stagePath, version)
+		return m.installInPlace(stagePath, payloadDir, version)
 	}
 
 	helperFile, err := os.CreateTemp(dir, ".wb2api-updater-*"+filepath.Ext(expectedBinary))
 	if err != nil {
 		os.Remove(stagePath)
+		os.RemoveAll(payloadDir)
 		return fmt.Errorf("创建更新进程文件: %w", err)
 	}
 	helperPath := helperFile.Name()
 	if err := helperFile.Close(); err != nil {
 		os.Remove(helperPath)
 		os.Remove(stagePath)
+		os.RemoveAll(payloadDir)
 		return err
 	}
 	// Run the helper protocol from the installed version, not an unstarted release.
 	if err := copyFile(m.executable, helperPath); err != nil {
 		os.Remove(helperPath)
 		os.Remove(stagePath)
+		os.RemoveAll(payloadDir)
 		return fmt.Errorf("准备更新进程: %w", err)
 	}
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(helperPath, 0o700); err != nil {
 			os.Remove(helperPath)
 			os.Remove(stagePath)
+			os.RemoveAll(payloadDir)
 			return fmt.Errorf("设置更新进程权限: %w", err)
 		}
 	}
@@ -607,17 +667,23 @@ func (m *Manager) Install(ctx context.Context) (err error) {
 	if err != nil {
 		os.Remove(helperPath)
 		os.Remove(stagePath)
+		os.RemoveAll(payloadDir)
 		return err
 	}
 	originalArgs, err := json.Marshal(os.Args[1:])
 	if err != nil {
 		os.Remove(helperPath)
 		os.Remove(stagePath)
+		os.RemoveAll(payloadDir)
 		return err
 	}
-	if err := launchUpdateHelper(helperPath, selfUpdateArg, strconv.Itoa(os.Getpid()), stagePath, m.executable, cwd, string(originalArgs)); err != nil {
+	// 前端产物目录按「进程工作目录 + 配置」解析后**绝对化**再交给 helper：helper
+	// 起来时环境已 Chdir 过，但把它算死在这里，就没人需要再猜一次相对路径是相对谁。
+	publicDir := m.publicDirPath(cwd)
+	if err := launchUpdateHelper(helperPath, selfUpdateArg, strconv.Itoa(os.Getpid()), stagePath, m.executable, cwd, string(originalArgs), payloadDir, publicDir); err != nil {
 		os.Remove(helperPath)
 		os.Remove(stagePath)
+		os.RemoveAll(payloadDir)
 		return fmt.Errorf("启动更新进程: %w", err)
 	}
 	log.Printf("[updater] 已准备 v%s，服务即将重启", version.text)
@@ -807,17 +873,40 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		return true, errors.New("更新进程参数中的 pid 无效")
 	}
 	stagePath, targetPath, cwd, originalArgsJSON := args[3], args[4], args[5], args[6]
+	// 第 8、9 个参数是前端产物暂存目录与实际 public 目录（老版本启动的 helper 没有
+	// 这两个参数，按空值处理 = 只换二进制，兼容升级过程中的新旧混跑）。
+	payloadDir, publicDir := "", ""
+	if len(args) >= 9 {
+		payloadDir, publicDir = args[7], args[8]
+	}
 	if err := validateHelperPath(stagePath, ".wb2api-"); err != nil {
 		return true, err
 	}
 	if err := validateHelperPath(targetPath, ""); err != nil {
 		return true, err
 	}
+	if payloadDir != "" {
+		if err := validateHelperPath(payloadDir, ".wb2api-"); err != nil {
+			return true, err
+		}
+	}
+	if publicDir != "" {
+		if err := validatePublicDir(publicDir, targetPath); err != nil {
+			return true, err
+		}
+	}
 	// 失败路径不再残留 stage：成功替换后显式移除，其余任何退出路径由 defer 兜底。
 	replaced := false
 	defer func() {
 		if !replaced {
 			os.Remove(stagePath)
+		}
+	}()
+	// 前端产物的暂存目录同理：没被消费掉（任何失败路径）就整目录删掉，不留垃圾。
+	payloadConsumed := false
+	defer func() {
+		if payloadDir != "" && !payloadConsumed {
+			os.RemoveAll(payloadDir)
 		}
 	}()
 	var originalArgs []string
@@ -859,8 +948,21 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 	}
 	_ = os.Remove(stagePath)
 	replaced = true
+	// 二进制换好之后紧接着换前端产物：新后端配旧前端是「接口在、页面还是老样子」，
+	// 比不更新更难排查。这里失败就直接把二进制回滚，宁可原地不动。
+	commitPayload, restorePayload, payloadInstalled, perr := installPayload(payloadDir, cwd, publicDir)
+	if perr != nil {
+		if rerr := restore(); rerr != nil {
+			log.Printf("WARN: [updater] 前端产物安装失败且回滚程序文件失败: %v", rerr)
+		}
+		return true, replaceFailed(fmt.Errorf("安装前端产物: %w", perr))
+	}
+	if payloadInstalled {
+		log.Printf("[updater] 前端产物已更新，重启后生效")
+	}
 	cmd, err := startTarget()
 	if err != nil {
+		restorePayload()
 		restartErr := restore()
 		if restartErr == nil {
 			if old, serr := startTarget(); serr == nil {
@@ -875,6 +977,9 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 	// 拉起 ≠ 能跑：配置不兼容、端口被占、依赖缺失都会让新版本启动即退。给它一个
 	// 短的观察窗口，窗口内退出就回滚旧版本（备份还在）；活过窗口才删备份与 helper。
 	if werr := waitChildHealthy(cmd, childGrace()); werr != nil {
+		// 前端与二进制一起回滚：只回二进制会留下「旧后端 + 新前端」，静态资源与
+		// 接口版本错位的报错比更新失败本身更难定位。
+		restorePayload()
 		if rerr := restore(); rerr != nil {
 			log.Printf("WARN: [updater] 新版本健康检查未通过且回滚失败: %v", rerr)
 		} else if old, serr := startTarget(); serr == nil {
@@ -886,6 +991,11 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		return true, fmt.Errorf("新版本健康检查未通过: %w", werr)
 	}
 	_ = cmd.Process.Release()
+	commitPayload()
+	if payloadDir != "" {
+		payloadConsumed = true
+		_ = os.RemoveAll(payloadDir)
+	}
 	cleanup()
 	cleanupHelper()
 	return true, nil
