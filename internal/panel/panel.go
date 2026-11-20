@@ -1406,9 +1406,11 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // accountPurgeOffline 批量删除「已掉线」账号：401 掉线的号留在池里只会继续吃 401，
 // 运维要的是一键清掉、之后统一重登。
 //
-// 只按禁用原因前缀筛（pool.IsOfflineReason）：上游风控封禁（可能等几天就放行）、余额
-// 耗尽、面板手动禁用（运维显式意图）都不在删除范围内——「删除所有已掉线」如果连带
-// 删了这些，等于替运维做他没做的决定。
+// 按「掉线」口径筛（pool.IsOfflineDisabled）：既认新原因前缀「已掉线」，也认升级前
+// 留下的历史文案（"12153 session dead" / "refresh session dead" / 本地化的 12153）——
+// 那些号同样是「请求已经打不动、只能重登」，漏掉它们就是运维看到列表一片 red 却删不掉。
+// 上游风控封禁（11140，可能等几天就放行）、余额耗尽、面板手动禁用（运维显式意图）都
+// 不在删除范围内：连带删掉等于替运维做他没做的决定。
 //
 // 锁序与 accountRemove 一致（proxyAccountMu → reloadMu → pool.mu），逐个走同一条
 // 出池→删凭证文件路径，避免出现「重载刚 upsert 回来、这边又删掉」的交错。
@@ -1419,7 +1421,7 @@ func (p *Panel) accountPurgeOffline(w http.ResponseWriter, r *http.Request) {
 	defer p.reloadMu.Unlock()
 	var uids []string
 	for _, st := range p.cfg.Pool.List() {
-		if st.Disabled && pool.IsOfflineReason(st.DisabledReason) {
+		if pool.IsOfflineDisabled(st) {
 			uids = append(uids, st.UID)
 		}
 	}

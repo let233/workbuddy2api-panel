@@ -93,6 +93,17 @@ func (s *Scheduler) runBanProbe(ctx context.Context, spread bool) {
 		probed++
 		log.Printf("INFO: [banprobe] %s verdict=%s status=%d detail=%s",
 			shortUID(st.UID), res.Verdict, res.Status, orNone(res.Detail))
+		if res.Verdict == banprobe.SessionDead {
+			// 探测自己把「登录态失效」证死了（refresh 判死）。此时把原因收敛成「已掉线」：
+			// 升级前留下的 12153 session dead / refresh session dead 不在「删除所有已掉线」
+			// 的范围内，运维看到的是一个再也用不了、却删不掉的号。原原因留在括号里对账。
+			if !pool.IsOfflineReason(st.DisabledReason) {
+				s.cfg.Pool.DisableOffline(st.UID, "封禁探测：登录态已失效，需重新登录（原原因："+orNone(st.DisabledReason)+"）")
+				log.Printf("INFO: [banprobe] %s 登录态失效 — 原因已收敛为「%s」，可被「删除所有已掉线」清掉",
+					shortUID(st.UID), pool.ReasonOffline)
+			}
+			continue
+		}
 		if res.Verdict != banprobe.Lifted {
 			continue
 		}

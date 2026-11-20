@@ -41,6 +41,61 @@ func IsManualDisableReason(reason string) bool {
 	return strings.HasPrefix(strings.TrimSpace(reason), strings.TrimSuffix(ReasonManualDisable, "（管理员操作）"))
 }
 
+// offlineReasonMarkers 历史口径的掉线原因文本。
+//
+// 本文件接管「掉线」这一类之前，同一个事实（token 已被上游拒收、只能重登）被写进
+// 三种文案里，它们至今还留在老账号的持久化原因中：
+//   - "12153 session dead"：pool.NoteSessionDead 连续 3 次达阈的持久化原因；
+//   - "refresh session dead"：面板单号刷新路径（internal/server/handler.go）判死；
+//   - "上游 12153 session dead（业务码明说登录态失效，需重新登录）"：导入校验路径。
+//
+// 「删除所有已掉线」若只认「已掉线」前缀，升级前就判死的号会永远删不掉——它们早就
+// 打不动了，只是原因字符串还没换成新口径。
+var offlineReasonMarkers = []string{
+	"session dead", "12153", "refresh", "401",
+	"掉线", "会话已失效", "登录态失效", "登录状态失效", "凭据失效", "token 失效",
+	"需要重新登录", "需重新登录", "重新登录",
+}
+
+// notOfflineReasonMarkers 明确**不属于**掉线的禁用原因：上游风控封禁（11140）与
+// 面板手动禁用。封禁号可能过几天被放行，删掉就再也回不来；手动禁用是运维的决定。
+var notOfflineReasonMarkers = []string{
+	"11140", "restricted", "unusual activity", "request illegal", "封禁", "风控",
+}
+
+// IsOfflineReasonText 判断任意禁用原因文本是否指向「账号已掉线」，兼容本文件接管
+// 前的历史文案（见 offlineReasonMarkers）。
+func IsOfflineReasonText(reason string) bool {
+	s := strings.TrimSpace(reason)
+	if s == "" {
+		return false
+	}
+	if IsOfflineReason(s) {
+		return true
+	}
+	if IsManualDisableReason(s) {
+		return false
+	}
+	r := strings.ToLower(s)
+	for _, m := range notOfflineReasonMarkers {
+		if strings.Contains(r, m) {
+			return false
+		}
+	}
+	for _, m := range offlineReasonMarkers {
+		if strings.Contains(r, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsOfflineDisabled 判断一个账号状态是否属于「掉线类禁用」。列表分流、「删除所有已
+// 掉线」、每日探测共用这一条口径，避免各处自己比字符串。
+func IsOfflineDisabled(st Status) bool {
+	return st.Disabled && IsOfflineReasonText(st.DisabledReason)
+}
+
 // DisableOffline 401 掉线禁用：签到/任务/余额刷新撞到 401 时立即停用这个号。
 //
 // 为什么 401 要直接禁用（而不是等连续 3 次 session dead 达阈）：401 是「凭据已不被

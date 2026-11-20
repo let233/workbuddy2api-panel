@@ -147,7 +147,7 @@ type AllActKind = 'checkin_all' | 'travel_all' | 'activity_all' | 'keepalive_all
 type ConfirmState =
   | { kind: 'remove' | 'disable' | 'revive' | 'group'; uids: string[]; name: string; group?: string }
   | { kind: 'all'; act: AllActKind; name: string }
-  // 全池清理不针对勾选的 uid：后端按禁用原因前缀筛「已掉线」，前端只负责确认与回显数量
+  // 全池清理不针对勾选的 uid：后端按「掉线」口径筛（含历史的 12153/refresh session dead 文案），前端只负责确认与回显数量
   | { kind: 'purge_offline'; name: string }
   | { kind: 'export'; href: string; name: string; count: number }
 
@@ -167,7 +167,7 @@ function confirmMessage(c: ConfirmState | null): string {
   if (c.kind === 'export') return '将导出 ' + c.count + ' 个账号，文件里是明文 accessToken / refreshToken，请妥善保管。'
   // 说清筛选口径：这一句是运维按下删除前的唯一防线，别让人以为会连风控封禁的号一起删
   if (c.kind === 'purge_offline')
-    return '只删除禁用原因为「已掉线」的账号（请求已 401、现在打不动），其它禁用账号（上游风控封禁、面板手动禁用）不受影响。此操作不可撤销。'
+    return '只删除「已掉线」的账号（请求已 401、登录态失效，含历史留下的「12153 session dead」「refresh session dead」），其它禁用账号（上游风控封禁、面板手动禁用）不受影响。此操作不可撤销。'
   if (c.kind === 'all') return ALL_ACT_HINT[c.act]
   if (c.kind === 'remove') return '将从账号目录删除 ' + c.name + '，并尽量清掉对应授权文件。此操作不可撤销。'
   if (c.kind === 'disable') return '将禁用 ' + c.name + '，它们不再参与选号；随时可以解冻。'
@@ -1375,12 +1375,12 @@ export default function Accounts() {
               {a.label}
             </button>
           ))}
-          {/* 清理掉线号不需要勾选：删哪些由后端按禁用原因（已掉线）判定，
+          {/* 清理掉线号不需要勾选：删哪些由后端按「掉线」口径（已掉线 + 历史 session dead 文案）判定，
               放在批量动作一栏是因为它同样是「一次作用于全池」的操作。 */}
           <button
             className="btn sm danger"
             disabled={!!busy}
-            title="只删除禁用原因为「已掉线」的账号（请求已 401、打不动），风控封禁与面板手动禁用的号不受影响"
+            title="只删除「已掉线」的账号（请求已 401、登录态失效，含历史 session dead 文案），风控封禁与面板手动禁用的号不受影响"
             onClick={() => setConfirm({ kind: 'purge_offline', name: '所有已掉线账号' })}
           >
             {busy === 'purge_offline' ? '删除中…' : '删除所有已掉线'}
