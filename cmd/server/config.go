@@ -263,6 +263,26 @@ type Config struct {
 		// 不开始，额度一直空转；等下一条真实请求进来，起点落到那一刻，中间那段额度
 		// 白扔。关闭后行为回到「只解除冷却、不主动起窗」。
 		WindowProbeEnabled bool `json:"window_probe_enabled"` // 缺省 true；false = 关闭
+
+		// 封禁探测（scheduler/banprobe.go + banprobe 包）：每天挑一个时点，对**已禁用**
+		// 的账号真实发一次最小对话，问上游「还封着吗」。
+		//
+		// 为什么需要：封禁是上游侧的判词，本地只能看到「401 / 11140」那一刻的状态。解封
+		// 却不会通知任何人——号在池子里躺着禁用，运维只能靠手动一个个点「探测封禁」或
+		// 盲试「解冻」。这条排程把「回到可用」变成一个自动收敛的过程。
+		//
+		// 为什么必须真实对话（而不是查余额）：余额 200 只说明 billing 放行，chat 被风控
+		// 拦的号照样 200。只有跑完一次真实对话才是「这个号又能干活了」的证据。
+		BanProbeEnabled bool `json:"ban_probe_enabled"` // 缺省 true；false = 关闭
+		// BanProbeHours 探测时点（缺省 [12]）。每天只跑一轮：封禁/解封是人工与风控
+		// 到期驱动的，没有分钟级变化，频繁探测只会加重既有风控画像。
+		BanProbeHours []int `json:"ban_probe_hours"`
+		// BanProbeAutoRevive 探到上游已解封时是否自动把号解冻（缺省 true）。
+		// 关掉则只在面板/日志里给结论，由管理员点「解冻」。
+		// 「面板手动禁用」的号**永不**自动解冻（那是管理员主动下线，不是上游判的）。
+		BanProbeAutoRevive bool `json:"ban_probe_auto_revive"`
+		// BanProbeModel 探测用模型 id（空 = deepseek-v4.1-flash，免费档）。
+		BanProbeModel string `json:"ban_probe_model"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -345,6 +365,11 @@ type Config struct {
 		// 本值也不超过 10 分钟；平静 30 分钟无新限制则重新从 30s 起。
 		// 0 = 关掉连坐暂停，只保留「命中即停手」。热生效。
 		RestrictionHoldSeconds int `json:"restriction_hold_seconds"`
+		// RestrictionFailover 命中 11140 之后本请求最多再换几个号，缺省 1。
+		// 被打中的号照样禁用；预算用来跳过一个被连坐/误判的号，而不是把封禁原文回给客户端。
+		// 0 = 命中即停手（旧行为，一个号都不换）；预算用尽或该域进入连坐暂停都会停手，
+		// 所以放大这个值也只是「一个请求最多试几个号」，不改变连坐闸。热生效。
+		RestrictionFailover int `json:"restriction_failover"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -618,6 +643,8 @@ func Default() *Config {
 	c.Server.ShutdownTimeout = "30s"
 	c.Server.MaxPayloadBytes = 64 << 20
 	c.Upstream.RestrictionHoldSeconds = 1800
+	// 命中 11140 缺省再换 1 个号：号池里还有健康号时用户不该吃到封禁原文。
+	c.Upstream.RestrictionFailover = 1
 	c.Panel.PackageDetailLimit = 5
 	c.Update.AutoTime = "04:00"
 	// 账号目录热重载（issue #199）：默认 10s 轮询、连续 2 次确认才删。
@@ -651,6 +678,10 @@ func Default() *Config {
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
 	c.Schedule.WindowProbeEnabled = true
+	// 封禁探测：默认开、每日 12:00 一轮；探到解封自动同步解冻（用户口径 2026-11-21）。
+	c.Schedule.BanProbeEnabled = true
+	c.Schedule.BanProbeHours = []int{12}
+	c.Schedule.BanProbeAutoRevive = true
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -1091,6 +1122,10 @@ func (c *Config) normalize() error {
 	if c.Upstream.RestrictionHoldSeconds < 0 {
 		return fmt.Errorf("upstream.restriction_hold_seconds: 负值 %d 无意义（0 = 关闭）", c.Upstream.RestrictionHoldSeconds)
 	}
+	// 11140 后换几个号：负值无意义（0 = 命中即停手）。
+	if c.Upstream.RestrictionFailover < 0 {
+		return fmt.Errorf("upstream.restriction_failover: 负值 %d 无意义（0 = 命中即停手）", c.Upstream.RestrictionFailover)
+	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
@@ -1273,6 +1308,12 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.GrowthHours) == 0 {
 		c.Schedule.GrowthHours = []int{11}
 	}
+	if len(c.Schedule.BanProbeHours) == 0 {
+		c.Schedule.BanProbeHours = []int{12}
+	}
+	// 探测模型留空 = 用 banprobe.DefaultModel（免费档）。不做模型目录校验：模型名
+	// 只影响探针本身是否能跑通，配错了会以 inconclusive 的形式出现在日志里。
+	c.Schedule.BanProbeModel = strings.TrimSpace(c.Schedule.BanProbeModel)
 	// 排程轮次账号间并发：缺省/0 → 1（老 config 无此键，不能当非法值报错）。
 	if c.Schedule.GrowthConcurrency <= 0 {
 		c.Schedule.GrowthConcurrency = 1
@@ -1430,7 +1471,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
+	if err := checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.ban_probe_hours", "ban_probe_enabled", c.Schedule.BanProbeHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

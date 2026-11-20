@@ -16,9 +16,12 @@ import (
 // 请求」，于是一个客户端请求能顺着轮转把池子挨个撞一遍（hub #422 实测：一次任务 7 个号全封）。
 //
 // 两道闸：
-//  1. 命中即停手：禁用该号，本请求不再换号（chatCompletions 的 HTTP 错误与首帧否决两条路径）；
+//  1. 命中即禁用 + 有界换号：禁用这个号，本请求最多再换 upstream.restriction_failover 个号
+//     （缺省 1，0 = 完全不换号，即旧行为）。号池里还有没被盯上的号时，用户该拿到正常回答，
+//     而不是把封禁原文回给客户端；预算用尽就停手，把「一个请求撞穿整池」挡在门外；
 //  2. 同一域、同一窗口内 ≥ restrictionWaveMin 个不同账号被限制 → 判为连坐扫荡，该域暂停派发
 //     upstream.restriction_hold_seconds，期间该域的 chat 请求快速失败（503 + Retry-After）。
+//     暂停中一律停手：换号预算不越过连坐闸。
 //
 // 为什么按域（cn / global）而不是全池：两个域是两套独立的上游服务（不同域名、不同账号体系、
 // 各自的风控），CN 的扫荡说明不了 global 的出口有没有被盯上；全池暂停会把一个域的风控事件
@@ -27,6 +30,11 @@ import (
 //
 // 作用域：只挂 chat 主链路（11140 由 chat 返回，其余端点的流量与风险都小得多）。状态在进程内、
 // 重启清零——「暂停」的意思是「现在先别打」，重启后重新判定即可。
+//
+// 第 1 道闸后来从「命中即停手、一个号都不换」改成有界换号：停手是防连坐，但落到用户侧就是
+// 「号池里明明还有健康号，请求却直接吃了一发封禁」（单号被误判、或轮转先挑中被连坐的号时最
+// 明显）。现在缺省再换 1 个号，而连坐暂停一触发就停手——扫荡场景下暂停闸仍是硬停手，
+// 单号误判时用户能拿到正常回答。
 
 // 阈值必须随池子规模缩放（2026-11-13 事故）：曾经固定「2 个号被封 → 全站停派 30 分钟」，
 // 在 340 个号的池子上等于 0.6% 的账号出事就让 100% 的请求失败；当天封号潮持续，于是
@@ -147,15 +155,25 @@ func (g *restrictionGate) remaining(realm string) time.Duration {
 	return 0
 }
 
+// restrictionOutcome 一次 11140 处置的结果，调用方据此决定停手还是继续换号。
+type restrictionOutcome struct {
+	// restricted 本次失败是 11140 账号限制（该号已由 applyErrorPolicy 禁用）。
+	restricted bool
+	// paused 所属域此刻处于连坐暂停（本次触发或此前已在窗口内）——必须停手。
+	paused bool
+}
+
 // noteRestriction 账号处置之后调用：本次失败若是 11140 账号限制（任一形态），计入所属域的
-// 连坐判定并返回 true，调用方据此停止换号——换下一个号等于把它也送进风控。
-func (h *Handler) noteRestriction(acct *auth.Auth, kind upstream.ErrKind, body string) bool {
+// 连坐判定。restricted 是「这一发是账号限制」，调用方据它走有界换号（restrictionFailover）；
+// paused 是「该域已在连坐暂停」，用它立刻停手——暂停期间换号就是在往风控里送号。
+func (h *Handler) noteRestriction(acct *auth.Auth, kind upstream.ErrKind, body string) restrictionOutcome {
 	if kind != upstream.ErrAccountFault || !upstream.IsAccountRestriction(body) {
-		return false
+		return restrictionOutcome{}
 	}
 	// hold 走热配置快照（hotcfg）：upstream.restriction_hold_seconds 改了立即生效。
-	h.restrict.note(acct.Realm(), acct.UID, h.restrictionHold(), h.realmHealthy(acct.Realm()))
-	return true
+	realm := acct.Realm()
+	h.restrict.note(realm, acct.UID, h.restrictionHold(), h.realmHealthy(realm))
+	return restrictionOutcome{restricted: true, paused: h.restrict.remaining(realm) > 0}
 }
 
 // realmHealthy 本域可用号数，供连坐阈值缩放；拿不到（未配池子）返回 0 = 用固定下限。

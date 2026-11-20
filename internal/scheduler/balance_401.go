@@ -11,64 +11,67 @@ package scheduler
 // 用 refresh 做一次权威求证即可分开。非 401 不参与：5xx/限流/传输层各有既有惩罚路径。
 
 import (
-	"errors"
 	"log"
-	"net/http"
-	"strings"
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
-	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/offline"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 func (s *Scheduler) noteBalanceAuthFailure(a *auth.Auth, uid string, probeErr error) {
-	var ue *upstream.Error
-	if !errors.As(probeErr, &ue) || ue.Status != http.StatusUnauthorized {
-		return
-	}
-	// 没有 RT 无从求证（静态 key / 企业号等形态）：保持「只记日志」的旧语义。
-	if a.RefreshTokenValue() == "" {
+	ue, hit := offline.Signal(probeErr)
+	if !hit {
 		return
 	}
 	label := logfmt.Label(uid, a.Nickname)
+	// 静态凭据（API Key 等）没有 refresh 路径：401 就是凭据失效，直接判掉线。
+	if a.RefreshTokenValue() == "" {
+		s.markOffline(uid, label, offline.Describe(ue, "静态凭证 401（无 refresh token）"))
+		return
+	}
 	// 退避只记「refresh 成功」：真死号每轮 refresh 都回 12153 且不轮换 RT，必须每轮都
-	// 试，连续计数才能按预期在阈值内判死；把失败也记进退避会让死号永远停在 1/阈。
+	// 试；把失败也记进退避会让死号一直停在「没判死」。
 	if !s.allowAuthHeal(uid) {
 		log.Printf("balance %s: 401（%s 内已求证过登录态，本轮跳过 refresh）", label, authHealBackoff)
 		return
 	}
-	rerr := s.cfg.Upstream.RefreshToken(a)
-	if rerr == nil {
+	verdict, detail := offline.Judge(s.cfg.Upstream, a, true)
+	switch verdict {
+	case offline.Alive:
 		if serr := a.SaveAtomic(); serr != nil {
 			log.Printf("balance %s: 401 后刷新成功但落盘失败: %v", label, serr)
 		}
 		s.noteAuthHeal(uid)
 		s.cfg.Pool.ClearSessionDead(uid)
 		log.Printf("balance %s: 401 经 refresh 求证为降级 token（会话仍活），已换新 token 并清 session dead 计数", label)
-		return
-	}
-	var re *upstream.Error
-	// Kind 之外再看一次 code=12153：doJSON 只用 env.Msg 做分类，而上游的 12153 文案
-	// 不总是英文原文（本地化后不含 marker 就会落成 ErrClient，死号便永远不计罚）。
-	if errors.As(rerr, &re) && (re.Kind == upstream.ErrSessionDead || strings.Contains(re.Msg, "12153")) {
-		// refresh token 失效 ≠ 账号不可用：AT 未过期时 chat 仍正常（issue #83，
-		// 与 keepalive 同一判据）。计死会在连续 3 轮后禁用掉一个健康账号。
+	case offline.Dead:
+		// refresh 判死但 AT 还没过期：chat 侧此刻可能仍可用（issue #83，与 keepalive
+		// 同一判据）。直接禁用会砍掉一个还能干活的号，所以这里只累计计数并在日志里
+		// 说清楚；AT 一过期 NeedsRefresh 即真，下轮 401 就按「已掉线」直接禁用。
 		if upstream.SessionDeadButUsable(a) {
-			log.Printf("balance %s: refresh token 已失效但 access token 仍有效，不计 session dead", label)
+			s.cfg.Pool.NoteSessionDead(uid)
+			log.Printf("balance %s: %s，但 access token 仍有效（chat 可能仍可用）—— 暂不禁用，AT 过期后按已掉线处理", label, detail)
 			return
 		}
-		if s.cfg.Pool.NoteSessionDead(uid) {
-			log.Printf("balance %s: 连续 %d 次 401 且 refresh 判死 — 禁用（需重新登录）", label, pool.SessionDeadThreshold())
-			return
-		}
-		if st, ok := s.cfg.Pool.Status(uid); ok {
-			log.Printf("balance %s: 401 且 refresh 判死（session dead 计数 %d/%d）", label, st.SessionDeadFails, pool.SessionDeadThreshold())
-		}
+		s.markOffline(uid, label, detail)
+	default:
+		log.Printf("balance %s: 401 但 refresh 未给出确定判词（%s），本轮不动账号状态", label, detail)
+	}
+}
+
+// markOffline 把账号判为「已掉线」并禁用（用户口径 2026-11-21：401 直接封禁，
+// 不再等连续 3 次计数——三次意味着面板上最长有十几分钟显示「可用」却什么都打不动）。
+func (s *Scheduler) markOffline(uid, label, detail string) {
+	if s.cfg.Pool == nil {
 		return
 	}
-	log.Printf("balance %s: 401 但 refresh 失败（非 session dead，不计罚）: %v", label, rerr)
+	if s.cfg.Pool.DisableOffline(uid, detail) {
+		log.Printf("WARN: %s 已掉线（%s）— 已禁用，需重新登录（用户口径：401 直接封禁）", label, detail)
+		return
+	}
+	log.Printf("WARN: %s 401 判死，但账号已是禁用态（%s），不改状态", label, detail)
 }
 
 // authHealBackoff 同一账号 401→refresh 求证的最小间隔。降级 token 每轮探测都会 401，

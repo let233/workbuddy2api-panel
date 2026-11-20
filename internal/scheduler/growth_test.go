@@ -35,6 +35,7 @@ func TestNextWakeGrowthDisabled(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
+		BanProbeDisabled:  true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 10, 30, 0, 0, cst.Loc))
 	if want := time.Date(2026, 9, 12, 9, 0, 0, 0, cst.Loc); !at.Equal(want) {
@@ -74,6 +75,7 @@ func TestReconfigureGrowthHot(t *testing.T) {
 	s := New(Config{GrowthHours: []int{11}})
 	off := ScheduleParams{
 		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
+		BanProbeDisabled: true, // 封禁探测缺省 12:00 会抢在 13:00 之前
 	}
 	p := off
 	p.GrowthHours = []int{13}

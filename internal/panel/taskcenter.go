@@ -57,6 +57,7 @@ func (p *Panel) scanAccountGrowth(a *auth.Auth) scanAccountItem {
 	}
 	var errors []string
 	if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
+		p.noteAuth401(a, a.UID, "扫描任务", err)
 		errors = append(errors, "list tasks: "+err.Error())
 	} else {
 		for _, t := range tasks {
@@ -68,6 +69,7 @@ func (p *Panel) scanAccountGrowth(a *auth.Auth) scanAccountItem {
 	// 小程序任务与默认任务分别读取。即使其中一路失败，也保留另一路结果并
 	// 明确标记扫描不完整，避免“没有待办”被误解成所有任务都已完成。
 	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err != nil {
+		p.noteAuth401(a, a.UID, "扫描任务", err)
 		errors = append(errors, "list MP tasks: "+err.Error())
 	} else {
 		seen := make(map[string]bool, len(it.Growth))
@@ -520,6 +522,7 @@ func (p *Panel) queueSet(q *queueState, uid string, fn func(*queueItem)) {
 func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
+		p.noteAuth401(a, a.UID, "接受任务", err)
 		return 0
 	}
 	var codes []string
@@ -532,6 +535,7 @@ func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 		return 0
 	}
 	if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
+		p.noteAuth401(a, a.UID, "接受任务", err)
 		log.Printf("panel: 队列 accept uid=%s: %v（不阻塞）", a.UID, err)
 		return 0
 	}
@@ -601,6 +605,7 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			default:
 				vs, err := p.cfg.Upstream.SchoolVouchers(a)
 				if err != nil {
+					p.noteAuth401(a, a.UID, "开学季券", err)
 					it.Err = err.Error()
 				} else {
 					it.Vouchers = vs

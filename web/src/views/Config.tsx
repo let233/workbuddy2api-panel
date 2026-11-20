@@ -100,6 +100,40 @@ const GROUPS: Group[] = [
     ],
   },
   {
+    // 单开一组而不是塞进「定时任务」：这四项只在「有号被封」时才有意义，
+    // 与签到/旅行那批日常任务不是一个心智模型，混在一起会被当成常规调度去改。
+    title: '封禁探测',
+    sub: '每日探测已封禁账号在上游是否解封；只探「被封禁」的号，面板手动禁用的号不参与自动解冻',
+    fields: [
+      {
+        path: 'schedule.ban_probe_enabled',
+        label: '每日自动探测',
+        kind: 'switch',
+        hint: '每日自动探测已封禁账号在上游是否解封；缺省开启',
+      },
+      {
+        path: 'schedule.ban_probe_hours',
+        label: '探测时段',
+        kind: 'hours',
+        placeholder: '12',
+        hint: '0–23 小时、逗号分隔，留空表示当天不探测；缺省 12 点',
+      },
+      {
+        path: 'schedule.ban_probe_auto_revive',
+        label: '探到解封自动解冻',
+        kind: 'switch',
+        hint: '探测到上游已解封时自动解冻（跳过面板手动禁用的账号）；缺省开启',
+      },
+      {
+        path: 'schedule.ban_probe_model',
+        label: '探测用模型',
+        kind: 'text',
+        placeholder: 'deepseek-v4.1-flash',
+        hint: '探测时发一条真实 chat 请求用哪个模型；留空用默认',
+      },
+    ],
+  },
+  {
     title: '账号池与流量治理',
     sub: '并发、熔断、降权与选号权重；改动会立即影响转发行为',
     fields: [
@@ -151,6 +185,7 @@ const GROUPS: Group[] = [
       { path: 'upstream.dump_dir', label: '抓包目录', kind: 'text', hint: '空 = 不落盘' },
       { path: 'upstream.dump_max_bytes', label: '单次抓包上限（字节）', kind: 'number' },
       { path: 'upstream.restriction_hold_seconds', label: '限制全池暂停（秒）', kind: 'number', hint: '0 = 关闭' },
+      { path: 'upstream.restriction_failover', label: '封禁后换号数', kind: 'number', min: 0, hint: '0 = 不换号；默认 1' },
       { path: 'dns_servers', label: 'DNS 服务器', kind: 'list', placeholder: '1.1.1.1, 8.8.8.8', hint: '逗号分隔，留空用系统默认' },
       { path: 'global.chat_base', label: '国际版对话地址', kind: 'text', realm: 'global', hint: '按账号 domain 选官方主机；空 = 内置默认' },
       { path: 'global.billing_base', label: '国际版计费地址', kind: 'text', realm: 'global', hint: '同国际版对话地址口径；空 = 内置默认' },
@@ -265,6 +300,8 @@ function parseHours(text: string): number[] {
 // 空字符串表示「回到内置默认」的字段；其余文本字段留空不下发，避免把默认值覆盖成空。
 const CLEARABLE = new Set([
   'upstream.user_agent',
+  // 探测模型按「留空用默认」的语义走：不放进 CLEARABLE 的话，一旦填过就再也清不回默认
+  'schedule.ban_probe_model',
   'prompt.text',
   'cn.chat_base',
   'cn.billing_base',

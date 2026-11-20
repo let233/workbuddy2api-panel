@@ -23,6 +23,8 @@ type hotConfig struct {
 	headKeepalive atomic.Int64
 	// restrictionHold 11140 风控连坐暂停的时长上限（退避不超过它）。0 = 只保留「命中即停手」。
 	restrictionHold atomic.Int64
+	// restrictionFailover 遇到 11140 后本请求最多再换几个号。0 = 命中即停手（旧行为）。
+	restrictionFailover atomic.Int64
 	// softCooldown 软冷却基数。0 = 未热改 → getter 回退 live 快照/静态字段/缺省。
 	softCooldown atomic.Int64
 	// maxRotate 单请求最多换号次数（<=0 一律按 1 处理，避免死循环）。
@@ -63,6 +65,7 @@ func (h *Handler) initHot(cfg Config) {
 	h.hot.maxPayloadBytes.Store(cfg.MaxPayloadBytes)
 	h.hot.headKeepalive.Store(int64(cfg.HeadKeepalive))
 	h.hot.restrictionHold.Store(int64(cfg.RestrictionHold))
+	h.hot.restrictionFailover.Store(int64(cfg.RestrictionFailover))
 	h.hot.maxRotate.Store(int64(cfg.MaxRotate))
 	h.hot.refreshSkew.Store(int64(cfg.RefreshSkew))
 	h.hot.setPrompt(cfg.PromptMode, cfg.PromptText)
@@ -90,6 +93,15 @@ func (h *Handler) headKeepalive() time.Duration {
 // restrictionHold 11140 连坐暂停时长上限（0 = 只保留命中即停手）。
 func (h *Handler) restrictionHold() time.Duration {
 	return time.Duration(h.hot.restrictionHold.Load())
+}
+
+// restrictionFailover 11140 之后还能再换几个号（<=0 = 命中即停手）。
+func (h *Handler) restrictionFailover() int {
+	n := int(h.hot.restrictionFailover.Load())
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // hotSoftCooldown 热改过的软冷却基数；0 = 没热改过。
@@ -188,6 +200,14 @@ func (h *Handler) SetRestrictionHold(d time.Duration) {
 		return
 	}
 	h.hot.restrictionHold.Store(int64(d))
+}
+
+// SetRestrictionFailover 热改 11140 之后的有界换号预算。0 = 命中即停手（旧行为）。
+func (h *Handler) SetRestrictionFailover(n int) {
+	if h == nil {
+		return
+	}
+	h.hot.restrictionFailover.Store(int64(n))
 }
 
 // SetSoftCooldown 热改软冷却基数。<=0 = 撤销热改值（回退 live 快照/静态字段）。

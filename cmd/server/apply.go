@@ -137,6 +137,7 @@ func (a *hotApplier) Apply(c *Config) error {
 			ActivityHours:  c.Schedule.ActivityHours,
 			KeepaliveHours: c.Schedule.KeepaliveHours,
 			GrowthHours:    c.Schedule.GrowthHours,
+			BanProbeHours:  c.Schedule.BanProbeHours,
 
 			CheckinDisabled:        !c.Schedule.CheckinEnabled,
 			TravelDisabled:         !c.Schedule.TravelEnabled,
@@ -144,6 +145,9 @@ func (a *hotApplier) Apply(c *Config) error {
 			WebActivityDisabled:    !c.Schedule.WebActivityEnabled,
 			KeepaliveDisabled:      !c.Schedule.KeepaliveEnabled,
 			GrowthDisabled:         !c.Schedule.GrowthEnabled,
+			BanProbeDisabled:       !c.Schedule.BanProbeEnabled,
+			BanProbeAutoRevive:     c.Schedule.BanProbeAutoRevive,
+			BanProbeModel:          c.Schedule.BanProbeModel,
 			IncludeDisabledInTasks: c.Schedule.IncludeDisabledInTasks,
 
 			JitterMinutes:              c.Schedule.JitterMinutes,
@@ -176,6 +180,7 @@ func (a *hotApplier) Apply(c *Config) error {
 		gw.SetMaxPayloadBytes(c.Server.MaxPayloadBytes)
 		gw.SetHeadKeepalive(c.HeadKeepaliveDur)
 		gw.SetRestrictionHold(time.Duration(c.Upstream.RestrictionHoldSeconds) * time.Second)
+		gw.SetRestrictionFailover(c.Upstream.RestrictionFailover)
 		// 提示词模式与文本成套切换：只改一半会出现「passthrough 却带着 custom 文本」。
 		gw.SetPrompt(c.Prompt.Mode, c.PromptText)
 		gw.SetGlobalEnabled(c.Global.Enabled)

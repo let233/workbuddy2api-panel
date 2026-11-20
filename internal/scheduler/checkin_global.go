@@ -64,6 +64,7 @@ func (s *Scheduler) checkinGlobal(a *auth.Auth) {
 			log.Printf("checkin %s: 国际版今天已签到（幂等）", label)
 			return
 		}
+		s.noteAuth401(a, a.UID, "国际版签到", err)
 		log.Printf("WARN: checkin %s: 国际版签到失败: %v", label, err)
 		return
 	}

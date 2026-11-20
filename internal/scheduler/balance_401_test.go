@@ -58,8 +58,8 @@ func healScheduler(t *testing.T, srvURL string, a *auth.Auth) *Scheduler {
 	return New(Config{Pool: p, Upstream: up})
 }
 
-// refresh 回 12153 = 会话真死：401 必须计入 session dead（3 次达阈禁用），
-// 而不是像修复前那样只写一行日志、面板一直显示「可用」。
+// refresh 回 12153 = 会话真死：401 直接禁用并写明「已掉线」（用户口径：401 直接封禁），
+// 不再等 3 次计数——真死号每轮重试只是白打上游。
 func TestBalanceProbe401RefreshSaysSessionDead(t *testing.T) {
 	f := &healFake{sessionDie: true}
 	srv := f.server(t)
@@ -68,11 +68,11 @@ func TestBalanceProbe401RefreshSaysSessionDead(t *testing.T) {
 
 	s.RunBalanceRefreshNow()
 	st, _ := s.cfg.Pool.Status("u1")
-	if st.SessionDeadFails != 1 {
-		t.Fatalf("session dead 计数=%d want 1（面板要靠它打「疑似登录失效」）", st.SessionDeadFails)
+	if !st.Disabled {
+		t.Fatalf("refresh 判死必须当场禁用（面板靠它把号移出轮转）: %+v", st)
 	}
-	if st.Disabled {
-		t.Fatal("一次不该直接禁用（阈值为连续计数）")
+	if !pool.IsOfflineReason(st.DisabledReason) {
+		t.Fatalf("禁用原因=%q want 前缀「%s」", st.DisabledReason, pool.ReasonOffline)
 	}
 	if f.refresh != 1 {
 		t.Fatalf("refresh 调用=%d want 1", f.refresh)
@@ -162,7 +162,8 @@ func TestBalanceProbe401SessionDeadLocalizedMessage(t *testing.T) {
 	s := healScheduler(t, srv.URL, a)
 
 	s.RunBalanceRefreshNow()
-	if st, _ := s.cfg.Pool.Status("u1"); st.SessionDeadFails != 1 {
-		t.Fatalf("本地化 12153 文案也必须判死，session dead 计数=%d want 1", st.SessionDeadFails)
+	st, _ := s.cfg.Pool.Status("u1")
+	if !st.Disabled || !pool.IsOfflineReason(st.DisabledReason) {
+		t.Fatalf("本地化 12153 文案也必须判死并标「已掉线」: %+v", st)
 	}
 }

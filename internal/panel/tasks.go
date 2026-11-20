@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/offline"
 )
 
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
@@ -45,6 +46,7 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
+		p.noteAuth401(a, uid, "查询任务", err)
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
@@ -101,6 +103,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.cfg.Upstream.AcceptTasks(a, body.TaskCodes); err != nil {
+		p.noteAuth401(a, uid, "接受任务", err)
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
 	}
@@ -132,6 +135,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
+		p.noteAuth401(a, uid, "接受全部任务", err)
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
@@ -156,6 +160,11 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 			end = len(codes)
 		}
 		if err := p.cfg.Upstream.AcceptTasks(a, codes[i:end]); err != nil {
+			if p.noteAuth401(a, uid, "接受任务", err) == offline.Offline {
+				// 已判掉线：剩下的批次没有再打的必要
+				failed = append(failed, codes[i:end]...)
+				break
+			}
 			log.Printf("panel: 批量接受失败 uid=%s codes=%v err=%v", uid, codes[i:end], err)
 			failed = append(failed, codes[i:end]...)
 			continue
@@ -174,6 +183,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(mpCodes) > 0 {
 			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
+				p.noteAuth401(a, uid, "接受任务", err)
 				log.Printf("panel: mp 批量接受失败 uid=%s err=%v", uid, err)
 				failed = append(failed, mpCodes...)
 			} else {
@@ -223,6 +233,7 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		credit, energy, err = p.cfg.Upstream.ClaimReward(a, body.TaskCode)
 	}
 	if err != nil {
+		p.noteAuth401(a, uid, "领取任务奖励", err)
 		writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
 		return
 	}

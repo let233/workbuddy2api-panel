@@ -82,13 +82,13 @@ func TestEnabledSlotsSingleSourceOfTruth(t *testing.T) {
 	now := time.Date(2026, 10, 15, 10, 0, 0, 0, cst.Loc)
 	all := Config{
 		CheckinHours: []int{9}, TravelHours: []int{8}, ActivityHours: []int{7},
-		KeepaliveHours: []int{6}, GrowthHours: []int{4},
+		KeepaliveHours: []int{6}, GrowthHours: []int{4}, BanProbeHours: []int{3},
 	}
-	if got := New(all).enabledSlots(now); len(got) != 5 {
-		t.Fatalf("启用任务族应为 5 类，got %d: %v", len(got), got)
+	if got := New(all).enabledSlots(now); len(got) != 6 {
+		t.Fatalf("启用任务族应为 6 类（签到/旅行/活跃/保活/成长/封禁探测），got %d: %v", len(got), got)
 	}
-	if got := New(all).missedToday(now); len(got) != 5 {
-		t.Fatalf("时点全过时 5 类都应补跑，got %v", got)
+	if got := New(all).missedToday(now); len(got) != 6 {
+		t.Fatalf("时点全过时 6 类都应补跑，got %v", got)
 	}
 }
 
@@ -246,6 +246,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		GrowthDisabled:    true,
+		BanProbeDisabled:  true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -448,66 +449,45 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 
 	up := testUpClient(upstream.Runtime{ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}, srv.Client())
 	s := New(Config{Pool: p, Upstream: up})
-	// P0-1：12153 连续 N 次才禁用。前 2 次刷新失败不应杀号（误判防护）。
-	s.RunKeepaliveNow()
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("第 1 次 12153 不应禁用: %+v", st)
-	}
-	s.RunKeepaliveNow()
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("第 2 次 12153 不应禁用: %+v", st)
-	}
-	// 第 3 次连续 12153 → 禁用。
+	// 用户口径（2026-11-21）：refresh 判死 = 已掉线，当场禁用，不再等连续 N 次计数。
 	s.RunKeepaliveNow()
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("第 3 次连续 12153 应禁用: %+v", st)
+		t.Fatalf("refresh 回 12153 应当场禁用: %+v", st)
 	}
-	if st.DisabledReason != "12153 session dead" {
-		t.Errorf("disabled_reason=%q want 12153 session dead", st.DisabledReason)
+	if !pool.IsOfflineReason(st.DisabledReason) {
+		t.Errorf("disabled_reason=%q want 前缀「%s」", st.DisabledReason, pool.ReasonOffline)
 	}
 }
 
-// TestRunKeepaliveSessionDeadResetBySuccess 两次 12153 后刷新成功 → 计数清零，
-// 再来的 12153 从第 1 次重新计（不会因历史失败被继续追杀）。
-func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
-	var fails atomic.Int32
+// TestRunKeepaliveDisabledNotRetried 判死禁用后不再反复刷新：禁用号默认不参与保活
+// （include_disabled_in_tasks=false），否则死号每轮白打一次上游。
+func TestRunKeepaliveDisabledNotRetried(t *testing.T) {
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if fails.Add(1) == 3 { // 第 3 次（本次调度循环的第二轮）刷新成功
-			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
-			return
-		}
+		calls.Add(1)
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
 	}))
 	defer srv.Close()
 
 	p := pool.New(nil)
-	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(a)
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1})
 
 	up := testUpClient(upstream.Runtime{ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}, srv.Client())
 	s := New(Config{Pool: p, Upstream: up})
-	s.RunKeepaliveNow() // 12153 #1
-	s.RunKeepaliveNow() // 12153 #2
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("precondition: 前 2 次不应禁用: %+v", st)
+
+	s.RunKeepaliveNow()
+	first := calls.Load()
+	if first != 1 {
+		t.Fatalf("首轮 refresh 调用=%d want 1（12153 不再二次求证）", first)
 	}
-	s.RunKeepaliveNow() // 刷新成功 → 清计数
-	// 刷新成功后 AT 有效期 1h，按 issue #83 判据这期间不累计（号确实能用）。
-	// 这里把 AT 重新标为已过期，模拟「新 token 也过期了」的下一轮，继续验计数语义。
-	a.Lock()
-	a.ExpiresAt = 1
-	a.Unlock()
-	// 接下来连续 2 次 12153：从新计数重新算，仍不应禁用（历史计数已清）。
-	s.RunKeepaliveNow() // 12153 #1（新计数）
-	s.RunKeepaliveNow() // 12153 #2（新计数）
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("刷新成功清计数后连续 2 次 12153 不应禁用: %+v", st)
-	}
-	s.RunKeepaliveNow() // 12153 #3（新计数）→ 禁用
 	if st, _ := p.Status("u1"); !st.Disabled {
-		t.Fatalf("新计数第 3 次 12153 应禁用: %+v", st)
+		t.Fatalf("12153 应当场禁用: %+v", st)
+	}
+	s.RunKeepaliveNow()
+	if got := calls.Load(); got != first {
+		t.Fatalf("已禁用账号不该再刷新：%d → %d", first, got)
 	}
 }
 

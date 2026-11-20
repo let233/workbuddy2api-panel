@@ -11,6 +11,7 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/offline"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -57,6 +58,9 @@ func (p *Panel) sweepAccount(a *auth.Auth) (accepted, claimed int, err error) {
 	label := logfmt.Label(a.UID, a.Nickname)
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
+		if p.noteAuth401(a, a.UID, "任务清扫", err) == offline.Offline {
+			return 0, 0, err
+		}
 		return 0, 0, err
 	}
 	mp, mpErr := p.cfg.Upstream.ListTasksMP(a)
@@ -67,6 +71,9 @@ func (p *Panel) sweepAccount(a *auth.Auth) (accepted, claimed int, err error) {
 	// 端标记不同，两种口径分开提交（缺 mp 头 accept 返回 task not found）。
 	if codes := acceptPendingCodes(tasks); len(codes) > 0 {
 		if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
+			if p.noteAuth401(a, a.UID, "任务清扫接受", err) == offline.Offline {
+				return accepted, claimed, nil
+			}
 			log.Printf("WARN: 补领清扫 %s 接受: %v", label, err)
 		} else {
 			accepted += len(codes)
@@ -74,6 +81,9 @@ func (p *Panel) sweepAccount(a *auth.Auth) (accepted, claimed int, err error) {
 	}
 	if codes := acceptPendingCodes(mp); len(codes) > 0 {
 		if err := p.cfg.Upstream.AcceptTasksMP(a, codes); err != nil {
+			if p.noteAuth401(a, a.UID, "任务清扫接受", err) == offline.Offline {
+				return accepted, claimed, nil
+			}
 			log.Printf("WARN: 补领清扫 %s 接受(mp): %v", label, err)
 		} else {
 			accepted += len(codes)
@@ -106,6 +116,9 @@ func (p *Panel) sweepAccount(a *auth.Auth) (accepted, claimed int, err error) {
 			_, _, cerr = p.cfg.Upstream.ClaimReward(a, t.TaskCode)
 		}
 		if cerr != nil {
+			if p.noteAuth401(a, a.UID, "任务清扫领奖", cerr) == offline.Offline {
+				return accepted, claimed, nil
+			}
 			log.Printf("WARN: 补领 %s %s: %v", label, t.TaskCode, cerr)
 			continue
 		}

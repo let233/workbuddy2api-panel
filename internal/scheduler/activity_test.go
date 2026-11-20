@@ -337,6 +337,7 @@ func TestNextWakeActivityDisabled(t *testing.T) {
 		ActivityDisabled: true,
 		KeepaliveHours:   []int{22},
 		GrowthDisabled:   true, // 成长队列 11:00 会插在 9:30 与 21:00 之间，本用例只看活跃时点
+		BanProbeDisabled: true, // 封禁探测缺省 12:00，会插在 9:30 与 21:00 之间
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, cst.Loc))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, cst.Loc); !at.Equal(want) {
@@ -380,6 +381,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},
 		KeepaliveHours:    []int{22},
+		BanProbeDisabled:  true,
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {

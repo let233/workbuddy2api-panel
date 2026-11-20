@@ -256,8 +256,13 @@ func (p *Pool) memPage(page, size int, realm, group string) ([]Status, int64) {
 }
 
 // statusFromRow 用库里的一行给内存里已不存在的账号兜底合成状态。
+//
+// 兜底行也必须带上禁用原因与时刻：账号出池后（凭证被删、目录里暂时扫不到）面板
+// 仍会渲染这一行，早先只合成 disabled 布尔值，于是「已掉线」的号在列表里显示成
+// 一个没有理由的禁用号——而清理与自动解冻都按原因分流，运维看不到原因就无法判断
+// 这一行为什么还在。
 func statusFromRow(row stateAccount) Status {
-	return Status{
+	st := Status{
 		UID:                      row.UID,
 		Credits:                  row.Credits,
 		CreditsTotal:             row.CreditsTotal,
@@ -272,6 +277,15 @@ func statusFromRow(row stateAccount) Status {
 		CreditsEarliestRemaining: row.CreditsEarliestRemaining,
 		CreditsExpiryBuckets:     append([]ExpiryBucket(nil), row.CreditsExpiryBuckets...),
 	}
+	// 原因只在禁用态透出（与 statusOf 同口径）：冷却期残留的 reason 不该被当成
+	// 「这个号为什么被禁」。
+	if st.Disabled {
+		st.DisabledReason = row.Reason
+		if !row.DisabledAt.IsZero() {
+			st.DisabledAt = row.DisabledAt.Format(time.RFC3339)
+		}
+	}
+	return st
 }
 
 // ExpiryRow 到期提醒页的一行（只带到期相关字段：整页要全量账号，不该顺带

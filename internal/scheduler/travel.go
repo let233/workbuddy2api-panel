@@ -104,6 +104,8 @@ func (s *Scheduler) RunTravelNowFor(uid string) bool {
 func (s *Scheduler) travelOne(a *auth.Auth) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
+		// 401 先按「已掉线」处置（禁用），再照旧记一行 WARN。
+		s.noteAuth401(a, a.UID, "旅行", err)
 		log.Printf("WARN: travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
@@ -116,6 +118,7 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	s.openBlindBox(a)
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
+		s.noteAuth401(a, a.UID, "旅行", err)
 		log.Printf("WARN: travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
@@ -138,6 +141,7 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
 		return
 	}
 	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
+		s.noteAuth401(a, a.UID, "旅行", err)
 		log.Printf("WARN: travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
@@ -152,6 +156,7 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 	}
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
+		s.noteAuth401(a, a.UID, "旅行", err)
 		log.Printf("WARN: travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
 		return
 	}

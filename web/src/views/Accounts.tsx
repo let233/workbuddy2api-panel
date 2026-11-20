@@ -91,6 +91,13 @@ type ProxySnap = { proxies?: ProxyView[]; bindings?: Record<string, Binding> }
 
 type ProbeResp = { verdict?: string; detail?: string; advice?: string }
 type BalanceResp = { ok?: boolean; credits?: number; credits_total?: number }
+/** 全池清理回执：count / uids 是删掉的，failed 是删不掉的（单个 uid 失败不影响其它号）。 */
+type PurgeOfflineResp = {
+  ok?: boolean
+  count?: number
+  uids?: string[]
+  failed?: { uid: string; error?: string }[]
+}
 
 type CheckinResp = {
   ok?: boolean
@@ -140,6 +147,8 @@ type AllActKind = 'checkin_all' | 'travel_all' | 'activity_all' | 'keepalive_all
 type ConfirmState =
   | { kind: 'remove' | 'disable' | 'revive' | 'group'; uids: string[]; name: string; group?: string }
   | { kind: 'all'; act: AllActKind; name: string }
+  // 全池清理不针对勾选的 uid：后端按禁用原因前缀筛「已掉线」，前端只负责确认与回显数量
+  | { kind: 'purge_offline'; name: string }
   | { kind: 'export'; href: string; name: string; count: number }
 
 function confirmTitle(c: ConfirmState | null): string {
@@ -148,6 +157,7 @@ function confirmTitle(c: ConfirmState | null): string {
   if (c.kind === 'disable') return '禁用账号'
   if (c.kind === 'revive') return '解冻账号'
   if (c.kind === 'group') return '更新分组'
+  if (c.kind === 'purge_offline') return '删除所有已掉线账号'
   if (c.kind === 'export') return '导出账号 JSON'
   return c.name
 }
@@ -155,6 +165,9 @@ function confirmTitle(c: ConfirmState | null): string {
 function confirmMessage(c: ConfirmState | null): string {
   if (!c) return ''
   if (c.kind === 'export') return '将导出 ' + c.count + ' 个账号，文件里是明文 accessToken / refreshToken，请妥善保管。'
+  // 说清筛选口径：这一句是运维按下删除前的唯一防线，别让人以为会连风控封禁的号一起删
+  if (c.kind === 'purge_offline')
+    return '只删除禁用原因为「已掉线」的账号（请求已 401、现在打不动），其它禁用账号（上游风控封禁、面板手动禁用）不受影响。此操作不可撤销。'
   if (c.kind === 'all') return ALL_ACT_HINT[c.act]
   if (c.kind === 'remove') return '将从账号目录删除 ' + c.name + '，并尽量清掉对应授权文件。此操作不可撤销。'
   if (c.kind === 'disable') return '将禁用 ' + c.name + '，它们不再参与选号；随时可以解冻。'
@@ -167,6 +180,7 @@ function confirmAction(c: ConfirmState | null): string {
   if (c.kind === 'all') return '开始'
   if (c.kind === 'export') return '下载'
   if (c.kind === 'remove') return '删除'
+  if (c.kind === 'purge_offline') return '删除'
   if (c.kind === 'disable') return '禁用'
   if (c.kind === 'revive') return '解冻'
   return '保存'
@@ -214,7 +228,7 @@ const ALL_ACT_HINT: Record<AllActKind, string> = {
 }
 
 const VERDICT: Record<string, { tone: Tone; text: string }> = {
-  lifted: { tone: 'ok', text: '上游已解封，可以点「解冻」恢复使用' },
+  lifted: { tone: 'ok', text: '上游已解封，可以去解冻' },
   still_banned: { tone: 'warn', text: '仍被封禁，继续等待；勿反复解冻，可能加重风控' },
   blocked: { tone: 'warn', text: '会话仍有效，但被上游风控拦截（可能仍是封禁），继续观察' },
   session_dead: { tone: 'warn', text: '不是封禁问题：登录态失效，需要重新登录' },
@@ -493,6 +507,10 @@ export default function Accounts() {
 
   // 行内探测：详情弹层里是就地显示结果，列表行没有位置放结果面板，
   // 所以把结论文本直接弹成 toast（verdict 六态映射见 VERDICT）。
+  //
+  // 后端判定口径已从「查余额」改成「发一次真实 chat 请求」：余额接口走的是另一套
+  // 风控口径，解封后仍可能正常返回，用它探封禁会得出「已解封」的假阳性。判定变了
+  // 但接口路径与 verdict 字段没变，所以这里只换提示文案，不动请求。
   const doProbeRow = (uid: string) => {
     void run('probe:' + uid, async () => {
       try {
@@ -635,6 +653,28 @@ export default function Accounts() {
     })
   }
 
+  /** 全池清理「已掉线」账号：不读勾选，删哪些由后端按禁用原因前缀决定。 */
+  const doPurgeOffline = () => {
+    void run('purge_offline', async () => {
+      try {
+        const r = await api.post<PurgeOfflineResp>('/accounts/purge_offline', {})
+        const n = typeof r.count === 'number' ? r.count : (r.uids ?? []).length
+        const failed = r.failed ?? []
+        const first = failed[0]
+        const failNote = first
+          ? '，失败 ' + failed.length + ' 个（' + first.uid.slice(0, 8) + (first.error ? '：' + first.error : '') + '）'
+          : ''
+        if (n > 0) toast.ok('已删除 ' + n + ' 个已掉线账号' + failNote)
+        else toast.warn('没有可删除的已掉线账号' + failNote)
+        q.reload()
+        ov.reload()
+        roster.reload()
+      } catch (e) {
+        toast.err(errorText(e))
+      }
+    })
+  }
+
   const applyGroup = (uids: string[], name: string) => {
     if (!uids.length) {
       toast.warn('先勾选账号')
@@ -665,6 +705,13 @@ export default function Accounts() {
     if (c.kind === 'all') {
       setConfirm(null)
       doAllAct(c.act)
+      return
+    }
+    if (c.kind === 'purge_offline') {
+      // 一次全池操作，和「全部签到」一样先关确认框再走动作，
+      // 免得批量删除期间确认框还挂在那儿被重复点。
+      setConfirm(null)
+      doPurgeOffline()
       return
     }
     if (c.kind === 'export') {
@@ -1089,20 +1136,31 @@ export default function Accounts() {
     {
       key: 'status',
       title: '状态',
-      width: '116px',
+      width: '144px',
       sortValue: (s) => {
         const st = statusOf(s).text
         return st === '健康' ? 0 : st === '冷却' ? 1 : st === '暂停' ? 2 : 3
       },
       render: (s) => {
         const st = statusOf(s)
+        // 禁用原因要直接摆出来：风控封禁该等上游、已掉线该重登、面板手动禁用是运维
+        // 自己的决定，三者的下一步动作完全不同，藏在 title 里等于列表上看不出区别。
+        // 单行省略 + title 兜底，避免长原因把状态列撑开挤掉操作列。
+        const offReason = s.disabled ? (s.disabled_reason || '').trim() : ''
         return (
-          <span title={s.reason || s.disabled_reason || ''}>
-            <Badge tone={st.tone}>{st.text}</Badge>
-            {s.cooling && s.cool_remaining_sec ? (
-              <span className="tiny muted"> {duration(s.cool_remaining_sec)}</span>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
+            <span title={s.reason || s.disabled_reason || ''}>
+              <Badge tone={st.tone}>{st.text}</Badge>
+              {s.cooling && s.cool_remaining_sec ? (
+                <span className="tiny muted"> {duration(s.cool_remaining_sec)}</span>
+              ) : null}
+            </span>
+            {offReason ? (
+              <span className="tiny muted truncate" style={{ maxWidth: '120px' }} title={offReason}>
+                {offReason}
+              </span>
             ) : null}
-          </span>
+          </div>
         )
       },
     },
@@ -1317,6 +1375,16 @@ export default function Accounts() {
               {a.label}
             </button>
           ))}
+          {/* 清理掉线号不需要勾选：删哪些由后端按禁用原因（已掉线）判定，
+              放在批量动作一栏是因为它同样是「一次作用于全池」的操作。 */}
+          <button
+            className="btn sm danger"
+            disabled={!!busy}
+            title="只删除禁用原因为「已掉线」的账号（请求已 401、打不动），风控封禁与面板手动禁用的号不受影响"
+            onClick={() => setConfirm({ kind: 'purge_offline', name: '所有已掉线账号' })}
+          >
+            {busy === 'purge_offline' ? '删除中…' : '删除所有已掉线'}
+          </button>
           <span className="sep" />
           <button className="btn sm ghost" onClick={() => openRemarks()}>
             备注 / 分组
@@ -1964,7 +2032,7 @@ export default function Accounts() {
         title={confirmTitle(confirm)}
         message={confirmMessage(confirm)}
         confirmText={confirmAction(confirm)}
-        danger={!!confirm && (confirm.kind === 'remove' || confirm.kind === 'disable')}
+        danger={!!confirm && (confirm.kind === 'remove' || confirm.kind === 'disable' || confirm.kind === 'purge_offline')}
         busy={!!busy}
         onConfirm={runConfirm}
         onClose={() => setConfirm(null)}

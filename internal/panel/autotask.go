@@ -331,6 +331,8 @@ func (p *Panel) listTasksSoftRate(a *auth.Auth, mp bool) ([]upstream.Task, error
 			return tasks, nil
 		}
 		if !isSoftRateErr(err) {
+			// 401 走「已掉线」处置（凭证类问题不重试），其余错误原样上抛。
+			p.noteAuth401(a, a.UID, "查询任务", err)
 			return nil, err
 		}
 		if attempt >= softRateRetries {
@@ -961,6 +963,7 @@ func (p *Panel) claimAutoTask(a *auth.Auth, act *autoAction, message string, bef
 		credit, energy, err = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
 	}
 	if err != nil {
+		p.noteAuth401(a, a.UID, "领取任务奖励", err)
 		out.Status = "claim_pending"
 		out.ClaimError = err.Error()
 		out.Message = message + "；任务已达标，但领奖失败: " + err.Error()
@@ -1011,6 +1014,7 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 	for i := int64(0); i < need; i++ {
 		cid := session.NewConversationID()
 		if err := p.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
+			p.noteAuth401(a, a.UID, "活跃上报", err)
 			return "", fmt.Errorf("上报第 %d/%d 条失败: %w", i+1, need, err)
 		}
 		if i < need-1 {
@@ -1023,6 +1027,7 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 // runFirstBuddy 领养：report（解锁前置）→ agreement → first。
 func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
 	if err := p.cfg.Upstream.ReportChatActivity(a, session.NewConversationID(), ""); err != nil {
+		p.noteAuth401(a, a.UID, "活跃上报", err)
 		return "", fmt.Errorf("前置上报: %w", err)
 	}
 	time.Sleep(reportGap) // 给上游事件处理留时间（脚本实测口径）
@@ -1476,7 +1481,11 @@ func (p *Panel) runAutoAllObserved(ctx context.Context, a *auth.Auth, observe fu
 	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
 	emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受)"})
 	if ctx.Err() == nil {
-		if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil && ctx.Err() == nil {
+		tasks, listErr := p.cfg.Upstream.ListTasks(a)
+		if listErr != nil {
+			p.noteAuth401(a, a.UID, "批量接受", listErr)
+		}
+		if listErr == nil && ctx.Err() == nil {
 			if done == nil {
 				done = make(map[string]bool, len(tasks))
 			}
@@ -1515,7 +1524,11 @@ func (p *Panel) runAutoAllObserved(ctx context.Context, a *auth.Auth, observe fu
 	if ctx.Err() == nil {
 		emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受-mp)"})
 		if ctx.Err() == nil {
-			if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil && ctx.Err() == nil {
+			mpTasks, listErr := p.cfg.Upstream.ListTasksMP(a)
+			if listErr != nil {
+				p.noteAuth401(a, a.UID, "批量接受", listErr)
+			}
+			if listErr == nil && ctx.Err() == nil {
 				have = make(map[string]bool, len(mpTasks))
 				done = make(map[string]bool, len(mpTasks))
 				for _, t := range mpTasks {

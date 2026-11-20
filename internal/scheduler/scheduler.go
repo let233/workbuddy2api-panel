@@ -14,8 +14,10 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
+	"github.com/misakano7545/workbuddy2api-panel/internal/banprobe"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/offline"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 	"github.com/misakano7545/workbuddy2api-panel/internal/store"
@@ -85,6 +87,19 @@ type Config struct {
 	AccountSpreadMinutes int
 	// AccountSpreadMinGapSeconds 同批两个账号的最小间隔（冲突时推开）。0 = 只做随机。
 	AccountSpreadMinGapSeconds int
+	// BanProbeHours 封禁探测的时点（schedule.ban_probe_hours）。空 = 用默认 [12]。
+	// BanProbeDisabled 显式关闭该排程（schedule.ban_probe_enabled=false）。
+	//
+	// 为什么单独一类任务而不是塞进余额刷新：探针要真实发一次对话，成本与失败面都
+	// 比读余额高一个量级，不该跟着 5 分钟一轮跑；每日一回就够（封禁是人工申诉/
+	// 风控到期解除的，没有分钟级变化）。
+	BanProbeHours    []int
+	BanProbeDisabled bool
+	// BanProbeAutoRevive 探测到上游已解封时，自动把池里的号解冻
+	// （schedule.ban_probe_auto_revive，缺省开）。关掉则只记日志等运维确认。
+	BanProbeAutoRevive bool
+	// BanProbeModel 探测用的模型 id（空 = banprobe.DefaultModel）。
+	BanProbeModel string
 	// DB 补跑去重标记的存储（见 runstamps.go）。nil = 不持久化，每次重启都补一轮
 	// （旧行为）。
 	DB *store.Store
@@ -192,6 +207,12 @@ func New(cfg Config) *Scheduler {
 	if cfg.KeepaliveRefreshWindow == 0 {
 		cfg.KeepaliveRefreshWindow = 7 * 24 * time.Hour
 	}
+	if len(cfg.BanProbeHours) == 0 {
+		cfg.BanProbeHours = []int{12}
+	}
+	if cfg.BanProbeModel == "" {
+		cfg.BanProbeModel = banprobe.DefaultModel
+	}
 	return &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
@@ -211,6 +232,7 @@ type ScheduleParams struct {
 	ActivityHours  []int
 	KeepaliveHours []int
 	GrowthHours    []int
+	BanProbeHours  []int
 
 	CheckinDisabled     bool
 	TravelDisabled      bool
@@ -218,6 +240,10 @@ type ScheduleParams struct {
 	WebActivityDisabled bool
 	KeepaliveDisabled   bool
 	GrowthDisabled      bool
+	BanProbeDisabled    bool
+	// BanProbeAutoRevive / BanProbeModel 见 Config 同名字段。
+	BanProbeAutoRevive bool
+	BanProbeModel      string
 	// IncludeDisabledInTasks 保号类四任务是否覆盖禁用账号（见 Config 同名字段）。
 	IncludeDisabledInTasks bool
 
@@ -268,10 +294,11 @@ func (s *Scheduler) SetKeepaliveRefreshWindow(d time.Duration) {
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
 // 空 hours 视为「未配置」保留原值（与 config.normalize 的回落语义一致）。
 func (s *Scheduler) Reconfigure(p ScheduleParams) {
-	hours := [][]int{p.CheckinHours, p.TravelHours, p.ActivityHours, p.KeepaliveHours, p.GrowthHours}
+	hours := [][]int{p.CheckinHours, p.TravelHours, p.ActivityHours, p.KeepaliveHours,
+		p.GrowthHours, p.BanProbeHours}
 	s.schedMu.Lock()
 	dst := []*[]int{&s.cfg.CheckinHours, &s.cfg.TravelHours, &s.cfg.ActivityHours,
-		&s.cfg.KeepaliveHours, &s.cfg.GrowthHours}
+		&s.cfg.KeepaliveHours, &s.cfg.GrowthHours, &s.cfg.BanProbeHours}
 	for i, h := range hours {
 		if len(h) > 0 {
 			*dst[i] = h
@@ -283,6 +310,11 @@ func (s *Scheduler) Reconfigure(p ScheduleParams) {
 	s.cfg.WebActivityDisabled = p.WebActivityDisabled
 	s.cfg.KeepaliveDisabled = p.KeepaliveDisabled
 	s.cfg.GrowthDisabled = p.GrowthDisabled
+	s.cfg.BanProbeDisabled = p.BanProbeDisabled
+	s.cfg.BanProbeAutoRevive = p.BanProbeAutoRevive
+	if p.BanProbeModel != "" {
+		s.cfg.BanProbeModel = p.BanProbeModel
+	}
 	s.cfg.IncludeDisabledInTasks = p.IncludeDisabledInTasks
 	s.cfg.JitterMinutes = p.JitterMinutes
 	s.cfg.AccountSpreadMinutes = p.AccountSpreadMinutes
@@ -351,6 +383,8 @@ func (k taskKind) String() string {
 		return "keepalive"
 	case taskGrowth:
 		return "growth"
+	case taskBanProbe:
+		return "banprobe"
 	default:
 		return "task"
 	}
@@ -398,6 +432,7 @@ const (
 	taskActivity
 	taskKeepalive
 	taskGrowth
+	taskBanProbe
 )
 
 // plannedSlot 一类任务的下一个触发时点（零时点 = 未配小时数 = 不跑）。
@@ -423,6 +458,7 @@ func (s *Scheduler) enabledSlots(now time.Time) []plannedSlot {
 		{s.cfg.ActivityDisabled, s.cfg.ActivityHours, taskActivity},
 		{s.cfg.KeepaliveDisabled, s.cfg.KeepaliveHours, taskKeepalive},
 		{s.cfg.GrowthDisabled, s.cfg.GrowthHours, taskGrowth},
+		{s.cfg.BanProbeDisabled, s.cfg.BanProbeHours, taskBanProbe},
 	}
 	jitter := s.cfg.JitterMinutes
 	s.schedMu.Unlock()
@@ -608,10 +644,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // spreadRunning 窗口 > 0 时各任务族的「上一批还没收尾」标记。
+// 长度必须 >= 任务族个数（下标就是 taskKind）：新增任务族而忘了扩容，越界 panic
+// 发生在 runBatch 的 goroutine 里，进程直接死——所以这里留一格余量。
 //
 // 摊开会把一批从几十秒拉长到数十分钟，跨过下一个时点；没有它，下一时点会再派一批
 // 同类任务，两批在同一模型/同一账号上并发叠加——摊开换来的相关性收益当场还回去。
-var spreadRunning [6]atomic.Bool
+var spreadRunning [7]atomic.Bool
 
 // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
 // ctx 取消时由各任务内部的可取消等待快速收尾。
@@ -643,6 +681,8 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 				s.runKeepalive(ctx, spread, true)
 			case taskGrowth:
 				s.RunGrowthNow()
+			case taskBanProbe:
+				s.runBanProbe(ctx, spread)
 			}
 		}(k)
 	}
@@ -724,6 +764,12 @@ func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
 		// credit_floor 判定与面板额度展示的唯一数据源）。
 		if a.SupportsPersonalEndpoints() {
 			done, cerr := s.checkinOne(a, st.UID)
+			if !done && cerr != nil {
+				// 401 一律先按「已掉线」处置（用户口径）：禁用的号本轮剩余步骤也不必再跑。
+				if s.noteAuth401(a, st.UID, "签到", cerr) == offline.Offline {
+					continue
+				}
+			}
 			if !done && cerr != nil && upstream.IsTransientBilling(cerr) {
 				// 只有「过一会儿再试可能好」的失败才值得排补签。业务拒绝（企业号、
 				// 参数错）重试必然同样失败，排进去只会每天多打几轮无效请求。
@@ -734,6 +780,7 @@ func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
 		// 按自然日聚合的全部批次（首页快照与明细共用同一口径）。
 		remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 		if err != nil {
+			s.noteAuth401(a, st.UID, "签到查余额", err)
 			log.Printf("WARN: user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
@@ -802,6 +849,7 @@ func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
 		// （issue #51）；ReportChatActivity 把它写进 conversationId / parentConversationId。
 		cid := session.NewConversationID()
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
+			s.noteAuth401(a, a.UID, "活跃上报", err)
 			log.Printf("WARN: activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 		} else {
 			s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
@@ -886,6 +934,16 @@ func (s *Scheduler) runKeepalive(ctx context.Context, spread, selective bool) {
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && upstream.SessionDeadButUsable(a) {
 				log.Printf("INFO: keepalive %s: refresh token 已失效但 access token 仍有效，本轮跳过（对话仍可用）",
 					logfmt.Label(st.UID, st.Nickname))
+				continue
+			}
+			// 保活失败本身就是一次 refresh 求证：12153 已是确定判词，直接判「已掉线」，
+			// 不再二次刷新（再问一次只会拿到同一个 12153，白花一次上游调用）。
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				s.markOffline(st.UID, logfmt.Label(st.UID, st.Nickname), "保活：refresh 判死: "+ue.Msg)
+				continue
+			}
+			// 非 12153 的 401（网关拦截/风控）交给统一判定：能刷新成功就换 token 继续。
+			if s.noteAuth401(a, st.UID, "保活", err) == offline.Offline {
 				continue
 			}
 			log.Printf("WARN: keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)

@@ -387,8 +387,12 @@ func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
 	p.Disable("disabled", "test")
 	s.RunTravelNow()
 
-	if n := deadCalls.Load(); n != 1 {
-		t.Errorf("dead account calls=%d want 1（401 跳过本轮，不强刷 token）", n)
+	// 401 后做一次 refresh 求证（buddy-info + refresh = 2 次），判死即禁用，不再重复打。
+	if n := deadCalls.Load(); n != 2 {
+		t.Errorf("dead account calls=%d want 2（401 + 一次 refresh 求证）", n)
+	}
+	if dst, ok := p.Status("dead"); !ok || !dst.Disabled || !pool.IsOfflineReason(dst.DisabledReason) {
+		t.Errorf("dead 账号应被判掉线禁用: %+v", dst)
 	}
 	if n := disabledCalls.Load(); n != 0 {
 		t.Errorf("disabled account calls=%d want 0", n)

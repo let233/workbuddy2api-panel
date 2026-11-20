@@ -133,6 +133,10 @@ type Config struct {
 	// 默认 1800s；0 = 只保留「命中即停手」）。实际暂停从 30s 起按 2 倍退避、不超过
 	// 本值也不超过 10 分钟，且按域判定。见 restrict.go。启动时读取。
 	RestrictionHold time.Duration
+	// RestrictionFailover 遇到 11140 后本请求最多再换几个号
+	// （upstream.restriction_failover，缺省 1；0 = 命中即停手，回到旧行为）。
+	// 预算用尽或该域进入连坐暂停即停手，见 restrict.go。启动时读取，之后走 hotcfg。
+	RestrictionFailover int
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -1420,6 +1424,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxRotate := h.maxRotate() // 请求入口取一次：同一请求内的换号预算不该中途变
+	// 11140 有界换号预算（restrict.go）：命中账号限制后最多再换 restrictionFailover() 个号，
+	// 用来跳过一个被连坐/误判的号，而不是把封禁原文回给客户端。预算用尽或该域进入连坐暂停
+	// 就停手——「一个请求撞穿整池」是必须守住的下界。
+	restrictRotations := 0
 	for i := 0; i < maxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -1818,10 +1826,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
-			// 11140 风控连坐（restrict.go）：上游判的是设备/出口而不是单个账号，换号等于
-			// 把下一个号也送进去 → 就地停手，并把这次限制喂给该域的连坐判定。
-			if h.noteRestriction(acct, kind, string(respBody)) {
-				break
+			// 11140 风控连坐（restrict.go）：上游判的是设备/出口而不是单个账号。被打中的号已由
+			// applyErrorPolicy 禁用；号池里可能还有没被盯上的号，故在预算内再换一个号，而不是把
+			// 封禁原文回给客户端。预算用尽、或该域已进入连坐暂停 → 就地停手。
+			if out := h.noteRestriction(acct, kind, string(respBody)); out.restricted {
+				if out.paused || restrictRotations >= h.restrictionFailover() {
+					break
+				}
+				restrictRotations++
+				log.Printf("WARN: [server] acct=%s model=%s: account restricted (11140), failing over (%d/%d)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, restrictRotations, h.restrictionFailover())
+				if !rotateBackoff(i, r.Context()) {
+					break
+				}
+				continue
 			}
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
 			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
@@ -1893,10 +1911,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					lastErr = &upstream.Error{Kind: kind, Msg: hv.Payload}
 					log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame before first byte kind=%s payload=%s",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(hv.Payload, 200))
-					// 11140 风控限制与 HTTP 错误路径同口径（restrict.go）：就地停手，不把
-					// 下一个号也送进风控。
-					if h.noteRestriction(acct, kind, hv.Payload) {
-						break
+					// 11140 风控限制与 HTTP 错误路径同口径（restrict.go）：预算内再换一个号，
+					// 预算用尽或该域已在连坐暂停才停手。停不下去就由下方的 rotateBackoff +
+					// continue 接手；break 直接出轮转，走末端错误映射。
+					if out := h.noteRestriction(acct, kind, hv.Payload); out.restricted {
+						if out.paused || restrictRotations >= h.restrictionFailover() {
+							break
+						}
+						restrictRotations++
+						log.Printf("WARN: [server] stream acct=%s model=%s: account restricted (11140), failing over (%d/%d)",
+							logfmt.Label(acct.UID, acct.Nickname), bareModel, restrictRotations, h.restrictionFailover())
 					}
 				}
 				if !rotateBackoff(i, r.Context()) {

@@ -159,12 +159,14 @@ func TestReconfigureCoversAllScheduleParams(t *testing.T) {
 		ActivityHours:              []int{8},
 		KeepaliveHours:             []int{5},
 		GrowthHours:                []int{4},
+		BanProbeHours:              []int{3},
 		CheckinDisabled:            true,
 		TravelDisabled:             true,
 		ActivityDisabled:           true,
 		WebActivityDisabled:        true,
 		KeepaliveDisabled:          true,
 		GrowthDisabled:             true,
+		BanProbeDisabled:           true,
 		IncludeDisabledInTasks:     true,
 		JitterMinutes:              9,
 		AccountSpreadMinutes:       11,
@@ -192,6 +194,7 @@ func TestReconfigureCoversAllScheduleParams(t *testing.T) {
 	check("WebActivityDisabled", cfg.WebActivityDisabled, true)
 	check("KeepaliveDisabled", cfg.KeepaliveDisabled, true)
 	check("GrowthDisabled", cfg.GrowthDisabled, true)
+	check("BanProbeDisabled", cfg.BanProbeDisabled, true)
 
 	hours := []struct {
 		name string
@@ -203,6 +206,7 @@ func TestReconfigureCoversAllScheduleParams(t *testing.T) {
 		{"ActivityHours", cfg.ActivityHours, 8},
 		{"KeepaliveHours", cfg.KeepaliveHours, 5},
 		{"GrowthHours", cfg.GrowthHours, 4},
+		{"BanProbeHours", cfg.BanProbeHours, 3},
 	}
 	for _, h := range hours {
 		if len(h.got) != 1 || h.got[0] != h.want {

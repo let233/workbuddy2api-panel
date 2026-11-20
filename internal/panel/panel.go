@@ -29,9 +29,11 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
+	"github.com/misakano7545/workbuddy2api-panel/internal/banprobe"
 	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
 	"github.com/misakano7545/workbuddy2api-panel/internal/gatewaykeys"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
+	"github.com/misakano7545/workbuddy2api-panel/internal/offline"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panelauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
@@ -340,6 +342,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.accountCheckin)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.accountBalance)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.accountRemove)
+	// 一键删掉所有「已掉线」（401）账号：只按禁用原因前缀筛，其它禁用号不动。
+	p.mux.HandleFunc("POST /panel/api/accounts/purge_offline", p.accountPurgeOffline)
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.accountTasks)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.accountTaskAccept)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.taskAcceptAll)
@@ -1283,6 +1287,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
+		// 401 说明凭据已被上游拒收：先按「已掉线」处置（同步禁用），再照旧回显错误。
+		if p.noteAuth401(a, uid, "签到", err) == offline.Offline {
+			checkinMsg = "已掉线：" + err.Error()
+		}
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
 		if upstream.IsAlreadyCheckin(err) {
 			p.cfg.Pool.NoteCheckinDone(uid)
@@ -1309,6 +1317,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
+		p.noteAuth401(a, uid, "签到查余额", err)
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -1338,6 +1347,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	}
 	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
+		p.noteAuth401(a, uid, "刷新余额", err)
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
@@ -1391,6 +1401,57 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountPurgeOffline 批量删除「已掉线」账号：401 掉线的号留在池里只会继续吃 401，
+// 运维要的是一键清掉、之后统一重登。
+//
+// 只按禁用原因前缀筛（pool.IsOfflineReason）：上游风控封禁（可能等几天就放行）、余额
+// 耗尽、面板手动禁用（运维显式意图）都不在删除范围内——「删除所有已掉线」如果连带
+// 删了这些，等于替运维做他没做的决定。
+//
+// 锁序与 accountRemove 一致（proxyAccountMu → reloadMu → pool.mu），逐个走同一条
+// 出池→删凭证文件路径，避免出现「重载刚 upsert 回来、这边又删掉」的交错。
+func (p *Panel) accountPurgeOffline(w http.ResponseWriter, r *http.Request) {
+	p.proxyAccountMu.Lock()
+	defer p.proxyAccountMu.Unlock()
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+	var uids []string
+	for _, st := range p.cfg.Pool.List() {
+		if st.Disabled && pool.IsOfflineReason(st.DisabledReason) {
+			uids = append(uids, st.UID)
+		}
+	}
+	sort.Strings(uids)
+	removed := make([]string, 0, len(uids))
+	failed := make([]map[string]any, 0)
+	for _, uid := range uids {
+		if p.cfg.ProxyPool != nil {
+			if err := p.cfg.ProxyPool.Unbind(uid); err != nil {
+				failed = append(failed, map[string]any{"uid": uid, "error": "account proxy binding: " + err.Error()})
+				continue
+			}
+		}
+		a := p.cfg.Pool.Remove(uid)
+		if a == nil {
+			continue // 并发下已被别处删掉，不计入失败
+		}
+		if a.FilePath != "" {
+			if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
+				// 已出池但凭证文件还在：不算删成功——重启会按目录把它读回来。
+				failed = append(failed, map[string]any{"uid": uid, "error": "auth file: " + err.Error()})
+				continue
+			}
+		}
+		removed = append(removed, uid)
+	}
+	if len(failed) > 0 {
+		log.Printf("panel: purge_offline 删除 %d 个已掉线账号（失败 %d 个: %s）", len(removed), len(failed), failed[0]["error"])
+	} else {
+		log.Printf("panel: purge_offline 删除 %d 个已掉线账号", len(removed))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(removed), "uids": removed, "failed": failed})
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,20 +1893,23 @@ func (p *Panel) modelFallbackSnapshot() map[string]string { return p.modelFallba
 //
 // 为什么需要（用户需求）：账号被 11140「账号存在异常行为」判死后，唯一的确认方式
 // 是反复 revive —— 但每次 revive 都会让账号重新参与选号、立刻再撞 11140，
-// 反复触发可能加重上游风控判定。需要一个「不惊动它」的问法。
+// 反复触发可能加重上游风控判定。需要一个「先问清楚」的问法。
 //
-// 用什么探：UserResource（余额查询）是最轻的只读端点，且 11140 会在这里原样返回
-// （上游 auth/auth_forbidden 在 billing 侧同样生效）。不用 chat —— 那会占在途、
-// 记连败、可能被计入风控。
+// 用什么探（2026-11-21 改判，用户口径）：**真实发一次 AI 对话**（internal/banprobe）。
+// 早先这里用 UserResource 查余额，理由是它最轻、且 11140 在 billing 侧也照样返回；
+// 但余额 200 只证明 billing 放行，**chat 被风控拦的号照样 200**，于是「已解封」是
+// 假阳性——点了解冻立刻又被 401 打回来。要证明「这个号又能干活」，只有真的跑完一次
+// 对话。请求形态与生产首 token 一致（stream、max_tokens=16、"Hi"），成本可忽略。
 //
-// 判据：
-//   - 200            → 已解封（可以 revive 了）
-//   - 11140/封禁类   → 仍被封（继续等）
-//   - 401/session    → 不是封禁问题，是登录失效（该重登）
-//   - 其它           → 无结论（网络/限流等，稍后再试）
+// 判据（见 banprobe.Verdict）：
+//   - lifted         → 上游已放行（可以解冻了）
+//   - still_banned   → 账号级风控（11140 等），仍被封
+//   - blocked        → 被拦但 refresh 成功：会话活着、风控拦着
+//   - session_dead   → 登录态失效，不是封禁问题（该重登）
+//   - inconclusive   → 无结论（网络/限流等，稍后再试）
 //
 // 不写任何池状态：探测是观测行为，不该改变账号的可用性判断 —— 否则运维点一下
-// 探活就把号放回池子，等于变相 revive。
+// 探活就把号放回池子，等于变相 revive（自动解冻是另一条路径，走排程与配置开关）。
 func (p *Panel) accountProbeBan(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	st, ok := p.cfg.Pool.Status(uid)
@@ -1866,60 +1930,26 @@ func (p *Panel) accountProbeBan(w http.ResponseWriter, r *http.Request) {
 		"was_reason":   st.DisabledReason,
 		"probed_at":    time.Now().Format(time.RFC3339),
 	}
-	if p.cfg.Upstream == nil {
-		resp["verdict"] = "unknown"
-		resp["detail"] = "upstream client not configured"
-		writeJSON(w, http.StatusOK, resp)
-		return
+	res := banprobe.Probe(r.Context(), p.cfg.Upstream, a, p.banProbeModel())
+	resp["verdict"] = string(res.Verdict)
+	resp["status"] = res.Status
+	if res.Detail != "" {
+		resp["detail"] = res.Detail
 	}
-	_, _, err := p.cfg.Upstream.UserResource(a)
-	// 302/401 的求证与 chat 路径同一套逻辑（见 server/handler.go 的网关 401 分支）：
-	// 网关 401 的响应体是 APISIX 的 HTML 页，**封禁（11140）与登录失效看起来完全一样**，
-	// 单看 401 分不出来。refresh 才是权威判词：refresh 成功 = 会话仍活（那 401 就是
-	// 风控拦截，含 11140 封禁）；refresh 被明确拒绝 = 登录态真失效。
-	// 网关 401 的求证与 chat 路径同一套判据（upstream.VerifySessionByRefresh）：
-	// 封禁（11140）与登录失效的响应体都是 APISIX HTML 页，单看 401 分不出来。
-	if err != nil && isSessionDeadErr(err) {
-		switch p.cfg.Upstream.VerifySessionByRefresh(a) {
-		case upstream.VerifyAlive:
-			resp["verdict"] = "blocked"
-			resp["detail"] = err.Error()
-			resp["advice"] = "会话仍有效，但请求被上游风控拦截（可能仍是 11140 封禁）—— 继续观察，勿反复 revive"
-			log.Printf("panel: probe_ban uid=%s → 被拦截但会话有效（refresh ok）", uid)
-			writeJSON(w, http.StatusOK, resp)
-			return
-		case upstream.VerifyInconclusive:
-			resp["verdict"] = "inconclusive"
-			resp["detail"] = err.Error()
-			resp["advice"] = "refresh 未给出明确判词（网络/限流等），稍后再试"
-			log.Printf("panel: probe_ban uid=%s → 无明确结论", uid)
-			writeJSON(w, http.StatusOK, resp)
-			return
-		}
-		// VerifyDead：落到下面的 session_dead 分支。
+	if res.Advice != "" {
+		resp["advice"] = res.Advice
 	}
-	switch {
-	case err == nil:
-		resp["verdict"] = "lifted"
-		resp["advice"] = "上游已解封，可以点「解冻」恢复使用"
-		log.Printf("panel: probe_ban uid=%s → 已解封", uid)
-	case isAccountFaultErr(err):
-		resp["verdict"] = "still_banned"
-		resp["detail"] = err.Error()
-		resp["advice"] = "仍被封禁，继续等待；勿反复 revive（可能加重风控）"
-		log.Printf("panel: probe_ban uid=%s → 仍被封", uid)
-	case isSessionDeadErr(err):
-		resp["verdict"] = "session_dead"
-		resp["detail"] = err.Error()
-		resp["advice"] = "不是封禁问题，是登录态失效 —— 需重新登录"
-		log.Printf("panel: probe_ban uid=%s → 登录失效（非封禁）", uid)
-	default:
-		resp["verdict"] = "inconclusive"
-		resp["detail"] = err.Error()
-		resp["advice"] = "无明确结论（网络/限流等），稍后再试"
-		log.Printf("panel: probe_ban uid=%s → 无结论: %v", uid, err)
-	}
+	log.Printf("panel: probe_ban uid=%s → %s (status=%d) %s", uid, res.Verdict, res.Status, res.Detail)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// banProbeModel 探测用模型：与每日排程共用同一份配置（空则由 banprobe 取默认）。
+// 测试面板无调度器时返回空，由 banprobe 回落默认值。
+func (p *Panel) banProbeModel() string {
+	if p.cfg.Scheduler == nil {
+		return ""
+	}
+	return p.cfg.Scheduler.BanProbeModel()
 }
 
 // isAccountFaultErr 判断错误是否为账号级封禁/风控（11140 request illegal 等）。

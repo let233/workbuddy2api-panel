@@ -351,6 +351,11 @@ func main() {
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		GrowthHours:    cfg.Schedule.GrowthHours,
+		// 封禁探测（每日一轮，只探已禁用账号；解封后按配置自动解冻）。
+		BanProbeHours:      cfg.Schedule.BanProbeHours,
+		BanProbeDisabled:   !cfg.Schedule.BanProbeEnabled,
+		BanProbeAutoRevive: cfg.Schedule.BanProbeAutoRevive,
+		BanProbeModel:      cfg.Schedule.BanProbeModel,
 		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
 		Balance: bal,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
@@ -430,6 +435,13 @@ func main() {
 	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
+	}
+	switch {
+	case !cfg.Schedule.BanProbeEnabled:
+		log.Printf("封禁探测已禁用（schedule.ban_probe_enabled=false）：封禁号解封后不会自动回到可用")
+	default:
+		log.Printf("封禁探测已启用：%v 点（只探已封禁账号，真实对话验证；自动解冻=%v）",
+			cfg.Schedule.BanProbeHours, cfg.Schedule.BanProbeAutoRevive)
 	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
@@ -628,9 +640,10 @@ func main() {
 		BudgetLimit:      cfg.Budget.DailyCreditLimit,
 		BurstCreditLimit: cfg.Budget.BurstCreditLimit,
 		CacheLowRate:     cfg.Budget.CacheLowRate,
-		// 入站请求体 OOM 护栏 + 11140 连坐暂停（两处均由 hotApplier 热改，保存即生效）。
+		// 入站请求体 OOM 护栏 + 11140 连坐暂停/有界换号（均由 hotApplier 热改，保存即生效）。
 		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
-		RestrictionHold: time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		RestrictionHold:     time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		RestrictionFailover: cfg.Upstream.RestrictionFailover,
 		// 等上游首帧期间的 SSE 注释帧间隔（server.head_keepalive，缺省 1.5s）。
 		HeadKeepalive: cfg.HeadKeepaliveDur,
 	})
