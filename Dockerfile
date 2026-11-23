@@ -13,7 +13,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---------- 后端构建 ----------
-FROM golang:1.27.0-alpine AS build
+FROM golang:1.27.4-alpine AS build
 # Go module 代理：默认官方源（境外/CI 不多绕一跳）；境内或镜像环境用
 # --build-arg 覆盖，容器内直连 proxy.golang.org 在境内会长时间卡住：
 #   docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
