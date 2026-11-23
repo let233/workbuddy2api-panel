@@ -20,15 +20,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       # 前端不再 go:embed 进二进制：public/ 由 Go 在运行时映射成 /panel/。
       # 所以 CI 必须先构建前端——go test 里的静态资源断言、以及发布 zip 里的
       # public/ 都依赖它，缺了它面板起来就是一段「请先构建前端」的说明页。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -87,32 +87,32 @@ jobs:
           done
 
       # ponytail: 四个 upload，每个系统架构一个 artifact。matrix 等构建时间不够再用。
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wb2api-panel-${{ env.VERSION }}-windows-amd64
           path: dist/windows-amd64
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wb2api-panel-${{ env.VERSION }}-windows-arm64
           path: dist/windows-arm64
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wb2api-panel-${{ env.VERSION }}-linux-amd64
           path: dist/linux-amd64
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wb2api-panel-${{ env.VERSION }}-linux-arm64
           path: dist/linux-arm64
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wb2api-panel-${{ env.VERSION }}-darwin-amd64
           path: dist/darwin-amd64
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wb2api-panel-${{ env.VERSION }}-darwin-arm64
           path: dist/darwin-arm64
