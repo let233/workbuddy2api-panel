@@ -39,7 +39,7 @@ jobs:
       matrix: ${{ steps.shards.outputs.matrix }}
       repos: ${{ steps.shards.outputs.repos }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 按 AutoBot.yml 生成分片
         id: shards
         env:
@@ -71,15 +71,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: 安装 Hermes Agent 并写入网关配置
@@ -170,7 +170,7 @@ jobs:
       - name: 报告进 job summary
         if: always()
         run: cat autobot-report.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: reports-${{ strategy.job-index }}
@@ -185,16 +185,16 @@ jobs:
     # land_max × 每条最坏 60 分钟（方案 30 + diff 30），留 60 分钟余量
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           token: ${{ secrets.AUTOBOT_TOKEN }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: 安装 Hermes Agent 并写入网关配置
@@ -247,7 +247,7 @@ jobs:
           echo "--- 产物:"; cat /tmp/hermes-selftest.txt 2>/dev/null || echo "(没有产物)"
           test -f /tmp/hermes-selftest.txt
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: inputs.reports_run == ''
         with:
           path: /tmp/artifacts
